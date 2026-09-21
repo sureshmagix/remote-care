@@ -1,0 +1,64 @@
+{
+  "name": "remote-care-phase1",
+  "version": "1.0.0",
+  "description": "Local-first cross-platform network, internet, target, and local-service monitor.",
+  "homepage": "https://archidtech.in",
+  "desktopName": "remote-care-monitor",
+  "main": "src/main/app.js",
+  "author": {
+    "name": "Wiitronics Solutions Pvt Ltd",
+    "email": "support@archidtech.in"
+  },
+  "license": "UNLICENSED",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "postinstall": "electron-builder install-app-deps",
+    "test": "node scripts/run-tests.js",
+    "lint": "node --check src/main/app.js && node --check src/main/database.js && node --check src/main/monitor-engine.js && node --check src/main/checks.js && node --check src/renderer/app.js",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder"
+  },
+  "build": {
+    "appId": "in.archidtech.remotecare",
+    "productName": "Remote Care Monitor",
+    "icon": "assets/icon.png",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "src/**/*",
+      "package.json",
+      "README.md"
+    ],
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/better-sqlite3/**/*"
+    ],
+    "win": {
+      "target": ["nsis", "portable"]
+    },
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "category": "Utility",
+      "maintainer": "Wiitronics Solutions Pvt Ltd <support@archidtech.in>",
+      "syncDesktopName": true,
+      "synopsis": "Local network and service monitoring application"
+    },
+    "mac": {
+      "target": ["dmg", "zip"],
+      "category": "public.app-category.utilities"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.4.1"
+  },
+  "devDependencies": {
+    "electron": "^39.2.6",
+    "electron-builder": "^26.0.12"
+  }
+}
