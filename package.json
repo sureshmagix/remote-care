@@ -15,7 +15,8 @@
     "dev": "electron . --dev",
     "postinstall": "electron-builder install-app-deps",
     "test": "node scripts/run-tests.js",
-    "lint": "node --check src/main/app.js && node --check src/main/database.js && node --check src/main/monitor-engine.js && node --check src/main/checks.js && node --check src/renderer/app.js",
+    "test:notifications-ui": "electron scripts/check-notifications.js",
+    "lint": "node --check src/main/app.js && node --check src/main/database.js && node --check src/main/monitor-engine.js && node --check src/main/checks.js && node --check src/main/notification-center.js && node --check src/main/notification-preload.js && node --check src/renderer/notification.js && node --check src/renderer/app.js",
     "pack": "electron-builder --dir",
     "dist": "electron-builder"
   },

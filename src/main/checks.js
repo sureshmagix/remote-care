@@ -88,9 +88,13 @@ async function getMacAdapters() {
   const hardware = await runCommand('networksetup', ['-listallhardwareports'], 5_000);
   const ports = hardware.exitCode === 0 ? parseMacHardwarePorts(hardware.stdout) : [];
   const known = new Map(ports.map((item) => [item.name, item]));
-  const all = Object.keys(os.networkInterfaces()).filter((name) => name !== 'lo0');
+  // Combine all hardware ports and interfaces so disconnected devices (like Wi-Fi en0 without an IP) are always included
+  const allNames = new Set([
+    ...ports.map((item) => item.name),
+    ...Object.keys(os.networkInterfaces()).filter((name) => name !== 'lo0')
+  ]);
   const adapters = [];
-  for (const name of all) {
+  for (const name of allNames) {
     const result = await runCommand('ifconfig', [name], 3_000);
     const text = `${result.stdout}\n${result.stderr}`;
     const mapped = known.get(name);
@@ -98,7 +102,7 @@ async function getMacAdapters() {
     adapters.push({
       name,
       description: mapped?.description || name,
-      kind: mapped?.kind || adapterKind(name),
+      kind: mapped?.kind || adapterKind(name, mapped?.description),
       state: active ? 'up' : 'down',
       connected: active,
       mac: text.match(/ether\s+([0-9a-f:]{17})/i)?.[1] || '',
@@ -109,7 +113,12 @@ async function getMacAdapters() {
 }
 
 async function getLinuxAdapters() {
-  const names = Object.keys(os.networkInterfaces()).filter((name) => name !== 'lo');
+  let names = [];
+  try {
+    names = fs.readdirSync('/sys/class/net').filter((name) => name !== 'lo');
+  } catch {
+    names = Object.keys(os.networkInterfaces()).filter((name) => name !== 'lo');
+  }
   const adapters = [];
   for (const name of names) {
     const base = path.join('/sys/class/net', name);
@@ -216,7 +225,7 @@ async function checkHttp(url, timeoutMs) {
     return {
       ok,
       latencyMs,
-      message: ok ? `${new URL(url).host} replied with HTTP ${response.status}.` : `${new URL(url).host} replied with HTTP ${response.status}.`,
+      message: ok ? `${new URL(url).host} replied with HTTP ${response.status}.` : `${new URL(url).host} returned HTTP error ${response.status}.`,
       details: { url, statusCode: response.status }
     };
   } catch (error) {
@@ -233,19 +242,50 @@ async function checkHttp(url, timeoutMs) {
 
 async function checkInterface(target) {
   const adapters = await getNetworkAdapters();
-  const requested = target.interfaceName && target.interfaceName !== 'auto' ? target.interfaceName.toLowerCase() : null;
-  const candidates = requested ? adapters.filter((adapter) => adapter.name.toLowerCase() === requested) : adapters.filter((adapter) => adapter.kind !== 'other' || adapter.connected);
-  if (requested && candidates.length === 0) return { ok: false, latencyMs: null, message: `Network adapter “${target.interfaceName}” was not found.`, details: { adapters } };
+  const rawRequested = String(target.interfaceName || 'auto').trim().toLowerCase();
+
+  let candidates;
+  if (!rawRequested || rawRequested === 'auto') {
+    const physical = adapters.filter((adapter) => adapter.kind === 'wireless' || adapter.kind === 'wired');
+    candidates = physical.length > 0 ? physical : adapters.filter((adapter) => adapter.kind !== 'loopback');
+  } else if (['wireless', 'wifi', 'wi-fi', 'wlan'].includes(rawRequested)) {
+    candidates = adapters.filter((adapter) => adapter.kind === 'wireless' || /wi-?fi|wireless/i.test(adapter.description) || /wi-?fi|wireless/i.test(adapter.name));
+    if (candidates.length === 0) {
+      return { ok: false, latencyMs: null, message: 'No Wi‑Fi / wireless network adapter was found on this device.', details: { adapters } };
+    }
+  } else if (['wired', 'ethernet', 'lan'].includes(rawRequested)) {
+    candidates = adapters.filter((adapter) => adapter.kind === 'wired' || /ethernet|lan|wired/i.test(adapter.description) || /ethernet|lan|wired/i.test(adapter.name));
+    if (candidates.length === 0) {
+      return { ok: false, latencyMs: null, message: 'No Ethernet / wired network adapter was found on this device.', details: { adapters } };
+    }
+  } else {
+    candidates = adapters.filter((adapter) =>
+      adapter.name.toLowerCase() === rawRequested ||
+      adapter.description.toLowerCase() === rawRequested ||
+      adapter.description.toLowerCase().includes(rawRequested)
+    );
+    if (candidates.length === 0) {
+      return { ok: false, latencyMs: null, message: `Network adapter “${target.interfaceName}” was not found.`, details: { adapters } };
+    }
+  }
+
   const connected = candidates.filter((adapter) => adapter.connected);
   if (connected.length > 0) {
-    const labels = connected.map((adapter) => `${adapter.kind === 'wireless' ? 'Wi‑Fi' : adapter.kind === 'wired' ? 'Wired' : 'Network'} (${adapter.name})`).join(', ');
+    const labels = connected.map((adapter) => `${adapter.kind === 'wireless' ? 'Wi‑Fi' : adapter.kind === 'wired' ? 'Wired' : 'Network'} (${adapter.description || adapter.name})`).join(', ');
     return { ok: true, latencyMs: 0, message: `${labels} connected.`, details: { adapters: candidates, connected } };
   }
-  const kinds = [...new Set(candidates.map((adapter) => adapter.kind))];
-  const label = kinds.includes('wireless') && !kinds.includes('wired') ? 'Wireless network is disconnected.'
-    : kinds.includes('wired') && !kinds.includes('wireless') ? 'Wired network is disconnected.'
-      : 'No active local network adapter was found.';
-  return { ok: false, latencyMs: null, message: label, details: { adapters: candidates } };
+
+  const isWifiTarget = ['wireless', 'wifi', 'wi-fi', 'wlan'].includes(rawRequested) || candidates.some((a) => a.kind === 'wireless');
+  const isWiredTarget = ['wired', 'ethernet', 'lan'].includes(rawRequested) || candidates.some((a) => a.kind === 'wired');
+  const targetLabel = isWifiTarget && !isWiredTarget
+    ? 'Wi‑Fi connection is disconnected.'
+    : isWiredTarget && !isWifiTarget
+      ? 'Wired network is disconnected.'
+      : candidates.length === 1
+        ? `${candidates[0].description || candidates[0].name} is disconnected.`
+        : 'Network adapter is disconnected.';
+
+  return { ok: false, latencyMs: null, message: targetLabel, details: { adapters: candidates } };
 }
 
 async function checkGateway(target) {
@@ -272,17 +312,48 @@ async function checkSystemService(serviceName, timeoutMs) {
   if (process.platform === 'win32') {
     result = await runCommand('sc.exe', ['query', serviceName], timeoutMs);
     const active = result.exitCode === 0 && /STATE\s*:\s*4\s+RUNNING/i.test(result.stdout);
-    return { ok: active, latencyMs: 0, message: active ? `Windows service “${serviceName}” is running.` : `Windows service “${serviceName}” is not running.`, details: { serviceName, output: result.stdout.slice(-1000) } };
+    return {
+      ok: active,
+      latencyMs: 0,
+      message: active ? `Windows service “${serviceName}” is running.` : `Windows service “${serviceName}” is not running.`,
+      details: { serviceName, output: (result.stdout || result.stderr || '').slice(-1000) }
+    };
   }
   if (process.platform === 'darwin') {
     result = await runCommand('launchctl', ['print', `system/${serviceName}`], timeoutMs);
-    if (result.exitCode !== 0) result = await runCommand('launchctl', ['print', `gui/${process.getuid()}/${serviceName}`], timeoutMs);
-    const active = result.exitCode === 0;
-    return { ok: active, latencyMs: 0, message: active ? `launchd service “${serviceName}” is running.` : `launchd service “${serviceName}” is not running.`, details: { serviceName, output: `${result.stdout}\n${result.stderr}`.slice(-1000) } };
+    if (result.exitCode !== 0) {
+      result = await runCommand('launchctl', ['print', `gui/${process.getuid()}/${serviceName}`], timeoutMs);
+    }
+    const combinedOutput = `${result.stdout}\n${result.stderr}`;
+    // launchctl print exits with 0 even when service is stopped (state = not running).
+    // Validate that the service explicitly has running state or an active non-zero PID.
+    const isRunningState = /\bstate\s*=\s*running\b/i.test(combinedOutput);
+    const hasActivePid = /\bpid\s*=\s*[1-9]\d*\b/i.test(combinedOutput);
+    let active = result.exitCode === 0 && (isRunningState || hasActivePid);
+
+    if (!active && result.exitCode !== 0) {
+      const listCheck = await runCommand('launchctl', ['list', serviceName], timeoutMs);
+      if (listCheck.exitCode === 0) {
+        active = /"PID"\s*=\s*[1-9]\d*/i.test(listCheck.stdout);
+      }
+    }
+
+    return {
+      ok: active,
+      latencyMs: 0,
+      message: active ? `launchd service “${serviceName}” is running.` : `launchd service “${serviceName}” is not running.`,
+      details: { serviceName, output: combinedOutput.slice(-1000) }
+    };
   }
-  result = await runCommand('systemctl', ['is-active', '--quiet', serviceName], timeoutMs);
-  const active = result.exitCode === 0;
-  return { ok: active, latencyMs: 0, message: active ? `systemd service “${serviceName}” is running.` : `systemd service “${serviceName}” is not running.`, details: { serviceName, output: `${result.stdout}\n${result.stderr}`.slice(-1000) } };
+  result = await runCommand('systemctl', ['is-active', serviceName], timeoutMs);
+  const statusText = (result.stdout || '').trim().toLowerCase();
+  const active = result.exitCode === 0 && statusText === 'active';
+  return {
+    ok: active,
+    latencyMs: 0,
+    message: active ? `systemd service “${serviceName}” is running.` : `systemd service “${serviceName}” is not running (${statusText || 'inactive'}).`,
+    details: { serviceName, output: `${result.stdout}\n${result.stderr}`.slice(-1000) }
+  };
 }
 
 async function checkProcess(processName, timeoutMs) {
@@ -315,4 +386,4 @@ async function executeCheck(target) {
   }
 }
 
-module.exports = { executeCheck, getNetworkAdapters, getDefaultGateway, runCommand, checkPing, checkTcp, checkHttp };
+module.exports = { executeCheck, getNetworkAdapters, getDefaultGateway, runCommand, checkPing, checkTcp, checkHttp, checkSystemService, checkProcess };

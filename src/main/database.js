@@ -1,11 +1,27 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const Database = require('better-sqlite3');
-const { passwordRecord, validateUsername } = require('./auth');
+const { passwordRecord, validateUsername, verifyPassword } = require('./auth');
 
 const ROLES = Object.freeze({ SUPER_ADMIN: 'super_admin', VIEWER: 'viewer' });
 const CHECK_TYPES = new Set(['internet', 'interface', 'gateway', 'ping', 'tcp', 'http', 'system_service', 'process']);
 const STATUSES = new Set(['unknown', 'healthy', 'warning', 'down', 'disabled']);
+const HISTORY_STATUSES = new Set(['unknown', 'healthy', 'warning', 'down']);
+const HISTORY_OUTCOMES = new Set(['all', 'success', 'failure']);
+const DEFAULT_APP_SETTINGS = Object.freeze({
+  minimizeToTray: true,
+  showTrayReminder: true,
+  showFailureNotifications: true,
+  showRecoveryNotifications: true,
+  notificationDurationSeconds: 5
+});
+const APP_SETTING_KEYS = Object.freeze({
+  minimizeToTray: 'minimize_to_tray',
+  showTrayReminder: 'show_tray_reminder',
+  showFailureNotifications: 'show_failure_notifications',
+  showRecoveryNotifications: 'show_recovery_notifications',
+  notificationDurationSeconds: 'notification_duration_seconds'
+});
 
 function now() {
   return new Date().toISOString();
@@ -22,6 +38,11 @@ function parseJson(value, fallback = {}) {
 
 function bool(value) {
   return Boolean(value);
+}
+
+function storedBool(value, fallback) {
+  if (value === undefined || value === null) return fallback;
+  return value === 'true' || value === '1';
 }
 
 function mapUser(row) {
@@ -132,6 +153,54 @@ function validateTarget(input) {
   };
 }
 
+function historyTimestamp(value, label) {
+  if (value === undefined || value === null || value === '') return null;
+  const parsed = new Date(String(value));
+  if (Number.isNaN(parsed.getTime())) throw new Error(`${label} must be a valid date and time.`);
+  return parsed.toISOString();
+}
+
+function validateHistoryFilters(input = {}) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('History filters must be an object.');
+
+  const from = historyTimestamp(input.from, 'Start date');
+  const to = historyTimestamp(input.to, 'End date');
+  if (from && to && from > to) throw new Error('The start date and time must be before the end date and time.');
+
+  let targetId = null;
+  if (input.targetId !== undefined && input.targetId !== null && input.targetId !== '') {
+    targetId = Number.parseInt(input.targetId, 10);
+    if (!Number.isInteger(targetId) || targetId < 1) throw new Error('Choose a valid monitor.');
+  }
+
+  const type = String(input.type || '').trim();
+  if (type && !CHECK_TYPES.has(type)) throw new Error('Choose a valid monitor type.');
+  const status = String(input.status || '').trim();
+  if (status && !HISTORY_STATUSES.has(status)) throw new Error('Choose a valid status.');
+  const outcome = String(input.outcome || 'all').trim() || 'all';
+  if (!HISTORY_OUTCOMES.has(outcome)) throw new Error('Choose a valid outcome.');
+
+  const search = String(input.search || '').trim().slice(0, 120);
+  const requestedLimit = Number.parseInt(input.limit ?? 100, 10);
+  const limit = Number.isInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 500) : 100;
+  return { from, to, targetId, type, status, outcome, search, limit };
+}
+
+function mapHistoryResult(row) {
+  return {
+    id: row.id,
+    targetId: row.target_id,
+    targetName: row.target_name,
+    targetType: row.target_type,
+    checkedAt: row.checked_at,
+    ok: bool(row.ok),
+    status: row.status,
+    message: row.message,
+    latencyMs: row.latency_ms,
+    details: parseJson(row.details_json)
+  };
+}
+
 class LocalDatabase {
   constructor(filePath) {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -194,6 +263,7 @@ class LocalDatabase {
         details_json TEXT NOT NULL DEFAULT '{}'
       );
       CREATE INDEX IF NOT EXISTS idx_check_results_target_time ON check_results(target_id, checked_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_check_results_time ON check_results(checked_at DESC);
       CREATE TABLE IF NOT EXISTS incidents (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         target_id INTEGER NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
@@ -230,6 +300,14 @@ class LocalDatabase {
         value TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS app_runtime_sessions (
+        id TEXT PRIMARY KEY,
+        started_at TEXT NOT NULL,
+        ended_at TEXT,
+        end_reason TEXT,
+        details_json TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE INDEX IF NOT EXISTS idx_app_runtime_sessions_end ON app_runtime_sessions(ended_at DESC);
       CREATE TABLE IF NOT EXISTS outbound_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         event_type TEXT NOT NULL,
@@ -251,6 +329,91 @@ class LocalDatabase {
 
   getSetupState() {
     return { requiresSetup: !this.hasSuperAdmin(), viewerLimit: 5 };
+  }
+
+  getAppSettings() {
+    const rows = this.db.prepare('SELECT key, value FROM app_settings').all();
+    const stored = new Map(rows.map((row) => [row.key, row.value]));
+    return Object.fromEntries(Object.entries(APP_SETTING_KEYS).map(([name, key]) => [
+      name,
+      name === 'notificationDurationSeconds'
+        ? (Number.isInteger(Number(stored.get(key))) && Number(stored.get(key)) >= 1 && Number(stored.get(key)) <= 300
+          ? Number(stored.get(key)) : DEFAULT_APP_SETTINGS[name])
+        : storedBool(stored.get(key), DEFAULT_APP_SETTINGS[name])
+    ]));
+  }
+
+  updateAppSettings(input, actorUserId) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Settings are required.');
+    const settings = this.getAppSettings();
+    for (const name of Object.keys(APP_SETTING_KEYS)) {
+      if (!Object.hasOwn(input, name)) continue;
+      if (name === 'notificationDurationSeconds') {
+        if (!Number.isInteger(input[name]) || input[name] < 1 || input[name] > 300) {
+          throw new Error('Notification duration must be a whole number from 1 to 300 seconds.');
+        }
+      } else if (typeof input[name] !== 'boolean') throw new Error('Each setting must be enabled or disabled.');
+      settings[name] = input[name];
+    }
+    const timestamp = now();
+    const save = this.db.transaction(() => {
+      for (const [name, key] of Object.entries(APP_SETTING_KEYS)) {
+        this.db.prepare(`INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
+          .run(key, String(settings[name]), timestamp);
+      }
+    });
+    save();
+    this.audit(actorUserId, 'update_app_settings', 'app_settings', null, settings);
+    return settings;
+  }
+
+  verifySuperAdminPassword(userId, password) {
+    const user = mapUserWithAuth(this.db.prepare('SELECT * FROM users WHERE id = ? AND role = ?').get(userId, ROLES.SUPER_ADMIN));
+    return Boolean(user && user.active && verifyPassword(password, user.passwordSalt, user.passwordHash));
+  }
+
+  startRuntimeSession(sessionId, details = {}) {
+    if (typeof sessionId !== 'string' || !sessionId) throw new Error('A runtime session ID is required.');
+    const timestamp = now();
+    const interrupted = this.db.prepare('SELECT id, started_at FROM app_runtime_sessions WHERE ended_at IS NULL').all();
+    const save = this.db.transaction(() => {
+      if (interrupted.length) {
+        this.db.prepare(`UPDATE app_runtime_sessions
+          SET ended_at = ?, end_reason = 'interrupted' WHERE ended_at IS NULL`).run(timestamp);
+        for (const run of interrupted) {
+          this.audit(null, 'unexpected_previous_shutdown', 'app_runtime_session', run.id, {
+            startedAt: run.started_at,
+            detectedAt: timestamp
+          });
+        }
+      }
+      this.db.prepare(`INSERT INTO app_runtime_sessions (id, started_at, details_json)
+        VALUES (?, ?, ?)`).run(sessionId, timestamp, JSON.stringify(details));
+      this.audit(null, 'app_started', 'app_runtime_session', sessionId, details);
+    });
+    save();
+    return { interruptedCount: interrupted.length };
+  }
+
+  endRuntimeSession(sessionId, reason = 'authorized_quit') {
+    if (typeof sessionId !== 'string' || !sessionId) return false;
+    const result = this.db.prepare(`UPDATE app_runtime_sessions
+      SET ended_at = ?, end_reason = ? WHERE id = ? AND ended_at IS NULL`).run(now(), reason, sessionId);
+    if (result.changes) this.audit(null, 'app_stopped', 'app_runtime_session', sessionId, { reason });
+    return Boolean(result.changes);
+  }
+
+  getRuntimeStatus() {
+    const latest = this.db.prepare(`SELECT started_at, ended_at, end_reason
+      FROM app_runtime_sessions ORDER BY started_at DESC LIMIT 1`).get();
+    const lastUnexpected = this.db.prepare(`SELECT started_at, ended_at
+      FROM app_runtime_sessions WHERE end_reason = 'interrupted' ORDER BY ended_at DESC LIMIT 1`).get();
+    return {
+      startedAt: latest?.started_at || null,
+      lastUnexpectedShutdownAt: lastUnexpected?.ended_at || null,
+      lastUnexpectedSessionStartedAt: lastUnexpected?.started_at || null
+    };
   }
 
   createInitialAdmin({ username, displayName, password }) {
@@ -313,6 +476,53 @@ class LocalDatabase {
     this.db.prepare('UPDATE users SET password_salt = ?, password_hash = ?, updated_at = ? WHERE id = ?')
       .run(record.salt, record.hash, now(), userId);
     this.audit(actorUserId, 'reset_viewer_password', 'user', String(userId), {});
+  }
+
+  changeUserPassword(userId, currentPassword, newPassword) {
+    const userRow = this.db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+    const user = mapUserWithAuth(userRow);
+    if (!user || !user.active) throw new Error('User not found or inactive.');
+    if (!verifyPassword(currentPassword || '', user.passwordSalt, user.passwordHash)) {
+      throw new Error('Current password is incorrect.');
+    }
+    const record = passwordRecord(newPassword);
+    this.db.prepare('UPDATE users SET password_salt = ?, password_hash = ?, updated_at = ? WHERE id = ?')
+      .run(record.salt, record.hash, now(), userId);
+    this.audit(userId, 'change_own_password', 'user', String(userId), {});
+    return { ok: true };
+  }
+
+  updateUserProfile(userId, { username, displayName }) {
+    const user = this.getUserById(userId);
+    if (!user) throw new Error('User not found.');
+    const normalizedUsername = validateUsername(username);
+    const trimmedDisplayName = String(displayName || normalizedUsername).trim().slice(0, 80);
+    try {
+      this.db.prepare('UPDATE users SET username = ?, display_name = ?, updated_at = ? WHERE id = ?')
+        .run(normalizedUsername, trimmedDisplayName, now(), userId);
+      this.audit(userId, 'update_profile', 'user', String(userId), { username: normalizedUsername, displayName: trimmedDisplayName });
+      return this.getUserById(userId);
+    } catch (error) {
+      if (/UNIQUE constraint failed/i.test(error.message)) throw new Error('That username is already taken.');
+      throw error;
+    }
+  }
+
+  updateViewer(userId, { username, displayName, active }, actorUserId) {
+    const user = this.getUserById(userId);
+    if (!user || user.role !== ROLES.VIEWER) throw new Error('Viewer account not found.');
+    const normalizedUsername = validateUsername(username);
+    const trimmedDisplayName = String(displayName || normalizedUsername).trim().slice(0, 80);
+    const isActive = active !== false;
+    try {
+      this.db.prepare('UPDATE users SET username = ?, display_name = ?, active = ?, updated_at = ? WHERE id = ?')
+        .run(normalizedUsername, trimmedDisplayName, isActive ? 1 : 0, now(), userId);
+      this.audit(actorUserId, 'update_viewer', 'user', String(userId), { username: normalizedUsername, displayName: trimmedDisplayName, active: isActive });
+      return this.getUserById(userId);
+    } catch (error) {
+      if (/UNIQUE constraint failed/i.test(error.message)) throw new Error('That username is already taken.');
+      throw error;
+    }
   }
 
   markLogin(userId) {
@@ -400,7 +610,7 @@ class LocalDatabase {
       successes = 0;
       failures += 1;
       if (failures >= target.failureThreshold) status = 'down';
-      else if (target.status === 'unknown') status = 'warning';
+      else status = wasDown ? 'down' : 'warning';
     }
 
     const transition = status !== target.status;
@@ -425,18 +635,59 @@ class LocalDatabase {
       VALUES (?, ?, ?, ?, ?, ?, ?)`)
       .run(targetId, timestamp, result.ok ? 1 : 0, status, String(result.message || ''), result.latencyMs ?? null, JSON.stringify(result.details || {}));
 
+    const finalTarget = this.getTarget(targetId);
     if (incidentEvent) {
+      incidentEvent.target = finalTarget;
       this.enqueueEvent(incidentEvent.kind === 'down' ? 'incident.opened' : 'incident.resolved', {
-        targetId, targetName: target.name, type: target.type, severity: target.severity, message: incidentEvent.message, occurredAt: timestamp
+        targetId, targetName: finalTarget.name, type: finalTarget.type, severity: finalTarget.severity, message: incidentEvent.message, occurredAt: timestamp
       });
     }
-    return { target: this.getTarget(targetId), result, status, transition, incidentEvent, wasHealthy };
+    return { target: finalTarget, result, status, previousStatus: target.status, transition, incidentEvent, wasHealthy };
   }
 
   recordNotification({ incidentId = null, targetId = null, kind, title, body, details = {} }) {
     this.db.prepare(`INSERT INTO notifications (incident_id, target_id, kind, title, body, delivered_at, details_json)
       VALUES (?, ?, ?, ?, ?, ?, ?)`)
       .run(incidentId, targetId, kind, title, body, now(), JSON.stringify(details));
+  }
+
+  listCheckHistory(filters = {}) {
+    const normalized = validateHistoryFilters(filters);
+    const clauses = [];
+    const parameters = [];
+    if (normalized.from) {
+      clauses.push('r.checked_at >= ?');
+      parameters.push(normalized.from);
+    }
+    if (normalized.to) {
+      clauses.push('r.checked_at <= ?');
+      parameters.push(normalized.to);
+    }
+    if (normalized.targetId) {
+      clauses.push('r.target_id = ?');
+      parameters.push(normalized.targetId);
+    }
+    if (normalized.type) {
+      clauses.push('t.type = ?');
+      parameters.push(normalized.type);
+    }
+    if (normalized.status) {
+      clauses.push('r.status = ?');
+      parameters.push(normalized.status);
+    }
+    if (normalized.outcome === 'success') clauses.push('r.ok = 1');
+    if (normalized.outcome === 'failure') clauses.push('r.ok = 0');
+    if (normalized.search) {
+      clauses.push("(t.name LIKE ? ESCAPE '\\' OR r.message LIKE ? ESCAPE '\\')");
+      const escapedSearch = `%${normalized.search.replace(/[\\%_]/g, '\\$&')}%`;
+      parameters.push(escapedSearch, escapedSearch);
+    }
+
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const rows = this.db.prepare(`SELECT r.*, t.name AS target_name, t.type AS target_type
+      FROM check_results r JOIN targets t ON t.id = r.target_id
+      ${where} ORDER BY r.checked_at DESC, r.id DESC LIMIT ?`).all(...parameters, normalized.limit);
+    return { filters: normalized, results: rows.map(mapHistoryResult) };
   }
 
   getDashboard() {
@@ -446,9 +697,7 @@ class LocalDatabase {
       .map((row) => ({ id: row.id, targetId: row.target_id, targetName: row.target_name, severity: row.severity, title: row.title, message: row.message, startedAt: row.started_at, acknowledgedAt: row.acknowledged_at }));
     const notifications = this.db.prepare('SELECT * FROM notifications ORDER BY delivered_at DESC LIMIT 20').all()
       .map((row) => ({ id: row.id, incidentId: row.incident_id, targetId: row.target_id, kind: row.kind, title: row.title, body: row.body, deliveredAt: row.delivered_at }));
-    const history = this.db.prepare(`SELECT r.*, t.name AS target_name FROM check_results r
-      JOIN targets t ON t.id = r.target_id ORDER BY r.checked_at DESC LIMIT 80`).all()
-      .map((row) => ({ id: row.id, targetId: row.target_id, targetName: row.target_name, checkedAt: row.checked_at, ok: bool(row.ok), status: row.status, message: row.message, latencyMs: row.latency_ms, details: parseJson(row.details_json) }));
+    const history = this.listCheckHistory({ limit: 80 }).results;
     const summary = {
       total: targets.filter((target) => target.enabled).length,
       healthy: targets.filter((target) => target.status === 'healthy').length,
@@ -484,4 +733,4 @@ class LocalDatabase {
   }
 }
 
-module.exports = { LocalDatabase, ROLES, CHECK_TYPES, STATUSES, validateTarget };
+module.exports = { LocalDatabase, ROLES, CHECK_TYPES, STATUSES, validateTarget, validateHistoryFilters };

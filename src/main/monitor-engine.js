@@ -2,10 +2,11 @@ const EventEmitter = require('node:events');
 const { executeCheck } = require('./checks');
 
 class MonitorEngine extends EventEmitter {
-  constructor({ database, notify }) {
+  constructor({ database, notify, check = executeCheck }) {
     super();
     this.database = database;
     this.notify = notify;
+    this.executeCheck = check;
     this.nextRunAt = new Map();
     this.runningTargets = new Set();
     this.timer = null;
@@ -62,11 +63,18 @@ class MonitorEngine extends EventEmitter {
     this.runningTargets.add(target.id);
     this.nextRunAt.set(target.id, Date.now() + target.intervalSeconds * 1000);
     try {
-      const result = await executeCheck(target);
+      const result = await this.executeCheck(target);
       const outcome = this.database.recordCheck(target.id, result);
-      if (outcome?.incidentEvent) {
-        const event = outcome.incidentEvent;
-        const title = event.kind === 'down' ? `Critical: ${event.target.name}` : `Recovered: ${event.target.name}`;
+      if (outcome?.transition) {
+        const event = outcome.incidentEvent || {
+          kind: outcome.status === 'healthy' ? (outcome.previousStatus === 'unknown' ? 'healthy' : 'recovered') : outcome.status,
+          target: outcome.target,
+          message: `${outcome.target.name}: ${outcome.previousStatus} → ${outcome.status}. ${result.message || ''}`
+        };
+        const prefix = event.kind === 'down'
+          ? (event.target.severity === 'critical' ? 'Critical' : event.target.severity === 'warning' ? 'Warning' : 'Alert')
+          : event.kind === 'recovered' ? 'Recovered' : event.kind === 'healthy' ? 'Healthy' : 'Warning';
+        const title = `${prefix}: ${event.target.name}`;
         this.database.recordNotification({
           incidentId: event.incidentId,
           targetId: target.id,
@@ -75,7 +83,15 @@ class MonitorEngine extends EventEmitter {
           body: event.message,
           details: { severity: event.target.severity, result }
         });
-        await this.notify?.({ kind: event.kind, title, body: event.message, target: event.target, result });
+        try {
+          await this.notify?.({
+            kind: event.kind, title, body: event.message, target: event.target, result,
+            previousStatus: outcome.previousStatus, occurredAt: outcome.target.lastCheckedAt
+          });
+        } catch (error) {
+          // A desktop notification failure must not prevent dashboard updates or future checks.
+          this.emit('notification-error', error);
+        }
       }
       this.emit('update', { type: 'check_complete', targetId: target.id, outcome });
       return outcome;

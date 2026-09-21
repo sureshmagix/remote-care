@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Remote Care notification</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body class="desktop-notification">
+    <article class="toast" id="notification" role="status" aria-live="polite" aria-atomic="true">
+      <span class="toast-icon" id="notification-icon" aria-hidden="true"></span>
+      <div class="toast-copy">
+        <strong class="toast-title" id="notification-title"></strong>
+        <span class="toast-body" id="notification-body"></span>
+        <time class="toast-time" id="notification-time"></time>
+        <div class="toast-actions"><button class="toast-btn" id="notification-open">Open dashboard</button></div>
+      </div>
+      <button class="toast-close" id="notification-close" type="button" aria-label="Dismiss notification">×</button>
+    </article>
+    <script src="notification.js"></script>
+  </body>
+</html>

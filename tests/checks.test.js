@@ -44,3 +44,10 @@ test('command runner captures a successful local command', async () => {
   assert.equal(result.exitCode, 0);
   assert.equal(result.stdout, 'ready');
 });
+
+test('system service check reports nonexistent service as down', async () => {
+  const { checkSystemService } = require('../src/main/checks');
+  const result = await checkSystemService('nonexistent_random_service_12345', 2_000);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /not running/i);
+});
