@@ -59,11 +59,11 @@ For a Raspberry Pi without a graphical desktop, Electron cannot show local notif
 
 ## Install from GitHub Releases
 
-Download the installer for the computer from the [GitHub Releases page](https://github.com/sureshmagix/remote-care/releases). The commands below use the current `1.1.0` asset names; use the matching version in a newer release.
+Download the installer for the computer from the [GitHub Releases page](https://github.com/sureshmagix/remote-care/releases). The commands below use the current `1.1.1` asset names; use the matching version in a newer release.
 
 ### Windows x64
 
-Download **`Remote Care Monitor Setup 1.1.0.exe`**, run it, and follow the installer prompts. It supports choosing the installation directory. To run without installing, download **`Remote Care Monitor 1.1.0.exe`** instead and launch it directly.
+Download **`Remote Care Monitor Setup 1.1.1.exe`**, run it, and follow the installer prompts. It supports choosing the installation directory. To run without installing, download **`Remote Care Monitor 1.1.1.exe`** instead and launch it directly.
 
 ### macOS
 
@@ -71,8 +71,8 @@ Download the disk image that matches the Mac processor:
 
 | Mac | Download |
 | --- | --- |
-| Apple Silicon (M1/M2/M3/M4) | `Remote Care Monitor-1.1.0-arm64.dmg` |
-| Intel | `Remote Care Monitor-1.1.0.dmg` |
+| Apple Silicon (M1/M2/M3/M4) | `Remote Care Monitor-1.1.1-arm64.dmg` |
+| Intel | `Remote Care Monitor-1.1.1.dmg` |
 
 Open the `.dmg`, drag **Remote Care Monitor** to **Applications**, then launch it from Applications. If macOS blocks the unsigned build after you have chosen to trust it, remove its quarantine flag in Terminal:
 
@@ -82,44 +82,54 @@ xattr -dr com.apple.quarantine "/Applications/Remote Care Monitor.app"
 
 ### Ubuntu / Debian Linux x64
 
-Confirm that the computer is `amd64`, download **`remote-care-phase1_1.1.0_amd64.deb`** from GitHub Releases, then install it from the download directory:
+Confirm that the computer is `amd64`, download **`remote-care-phase1_1.1.1_amd64.deb`** from GitHub Releases, then install it from the download directory:
 
 ```bash
 dpkg --print-architecture
 cd ~/Downloads
-sudo apt install ./remote-care-phase1_1.1.0_amd64.deb
+sudo apt install ./remote-care-phase1_1.1.1_amd64.deb
 ```
 
 Start **Remote Care Monitor** from the desktop application menu. To upgrade, download the newer `.deb` and run the same `sudo apt install ./...deb` command.
 
-If installing a `.deb` is not suitable, use the portable **`Remote Care Monitor-1.1.0.AppImage`** instead:
+If installing a `.deb` is not suitable, use the portable **`Remote Care Monitor-1.1.1.AppImage`** instead:
 
 ```bash
 cd ~/Downloads
-chmod +x "Remote Care Monitor-1.1.0.AppImage"
-./"Remote Care Monitor-1.1.0.AppImage"
+chmod +x "Remote Care Monitor-1.1.1.AppImage"
+./"Remote Care Monitor-1.1.1.AppImage"
 ```
 
 ### Raspberry Pi OS 64-bit
 
-This build is for **Raspberry Pi OS 64-bit with a graphical desktop**. Raspberry Pi OS Lite/headless systems and 32-bit Raspberry Pi OS are not supported by the Electron desktop app. Confirm the architecture is `aarch64`, download **`remote-care-phase1_1.1.0_arm64.deb`**, and install it:
+This build is for **Raspberry Pi OS 64-bit with a graphical desktop**. Raspberry Pi OS Lite/headless systems and 32-bit Raspberry Pi OS are not supported by the Electron desktop app. Confirm the architecture is `aarch64`, download **`remote-care-phase1_1.1.1_arm64.deb`**, and install it:
 
 ```bash
 uname -m
 cd ~/Downloads
 sudo apt update
-sudo apt install ./remote-care-phase1_1.1.0_arm64.deb
+sudo apt install ./remote-care-phase1_1.1.1_arm64.deb
 ```
 
 Launch **Remote Care Monitor** from the Raspberry Pi desktop menu. To use the portable ARM64 package instead:
 
 ```bash
 cd ~/Downloads
-chmod +x "Remote Care Monitor-1.1.0-arm64.AppImage"
-./"Remote Care Monitor-1.1.0-arm64.AppImage"
+chmod +x "Remote Care Monitor-1.1.1-arm64.AppImage"
+./"Remote Care Monitor-1.1.1-arm64.AppImage"
 ```
 
 The app must run in a graphical desktop session for its dashboard, tray icon, and desktop alerts. For a headless Pi, run monitoring through an approved service/watchdog deployment instead.
+
+## Start automatically after a reboot
+
+After the installed application is opened once, it registers itself to start automatically when that user next signs in. It starts hidden in the tray and resumes monitoring without opening the dashboard.
+
+- Windows: an enabled per-user Startup item is created for the installed executable.
+- macOS: a Login Item is registered. If **About this device → Automatic startup** says approval is required, enable Remote Care Monitor in **System Settings → General → Login Items**.
+- Ubuntu and Raspberry Pi OS with a graphical desktop: the app creates `~/.config/autostart/remote-care-monitor.desktop` (or `$XDG_CONFIG_HOME/autostart/...`) and starts at the next desktop-session login. AppImage installations use the persistent AppImage path.
+
+The **About this device** page reports whether registration succeeded, so it can be checked before rebooting. This is a desktop-session startup feature: the Electron dashboard, tray, and alerts cannot start before a user signs in or on Raspberry Pi OS Lite/headless systems.
 
 ## Check types
 
