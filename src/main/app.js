@@ -7,6 +7,7 @@ const { verifyPassword, SessionStore } = require('./auth');
 const { MonitorEngine } = require('./monitor-engine');
 const { getNetworkAdapters } = require('./checks');
 const { NotificationCenter } = require('./notification-center');
+const { configureAutostart, startedInBackground } = require('./autostart');
 
 app.setName('Remote Care Monitor');
 if (process.platform === 'win32') {
@@ -25,6 +26,8 @@ let trayClockTimer;
 let pendingProtectedQuit = false;
 let runtimeSessionId;
 let shutdownComplete = false;
+let autostartStatus = { enabled: false, message: 'Automatic startup has not been checked yet' };
+let startedAtLogin = false;
 const sessions = new SessionStore();
 
 function csvCell(value) {
@@ -187,19 +190,6 @@ function showWindow() {
   }
   window.focus();
   broadcast('monitor-update', { type: 'window_focused' });
-}
-
-function setupAutostart() {
-  if (process.platform === 'win32' || process.platform === 'darwin') {
-    app.setLoginItemSettings({ openAtLogin: true, openAsHidden: true, args: ['--background'] });
-    return;
-  }
-  if (process.platform === 'linux' && app.isPackaged) {
-    const autostartDir = path.join(app.getPath('home'), '.config', 'autostart');
-    fs.mkdirSync(autostartDir, { recursive: true });
-    const execPath = process.execPath.replace(/"/g, '\\"');
-    fs.writeFileSync(path.join(autostartDir, 'remote-care-monitor.desktop'), `[Desktop Entry]\nType=Application\nName=Remote Care Monitor\nComment=Local network and service monitor\nExec=\"${execPath}\" --background\nTerminal=false\nX-GNOME-Autostart-enabled=true\n`);
-  }
 }
 
 function requireSession(token, requiredRole = null) {
@@ -416,19 +406,21 @@ function registerIpc() {
     requireSession(token);
     return {
       version: app.getVersion(), platform: process.platform, arch: process.arch, dataPath: app.getPath('userData'),
-      cloudSync: 'Phase 2 disabled', runtime: database.getRuntimeStatus()
+      cloudSync: 'Phase 2 disabled', runtime: database.getRuntimeStatus(), autostart: autostartStatus
     };
   });
 }
 
 app.whenReady().then(() => {
+  startedAtLogin = startedInBackground({ app });
+  autostartStatus = configureAutostart({ app });
   const databasePath = path.join(app.getPath('userData'), 'remote-care.sqlite');
   database = new LocalDatabase(databasePath);
   runtimeSessionId = crypto.randomUUID();
   database.startRuntimeSession(runtimeSessionId, {
     version: app.getVersion(),
     platform: process.platform,
-    startedInBackground: process.argv.includes('--background')
+    startedInBackground: startedAtLogin
   });
   monitor = new MonitorEngine({ database, notify });
   notificationCenter = new NotificationCenter({ openDashboard: showWindow });
@@ -442,14 +434,12 @@ app.whenReady().then(() => {
   updateTray();
   trayClockTimer = setInterval(updateTray, 60_000);
   trayClockTimer.unref?.();
-  setupAutostart();
-
   if (database.hasSuperAdmin()) {
     database.createDefaultTargets();
     monitor.start();
   }
   createWindow();
-  if (!process.argv.includes('--background') || !database.hasSuperAdmin()) showWindow();
+  if (!startedAtLogin || !database.hasSuperAdmin()) showWindow();
 });
 
 app.on('second-instance', () => showWindow());
