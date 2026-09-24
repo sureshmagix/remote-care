@@ -44,7 +44,7 @@ function runCommand(command, args, timeoutMs = 5_000) {
 function adapterKind(name, description = '') {
   const text = `${name} ${description}`.toLowerCase();
   if (/(wi-?fi|wireless|wlan|airport|802\.11)/.test(text)) return 'wireless';
-  if (/(ethernet|wired|\beth\d|\ben[ops]\d|\bens\d|\benp\d)/.test(text)) return 'wired';
+  if (/(ethernet|wired|\blan\b|\beth\d+|\ben\d+|\ben[ops]\d+)/.test(text)) return 'wired';
   if (/(loopback|\blo\b)/.test(text)) return 'loopback';
   return 'other';
 }
@@ -85,20 +85,37 @@ function parseMacHardwarePorts(output) {
 }
 
 async function getMacAdapters() {
-  const hardware = await runCommand('networksetup', ['-listallhardwareports'], 5_000);
+  const [hardware, ifconfigResult] = await Promise.all([
+    runCommand('networksetup', ['-listallhardwareports'], 5_000),
+    runCommand('ifconfig', [], 3_000)
+  ]);
   const ports = hardware.exitCode === 0 ? parseMacHardwarePorts(hardware.stdout) : [];
   const known = new Map(ports.map((item) => [item.name, item]));
-  // Combine all hardware ports and interfaces so disconnected devices (like Wi-Fi en0 without an IP) are always included
+
+  const blocks = new Map();
+  let current = null;
+  for (const line of ifconfigResult.stdout.split('\n')) {
+    const match = line.match(/^([a-zA-Z0-9_]+):\s+flags=/);
+    if (match) {
+      current = match[1];
+      blocks.set(current, line);
+    } else if (current) {
+      blocks.set(current, blocks.get(current) + '\n' + line);
+    }
+  }
+
+  // Combine physical hardware ports plus any physical non-virtual interfaces
   const allNames = new Set([
     ...ports.map((item) => item.name),
-    ...Object.keys(os.networkInterfaces()).filter((name) => name !== 'lo0')
+    ...Object.keys(os.networkInterfaces()).filter((name) => !/^(lo\d*|utun\d*|llw\d*|awdl\d*|gif\d*|stf\d*|p2p\d*|ipsec\d*|ap\d*|vboxnet\d*|vmnet\d*)/i.test(name))
   ]);
+
   const adapters = [];
   for (const name of allNames) {
-    const result = await runCommand('ifconfig', [name], 3_000);
-    const text = `${result.stdout}\n${result.stderr}`;
+    const text = blocks.get(name) || '';
     const mapped = known.get(name);
-    const active = /status:\s+active/i.test(text);
+    const hasIp = /inet\s+(?!127\.)\d+\.\d+\.\d+\.\d+/.test(text);
+    const active = /status:\s+active/i.test(text) || hasIp;
     adapters.push({
       name,
       description: mapped?.description || name,

@@ -1,6 +1,8 @@
 const path = require('node:path');
 const { BrowserWindow, ipcMain, screen, Notification } = require('electron');
 
+const RENDERER_READY_TIMEOUT_MS = 3_000;
+
 // Own the popup and its lifetime so desktop notification preferences cannot
 // silently suppress alerts or choose a different timeout. Queue bursts so every
 // change gets its full display time, including while the dashboard is hidden.
@@ -13,20 +15,35 @@ class NotificationCenter {
     this.ready = false;
     this.sequence = 0;
     this.timer = null;
+    this.readyTimer = null;
     this.nativeNotifications = new Map();
     this.handlers = {
       'desktop-notification-ready': (event) => {
         if (!this.isSender(event)) return;
         this.ready = true;
+        clearTimeout(this.readyTimer);
+        this.readyTimer = null;
         this.showNext();
       },
       'desktop-notification-visible': (event, id, height) => {
         if (!this.isSender(event) || id !== this.current?.id || this.timer) return;
-        const area = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea;
-        const width = Math.min(440, area.width);
-        const popupHeight = Math.min(Math.max(140, Number.isFinite(height) ? Math.ceil(height) : 200), area.height);
+        const cursor = screen.getCursorScreenPoint ? screen.getCursorScreenPoint() : { x: 0, y: 0 };
+        const display = (screen.getDisplayNearestPoint ? screen.getDisplayNearestPoint(cursor) : null)
+          || (screen.getPrimaryDisplay ? screen.getPrimaryDisplay() : { workArea: { x: 0, y: 0, width: 1280, height: 720 } });
+        const area = display.workArea;
+        const width = Math.min(360, area.width);
+        const popupHeight = Math.min(Math.max(96, Number.isFinite(height) ? Math.ceil(height) : 118), area.height);
         this.window.setBounds({ x: area.x + area.width - width, y: area.y, width, height: popupHeight });
+        if (typeof this.window.setVisibleOnAllWorkspaces === 'function') {
+          this.window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+        }
+        if (typeof this.window.setAlwaysOnTop === 'function') {
+          this.window.setAlwaysOnTop(true, 'pop-up-menu');
+        }
         this.window.showInactive();
+        if (typeof this.window.moveTop === 'function') {
+          this.window.moveTop();
+        }
         this.timer = setTimeout(() => this.dismiss(id), this.current.durationMs);
       },
       'desktop-notification-dismiss': (event, id) => {
@@ -54,7 +71,7 @@ class NotificationCenter {
   createWindow() {
     this.ready = false;
     const window = new BrowserWindow({
-      width: 440, height: 200, show: false, frame: false,
+      width: 360, height: 118, show: false, frame: false,
       resizable: false, minimizable: false, maximizable: false,
       alwaysOnTop: true, skipTaskbar: true, backgroundColor: '#0d2132',
       title: 'Remote Care notification',
@@ -65,8 +82,12 @@ class NotificationCenter {
       }
     });
     this.window = window;
-    window.setAlwaysOnTop(true, 'pop-up-menu');
-    window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+    if (typeof window.setAlwaysOnTop === 'function') {
+      window.setAlwaysOnTop(true, 'pop-up-menu');
+    }
+    if (typeof window.setVisibleOnAllWorkspaces === 'function') {
+      window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+    }
     window.removeMenu();
     window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
     window.webContents.on('will-navigate', (event) => event.preventDefault());
@@ -75,8 +96,14 @@ class NotificationCenter {
       if (this.current) this.dismiss(this.current.id);
       else window.hide();
     });
+    window.webContents.on('did-fail-load', (_event, errorCode) => {
+      if (errorCode !== -3) this.fallback(); // -3 is a benign cancelled navigation.
+    });
     window.webContents.on('render-process-gone', () => this.fallback());
     window.loadFile(path.join(__dirname, '..', 'renderer', 'notification.html')).catch(() => this.fallback());
+    this.readyTimer = setTimeout(() => {
+      if (!this.ready && this.queue.length) this.fallback();
+    }, RENDERER_READY_TIMEOUT_MS);
   }
 
   showNext() {
@@ -100,6 +127,8 @@ class NotificationCenter {
     this.queue = [];
     clearTimeout(this.timer);
     this.timer = null;
+    clearTimeout(this.readyTimer);
+    this.readyTimer = null;
     this.ready = false;
     this.window?.destroy();
     this.window = null;
@@ -107,7 +136,7 @@ class NotificationCenter {
       if (!Notification.isSupported()) continue;
       const notification = new Notification({
         title: event.title,
-        body: `${event.body}\n${new Date(event.occurredAt).toLocaleString()}`,
+        body: `${event.target?.locationName ? `${event.target.locationName}\n` : ''}${event.body}\n${new Date(event.occurredAt).toLocaleString()}`,
         closeButtonText: 'Close', timeoutType: 'never'
       });
       const dispose = () => {
@@ -124,6 +153,7 @@ class NotificationCenter {
 
   dispose() {
     clearTimeout(this.timer);
+    clearTimeout(this.readyTimer);
     for (const [notification, timer] of this.nativeNotifications) {
       clearTimeout(timer);
       notification.close();

@@ -9,6 +9,8 @@ contextBridge.exposeInMainWorld('remoteCare', {
   logout: (token) => invoke('logout', { token }),
   getDashboard: (token) => invoke('dashboard', { token }),
   getCheckHistory: (token, filters) => invoke('history-list', { token, filters }),
+  exportMonthlyReport: (token, month) => invoke('history-export-monthly-report', { token, month }),
+  testNotification: (token) => invoke('notification-test', { token }),
   getNetworkAdapters: (token) => invoke('network-adapters', { token }),
   saveTarget: (token, target) => invoke('target-save', { token, target }),
   deleteTarget: (token, targetId) => invoke('target-delete', { token, targetId }),

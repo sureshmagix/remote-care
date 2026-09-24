@@ -8,8 +8,9 @@ Remote Care Monitor is a local-first desktop monitoring application for Windows,
 - Local Super Admin setup and Viewer-only accounts.
 - Connectivity monitoring: Wi-Fi/Ethernet link, default gateway and external internet.
 - Configurable ICMP ping, TCP port, HTTP/HTTPS, system-service and process checks.
+- A required location name on every monitor, shown in monitor lists, incidents, alerts, history, and reports.
 - Timestamped desktop alerts for every monitor status transition, including initial health, warnings, failures, and recoveries, with deduplication and per-alert toggles in Settings.
-- Local SQLite dashboard, timestamped incident/check history, response timings, and audit log.
+- Local SQLite dashboard, timestamped incident/check history, response timings, audit log, and monthly CSV report export.
 - Queue table ready for Phase 2 HTTPS or MQTT cloud publishing; Phase 1 never transmits data.
 
 ## Important behavior
@@ -20,7 +21,7 @@ The Super Admin can open **Settings → Alert notifications → Notification dur
 
 Desktop stacking and placement depend on the window manager; [Electron cannot enforce always-on-top positioning on Wayland](https://www.electronjs.org/docs/latest/api/browser-window#winsetalwaysontopflag-level-relativelevel). If the popup renderer fails, the app attempts a native notification with the same timestamp and a timed close request, whose presentation is controlled by the operating system. A graphical desktop session is required.
 
-Every completed monitor check is stored in the local SQLite database with a UTC timestamp to millisecond precision and is shown in the dashboard in the device's local date, time, and time zone. The **History** page can filter recorded checks by date/time range, monitor, monitor type, outcome, recorded status, and monitor/message text. The tray menu also shows its local update time and the most recent recorded check.
+The first monitor result and every later material change in outcome, status, message, or result details are stored in the local SQLite database with a UTC timestamp to millisecond precision; normal response-time variation alone does not create another history row. The live monitor status and latency still update on every completed check. The **History** page can filter recorded changes by date/time range, location, monitor, monitor type, outcome, recorded status, and text, and can export any selected month as a local CSV report. The tray menu also shows its local update time and the most recent completed check.
 
 Each app run is recorded locally. If a prior run did not get a clean, password-authorized shutdown—for example, because the process was terminated—the next launch records it as an unexpected shutdown and surfaces it in **About this device**. An ordinary desktop app cannot prevent an operating-system administrator from ending its process or reliably restart itself after a force kill. For managed, organization-owned devices that require automatic recovery after termination, deploy the monitor under an approved OS service/watchdog and device-management policy.
 
@@ -55,6 +56,70 @@ Outputs are written to `release/`.
 | Raspberry Pi OS 64-bit | `npm run dist` | ARM64 `.deb` and AppImage |
 
 For a Raspberry Pi without a graphical desktop, Electron cannot show local notifications. The reusable monitoring core can later be run as a system service and publish to the Phase 2 cloud endpoint.
+
+## Install from GitHub Releases
+
+Download the installer for the computer from the [GitHub Releases page](https://github.com/sureshmagix/remote-care/releases). The commands below use the current `1.1.0` asset names; use the matching version in a newer release.
+
+### Windows x64
+
+Download **`Remote Care Monitor Setup 1.1.0.exe`**, run it, and follow the installer prompts. It supports choosing the installation directory. To run without installing, download **`Remote Care Monitor 1.1.0.exe`** instead and launch it directly.
+
+### macOS
+
+Download the disk image that matches the Mac processor:
+
+| Mac | Download |
+| --- | --- |
+| Apple Silicon (M1/M2/M3/M4) | `Remote Care Monitor-1.1.0-arm64.dmg` |
+| Intel | `Remote Care Monitor-1.1.0.dmg` |
+
+Open the `.dmg`, drag **Remote Care Monitor** to **Applications**, then launch it from Applications. If macOS blocks the unsigned build after you have chosen to trust it, remove its quarantine flag in Terminal:
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/Remote Care Monitor.app"
+```
+
+### Ubuntu / Debian Linux x64
+
+Confirm that the computer is `amd64`, download **`remote-care-phase1_1.1.0_amd64.deb`** from GitHub Releases, then install it from the download directory:
+
+```bash
+dpkg --print-architecture
+cd ~/Downloads
+sudo apt install ./remote-care-phase1_1.1.0_amd64.deb
+```
+
+Start **Remote Care Monitor** from the desktop application menu. To upgrade, download the newer `.deb` and run the same `sudo apt install ./...deb` command.
+
+If installing a `.deb` is not suitable, use the portable **`Remote Care Monitor-1.1.0.AppImage`** instead:
+
+```bash
+cd ~/Downloads
+chmod +x "Remote Care Monitor-1.1.0.AppImage"
+./"Remote Care Monitor-1.1.0.AppImage"
+```
+
+### Raspberry Pi OS 64-bit
+
+This build is for **Raspberry Pi OS 64-bit with a graphical desktop**. Raspberry Pi OS Lite/headless systems and 32-bit Raspberry Pi OS are not supported by the Electron desktop app. Confirm the architecture is `aarch64`, download **`remote-care-phase1_1.1.0_arm64.deb`**, and install it:
+
+```bash
+uname -m
+cd ~/Downloads
+sudo apt update
+sudo apt install ./remote-care-phase1_1.1.0_arm64.deb
+```
+
+Launch **Remote Care Monitor** from the Raspberry Pi desktop menu. To use the portable ARM64 package instead:
+
+```bash
+cd ~/Downloads
+chmod +x "Remote Care Monitor-1.1.0-arm64.AppImage"
+./"Remote Care Monitor-1.1.0-arm64.AppImage"
+```
+
+The app must run in a graphical desktop session for its dashboard, tray icon, and desktop alerts. For a headless Pi, run monitoring through an approved service/watchdog deployment instead.
 
 ## Check types
 

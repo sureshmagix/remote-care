@@ -78,10 +78,11 @@ class MonitorEngine extends EventEmitter {
         this.database.recordNotification({
           incidentId: event.incidentId,
           targetId: target.id,
+          locationName: event.target.locationName,
           kind: event.kind,
           title,
           body: event.message,
-          details: { severity: event.target.severity, result }
+          details: { severity: event.target.severity, locationName: event.target.locationName, result }
         });
         try {
           await this.notify?.({

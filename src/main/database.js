@@ -8,6 +8,7 @@ const CHECK_TYPES = new Set(['internet', 'interface', 'gateway', 'ping', 'tcp', 
 const STATUSES = new Set(['unknown', 'healthy', 'warning', 'down', 'disabled']);
 const HISTORY_STATUSES = new Set(['unknown', 'healthy', 'warning', 'down']);
 const HISTORY_OUTCOMES = new Set(['all', 'success', 'failure']);
+const DEFAULT_LOCATION_NAME = 'Local device';
 const DEFAULT_APP_SETTINGS = Object.freeze({
   minimizeToTray: true,
   showTrayReminder: true,
@@ -34,6 +35,30 @@ function parseJson(value, fallback = {}) {
   } catch {
     return fallback;
   }
+}
+
+function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === 'object') {
+    return Object.keys(value).sort().reduce((result, key) => {
+      if (value[key] !== undefined) result[key] = canonicalize(value[key]);
+      return result;
+    }, {});
+  }
+  if (typeof value === 'number' && !Number.isFinite(value)) return null;
+  return value;
+}
+
+function resultSignature(result, status) {
+  // Response timing naturally varies between checks; including it would defeat
+  // change-only history storage. The outcome, status, message, and details are
+  // the meaningful result state that users need to audit.
+  return JSON.stringify({
+    ok: Boolean(result.ok),
+    status,
+    message: String(result.message || '').replace(/\b\d+(?:\.\d+)?\s*ms\b/gi, '<latency>'),
+    details: canonicalize(result.details || {})
+  });
 }
 
 function bool(value) {
@@ -69,6 +94,7 @@ function mapTarget(row) {
   return {
     id: row.id,
     name: row.name,
+    locationName: row.location_name || DEFAULT_LOCATION_NAME,
     type: row.type,
     host: row.host || '',
     port: row.port || '',
@@ -102,6 +128,8 @@ function validateTarget(input) {
   if (!CHECK_TYPES.has(type)) throw new Error('Unsupported monitor type.');
   const name = String(input.name || '').trim();
   if (name.length < 2 || name.length > 80) throw new Error('Monitor name must be 2–80 characters.');
+  const locationName = String(input.locationName ?? DEFAULT_LOCATION_NAME).trim();
+  if (locationName.length < 2 || locationName.length > 100) throw new Error('Location name must be 2–100 characters.');
 
   const toPositiveInteger = (value, fallback, minimum, maximum) => {
     const result = Number.parseInt(value ?? fallback, 10);
@@ -134,6 +162,7 @@ function validateTarget(input) {
   return {
     id: input.id ? Number.parseInt(input.id, 10) : null,
     name,
+    locationName,
     type,
     host,
     port,
@@ -181,9 +210,20 @@ function validateHistoryFilters(input = {}) {
   if (!HISTORY_OUTCOMES.has(outcome)) throw new Error('Choose a valid outcome.');
 
   const search = String(input.search || '').trim().slice(0, 120);
+  const location = String(input.location || '').trim().slice(0, 100);
   const requestedLimit = Number.parseInt(input.limit ?? 100, 10);
   const limit = Number.isInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 500) : 100;
-  return { from, to, targetId, type, status, outcome, search, limit };
+  return { from, to, targetId, type, status, outcome, search, location, limit };
+}
+
+function validateReportMonth(value) {
+  const match = String(value || '').match(/^(\d{4})-(0[1-9]|1[0-2])$/);
+  if (!match) throw new Error('Choose a valid report month.');
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const from = new Date(Date.UTC(year, month - 1, 1));
+  const to = new Date(Date.UTC(year, month, 1));
+  return { month: `${match[1]}-${match[2]}`, from: from.toISOString(), to: to.toISOString() };
 }
 
 function mapHistoryResult(row) {
@@ -191,6 +231,7 @@ function mapHistoryResult(row) {
     id: row.id,
     targetId: row.target_id,
     targetName: row.target_name,
+    locationName: row.location_name || DEFAULT_LOCATION_NAME,
     targetType: row.target_type,
     checkedAt: row.checked_at,
     ok: bool(row.ok),
@@ -227,6 +268,7 @@ class LocalDatabase {
       CREATE TABLE IF NOT EXISTS targets (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
+        location_name TEXT NOT NULL DEFAULT 'Local device',
         type TEXT NOT NULL,
         host TEXT,
         port INTEGER,
@@ -256,17 +298,20 @@ class LocalDatabase {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         target_id INTEGER NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
         checked_at TEXT NOT NULL,
+        location_name TEXT NOT NULL DEFAULT 'Local device',
         ok INTEGER NOT NULL,
         status TEXT NOT NULL,
         message TEXT NOT NULL,
         latency_ms INTEGER,
-        details_json TEXT NOT NULL DEFAULT '{}'
+        details_json TEXT NOT NULL DEFAULT '{}',
+        result_signature TEXT NOT NULL DEFAULT ''
       );
       CREATE INDEX IF NOT EXISTS idx_check_results_target_time ON check_results(target_id, checked_at DESC);
       CREATE INDEX IF NOT EXISTS idx_check_results_time ON check_results(checked_at DESC);
       CREATE TABLE IF NOT EXISTS incidents (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         target_id INTEGER NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
+        location_name TEXT NOT NULL DEFAULT 'Local device',
         severity TEXT NOT NULL,
         title TEXT NOT NULL,
         message TEXT NOT NULL,
@@ -280,6 +325,7 @@ class LocalDatabase {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         incident_id INTEGER REFERENCES incidents(id) ON DELETE SET NULL,
         target_id INTEGER REFERENCES targets(id) ON DELETE SET NULL,
+        location_name TEXT NOT NULL DEFAULT 'Local device',
         kind TEXT NOT NULL,
         title TEXT NOT NULL,
         body TEXT NOT NULL,
@@ -317,6 +363,38 @@ class LocalDatabase {
         attempts INTEGER NOT NULL DEFAULT 0
       );
     `);
+
+    // SQLite migrations for existing local installations. New tables receive
+    // these fields from the schema above; existing rows retain a meaningful
+    // location instead of becoming blank in history and reports.
+    const columns = (table) => new Set(this.db.prepare(`PRAGMA table_info(${table})`).all().map((column) => column.name));
+    const targetColumns = columns('targets');
+    if (!targetColumns.has('location_name')) {
+      this.db.exec(`ALTER TABLE targets ADD COLUMN location_name TEXT NOT NULL DEFAULT '${DEFAULT_LOCATION_NAME}'`);
+    }
+    const resultColumns = columns('check_results');
+    if (!resultColumns.has('location_name')) {
+      this.db.exec(`ALTER TABLE check_results ADD COLUMN location_name TEXT NOT NULL DEFAULT '${DEFAULT_LOCATION_NAME}'`);
+    }
+    if (!resultColumns.has('result_signature')) {
+      this.db.exec("ALTER TABLE check_results ADD COLUMN result_signature TEXT NOT NULL DEFAULT ''");
+    }
+    const incidentColumns = columns('incidents');
+    if (!incidentColumns.has('location_name')) {
+      this.db.exec(`ALTER TABLE incidents ADD COLUMN location_name TEXT NOT NULL DEFAULT '${DEFAULT_LOCATION_NAME}'`);
+    }
+    const notificationColumns = columns('notifications');
+    if (!notificationColumns.has('location_name')) {
+      this.db.exec(`ALTER TABLE notifications ADD COLUMN location_name TEXT NOT NULL DEFAULT '${DEFAULT_LOCATION_NAME}'`);
+    }
+    this.db.prepare('UPDATE targets SET location_name = ? WHERE location_name IS NULL OR TRIM(location_name) = ?')
+      .run(DEFAULT_LOCATION_NAME, '');
+    this.db.prepare(`UPDATE check_results SET location_name = COALESCE(NULLIF((SELECT location_name FROM targets WHERE targets.id = check_results.target_id), ''), ?)
+      WHERE location_name IS NULL OR TRIM(location_name) = ''`).run(DEFAULT_LOCATION_NAME);
+    this.db.prepare(`UPDATE incidents SET location_name = COALESCE(NULLIF((SELECT location_name FROM targets WHERE targets.id = incidents.target_id), ''), ?)
+      WHERE location_name IS NULL OR TRIM(location_name) = ''`).run(DEFAULT_LOCATION_NAME);
+    this.db.prepare(`UPDATE notifications SET location_name = COALESCE(NULLIF((SELECT location_name FROM targets WHERE targets.id = notifications.target_id), ''), ?)
+      WHERE location_name IS NULL OR TRIM(location_name) = ''`).run(DEFAULT_LOCATION_NAME);
   }
 
   close() {
@@ -541,15 +619,15 @@ class LocalDatabase {
     if (this.db.prepare('SELECT COUNT(*) AS count FROM targets').get().count > 0) return;
     const defaults = [
       {
-        name: 'Network interface', type: 'interface', interfaceName: 'auto', intervalSeconds: 5, timeoutMs: 2000,
+        name: 'Network interface', locationName: DEFAULT_LOCATION_NAME, type: 'interface', interfaceName: 'auto', intervalSeconds: 5, timeoutMs: 2000,
         failureThreshold: 1, recoveryThreshold: 1, severity: 'critical', downMessage: 'Network adapter is disconnected.', recoveryMessage: 'Network adapter is connected.', metadata: {}
       },
       {
-        name: 'Default gateway', type: 'gateway', intervalSeconds: 8, timeoutMs: 2500,
+        name: 'Default gateway', locationName: DEFAULT_LOCATION_NAME, type: 'gateway', intervalSeconds: 8, timeoutMs: 2500,
         failureThreshold: 2, recoveryThreshold: 1, severity: 'warning', downMessage: 'Local network gateway is not reachable.', recoveryMessage: 'Local network gateway is reachable again.', metadata: {}
       },
       {
-        name: 'Internet connection', type: 'internet', url: 'https://www.cloudflare.com/cdn-cgi/trace', intervalSeconds: 10, timeoutMs: 5000,
+        name: 'Internet connection', locationName: DEFAULT_LOCATION_NAME, type: 'internet', url: 'https://www.cloudflare.com/cdn-cgi/trace', intervalSeconds: 10, timeoutMs: 5000,
         failureThreshold: 2, recoveryThreshold: 1, severity: 'critical', downMessage: 'Internet connection has been lost.', recoveryMessage: 'Internet connection has been restored.', metadata: { dnsHost: 'cloudflare.com' }
       }
     ];
@@ -560,7 +638,7 @@ class LocalDatabase {
     const target = validateTarget(input);
     const timestamp = now();
     const values = [
-      target.name, target.type, target.host || null, target.port, target.url || null, target.interfaceName || null,
+      target.name, target.locationName, target.type, target.host || null, target.port, target.url || null, target.interfaceName || null,
       target.serviceName || null, target.processName || null, target.intervalSeconds, target.timeoutMs,
       target.failureThreshold, target.recoveryThreshold, target.severity, target.downMessage, target.recoveryMessage,
       target.enabled ? 1 : 0, JSON.stringify(target.metadata), timestamp
@@ -568,18 +646,18 @@ class LocalDatabase {
     let id = target.id;
     if (id && this.getTarget(id)) {
       this.db.prepare(`UPDATE targets SET
-        name=?, type=?, host=?, port=?, url=?, interface_name=?, service_name=?, process_name=?, interval_seconds=?, timeout_ms=?,
+        name=?, location_name=?, type=?, host=?, port=?, url=?, interface_name=?, service_name=?, process_name=?, interval_seconds=?, timeout_ms=?,
         failure_threshold=?, recovery_threshold=?, severity=?, down_message=?, recovery_message=?, enabled=?, metadata_json=?, updated_at=?
         WHERE id=?`).run(...values, id);
-      if (!internal) this.audit(actorUserId, 'update_monitor', 'target', String(id), { name: target.name, type: target.type });
+      if (!internal) this.audit(actorUserId, 'update_monitor', 'target', String(id), { name: target.name, locationName: target.locationName, type: target.type });
     } else {
       const info = this.db.prepare(`INSERT INTO targets
-        (name, type, host, port, url, interface_name, service_name, process_name, interval_seconds, timeout_ms,
+        (name, location_name, type, host, port, url, interface_name, service_name, process_name, interval_seconds, timeout_ms,
         failure_threshold, recovery_threshold, severity, down_message, recovery_message, enabled, metadata_json, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .run(...values, timestamp);
       id = info.lastInsertRowid;
-      if (!internal) this.audit(actorUserId, 'create_monitor', 'target', String(id), { name: target.name, type: target.type });
+      if (!internal) this.audit(actorUserId, 'create_monitor', 'target', String(id), { name: target.name, locationName: target.locationName, type: target.type });
     }
     return this.getTarget(id);
   }
@@ -618,8 +696,8 @@ class LocalDatabase {
     if (!wasDown && status === 'down') {
       incidentStartedAt = timestamp;
       const incident = this.db.prepare(`INSERT INTO incidents
-        (target_id, severity, title, message, started_at) VALUES (?, ?, ?, ?, ?)`)
-        .run(target.id, target.severity, `${target.name} is unavailable`, target.downMessage || result.message, timestamp);
+        (target_id, location_name, severity, title, message, started_at) VALUES (?, ?, ?, ?, ?, ?)`)
+        .run(target.id, target.locationName, target.severity, `${target.name} is unavailable`, target.downMessage || result.message, timestamp);
       incidentEvent = { kind: 'down', incidentId: incident.lastInsertRowid, target, message: target.downMessage || result.message };
     } else if (wasDown && status === 'healthy') {
       const activeIncident = this.db.prepare('SELECT * FROM incidents WHERE target_id = ? AND resolved_at IS NULL ORDER BY id DESC LIMIT 1').get(target.id);
@@ -631,24 +709,31 @@ class LocalDatabase {
     this.db.prepare(`UPDATE targets SET status=?, consecutive_failures=?, consecutive_successes=?, last_checked_at=?,
       last_latency_ms=?, incident_started_at=?, updated_at=? WHERE id=?`)
       .run(status, failures, successes, timestamp, result.latencyMs ?? null, incidentStartedAt, timestamp, targetId);
-    this.db.prepare(`INSERT INTO check_results (target_id, checked_at, ok, status, message, latency_ms, details_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?)`)
-      .run(targetId, timestamp, result.ok ? 1 : 0, status, String(result.message || ''), result.latencyMs ?? null, JSON.stringify(result.details || {}));
+    const signature = resultSignature(result, status);
+    const previousResult = this.db.prepare(`SELECT result_signature FROM check_results
+      WHERE target_id = ? ORDER BY checked_at DESC, id DESC LIMIT 1`).get(targetId);
+    const recorded = !previousResult || previousResult.result_signature !== signature;
+    if (recorded) {
+      this.db.prepare(`INSERT INTO check_results
+        (target_id, checked_at, location_name, ok, status, message, latency_ms, details_json, result_signature)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(targetId, timestamp, target.locationName, result.ok ? 1 : 0, status, String(result.message || ''), result.latencyMs ?? null, JSON.stringify(result.details || {}), signature);
+    }
 
     const finalTarget = this.getTarget(targetId);
     if (incidentEvent) {
       incidentEvent.target = finalTarget;
       this.enqueueEvent(incidentEvent.kind === 'down' ? 'incident.opened' : 'incident.resolved', {
-        targetId, targetName: finalTarget.name, type: finalTarget.type, severity: finalTarget.severity, message: incidentEvent.message, occurredAt: timestamp
+        targetId, targetName: finalTarget.name, locationName: finalTarget.locationName, type: finalTarget.type, severity: finalTarget.severity, message: incidentEvent.message, occurredAt: timestamp
       });
     }
-    return { target: finalTarget, result, status, previousStatus: target.status, transition, incidentEvent, wasHealthy };
+    return { target: finalTarget, result, status, previousStatus: target.status, transition, incidentEvent, wasHealthy, recorded };
   }
 
-  recordNotification({ incidentId = null, targetId = null, kind, title, body, details = {} }) {
-    this.db.prepare(`INSERT INTO notifications (incident_id, target_id, kind, title, body, delivered_at, details_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?)`)
-      .run(incidentId, targetId, kind, title, body, now(), JSON.stringify(details));
+  recordNotification({ incidentId = null, targetId = null, locationName = DEFAULT_LOCATION_NAME, kind, title, body, details = {} }) {
+    this.db.prepare(`INSERT INTO notifications (incident_id, target_id, location_name, kind, title, body, delivered_at, details_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(incidentId, targetId, locationName, kind, title, body, now(), JSON.stringify(details));
   }
 
   listCheckHistory(filters = {}) {
@@ -677,10 +762,14 @@ class LocalDatabase {
     }
     if (normalized.outcome === 'success') clauses.push('r.ok = 1');
     if (normalized.outcome === 'failure') clauses.push('r.ok = 0');
+    if (normalized.location) {
+      clauses.push("r.location_name LIKE ? ESCAPE '\\'");
+      parameters.push(`%${normalized.location.replace(/[\\%_]/g, '\\$&')}%`);
+    }
     if (normalized.search) {
-      clauses.push("(t.name LIKE ? ESCAPE '\\' OR r.message LIKE ? ESCAPE '\\')");
+      clauses.push("(t.name LIKE ? ESCAPE '\\' OR r.location_name LIKE ? ESCAPE '\\' OR r.message LIKE ? ESCAPE '\\')");
       const escapedSearch = `%${normalized.search.replace(/[\\%_]/g, '\\$&')}%`;
-      parameters.push(escapedSearch, escapedSearch);
+      parameters.push(escapedSearch, escapedSearch, escapedSearch);
     }
 
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -690,13 +779,35 @@ class LocalDatabase {
     return { filters: normalized, results: rows.map(mapHistoryResult) };
   }
 
+  getMonthlyReport(month) {
+    const period = validateReportMonth(month);
+    const rows = this.db.prepare(`SELECT r.*, t.name AS target_name, t.type AS target_type
+      FROM check_results r JOIN targets t ON t.id = r.target_id
+      WHERE r.checked_at >= ? AND r.checked_at < ?
+      ORDER BY r.checked_at ASC, r.id ASC`).all(period.from, period.to);
+    const results = rows.map(mapHistoryResult);
+    const summary = results.reduce((totals, result) => {
+      totals.recordedChanges += 1;
+      totals[result.ok ? 'successful' : 'failed'] += 1;
+      totals.statuses[result.status] = (totals.statuses[result.status] || 0) + 1;
+      return totals;
+    }, { recordedChanges: 0, successful: 0, failed: 0, statuses: {} });
+    return {
+      ...period,
+      generatedAt: now(),
+      locations: [...new Set(results.map((result) => result.locationName))].sort((a, b) => a.localeCompare(b)),
+      summary,
+      results
+    };
+  }
+
   getDashboard() {
     const targets = this.listTargets();
     const activeIncidents = this.db.prepare(`SELECT i.*, t.name AS target_name FROM incidents i
       JOIN targets t ON t.id = i.target_id WHERE i.resolved_at IS NULL ORDER BY i.started_at DESC`).all()
-      .map((row) => ({ id: row.id, targetId: row.target_id, targetName: row.target_name, severity: row.severity, title: row.title, message: row.message, startedAt: row.started_at, acknowledgedAt: row.acknowledged_at }));
+      .map((row) => ({ id: row.id, targetId: row.target_id, targetName: row.target_name, locationName: row.location_name || DEFAULT_LOCATION_NAME, severity: row.severity, title: row.title, message: row.message, startedAt: row.started_at, acknowledgedAt: row.acknowledged_at }));
     const notifications = this.db.prepare('SELECT * FROM notifications ORDER BY delivered_at DESC LIMIT 20').all()
-      .map((row) => ({ id: row.id, incidentId: row.incident_id, targetId: row.target_id, kind: row.kind, title: row.title, body: row.body, deliveredAt: row.delivered_at }));
+      .map((row) => ({ id: row.id, incidentId: row.incident_id, targetId: row.target_id, locationName: row.location_name || DEFAULT_LOCATION_NAME, kind: row.kind, title: row.title, body: row.body, deliveredAt: row.delivered_at }));
     const history = this.listCheckHistory({ limit: 80 }).results;
     const summary = {
       total: targets.filter((target) => target.enabled).length,

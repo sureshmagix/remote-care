@@ -59,7 +59,7 @@ test('desktop popup counts five seconds from visibility and queues every change'
   h.show('First');
   h.show('Second');
   const window = h.windows[0];
-  t.mock.timers.tick(10000); // Loading time must not consume display time.
+  t.mock.timers.tick(2_500); // Loading time must not consume display time.
   assert.equal(window.visible, false);
   h.send('ready');
   assert.equal(window.event.title, 'First');
@@ -67,7 +67,7 @@ test('desktop popup counts five seconds from visibility and queues every change'
   const firstId = window.event.id;
   h.send('visible', firstId, 180);
   assert.equal(window.visible, true);
-  assert.equal(window.bounds.x, -440); // Respect a secondary display's origin.
+  assert.equal(window.bounds.x, -360); // Respect a secondary display's origin.
   t.mock.timers.tick(4999);
   assert.equal(window.visible, true);
   t.mock.timers.tick(1);
@@ -120,4 +120,15 @@ test('a failed popup renderer falls back to timestamped native alerts and cleans
   assert.equal(h.center.nativeNotifications.size, 0);
   h.center.dispose();
   assert.equal(h.ipcMain.listenerCount('desktop-notification-ready'), 0);
+});
+
+test('a popup that never signals readiness falls back to native alerts', (t) => {
+  const h = harness(t);
+  h.show('Renderer timeout');
+  t.mock.timers.tick(3_000);
+  assert.equal(h.natives.length, 1);
+  assert.equal(h.natives[0].visible, true);
+  assert.equal(h.windows[0].destroyed, true);
+  t.mock.timers.tick(5_000);
+  assert.equal(h.natives[0].visible, false);
 });

@@ -39,7 +39,8 @@ app.whenReady().then(async () => {
     const output = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'remote-care-notification-')), 'notification.png');
     fs.writeFileSync(output, screenshot.toPNG());
     await until(() => !center.window.isVisible());
-    assert.ok(Date.now() - displayedAt >= 4800, 'Popup expired before its five-second duration.');
+    const visibleDuration = Date.now() - displayedAt;
+    assert.ok(visibleDuration >= 4800, `Popup expired after ${visibleDuration}ms, before its five-second duration.`);
     center.show({ kind: 'recovered', title: 'Close button check', body: 'Monitor recovered.', occurredAt }, 12000);
     await until(() => center.window.isVisible());
     await center.window.webContents.executeJavaScript("document.getElementById('notification-close').click()");

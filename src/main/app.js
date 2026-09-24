@@ -1,7 +1,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, Menu, Tray, nativeImage } = require('electron');
 const { LocalDatabase, ROLES } = require('./database');
 const { verifyPassword, SessionStore } = require('./auth');
 const { MonitorEngine } = require('./monitor-engine');
@@ -26,6 +26,43 @@ let pendingProtectedQuit = false;
 let runtimeSessionId;
 let shutdownComplete = false;
 const sessions = new SessionStore();
+
+function csvCell(value) {
+  let text = String(value ?? '');
+  // Spreadsheet applications can interpret leading formula characters. Reports
+  // are data-only, so preserve those values as text instead.
+  if (/^[=+\-@]/.test(text)) text = `'${text}`;
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+function monthlyReportCsv(report) {
+  const line = (values) => values.map(csvCell).join(',');
+  const lines = [
+    line(['Remote Care Monitor — monthly monitoring report']),
+    line(['Report month', report.month]),
+    line(['Generated at (UTC)', report.generatedAt]),
+    line(['Recorded result changes', report.summary.recordedChanges]),
+    line(['Successful results', report.summary.successful]),
+    line(['Failed results', report.summary.failed]),
+    line(['Locations', report.locations.join('; ') || 'None']),
+    line([]),
+    line(['Checked at (UTC)', 'Location', 'Monitor', 'Type', 'Outcome', 'Status', 'Message', 'Latency (ms)', 'Details'])
+  ];
+  for (const result of report.results) {
+    lines.push(line([
+      result.checkedAt,
+      result.locationName,
+      result.targetName,
+      result.targetType,
+      result.ok ? 'Success' : 'Failure',
+      result.status,
+      result.message,
+      result.latencyMs ?? '',
+      JSON.stringify(result.details || {})
+    ]));
+  }
+  return `\ufeff${lines.join('\r\n')}\r\n`;
+}
 
 function createTrayIcon() {
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
@@ -120,16 +157,15 @@ function createWindow() {
       nodeIntegration: false,
       sandbox: true,
       webSecurity: true,
+      backgroundThrottling: false,
       devTools: !app.isPackaged
     }
   });
   mainWindow.removeMenu();
   mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-  mainWindow.webContents.on('will-navigate', (event) => event.preventDefault());
-  mainWindow.on('minimize', (event) => {
-    event.preventDefault();
-    hideWindowToTray();
+  mainWindow.on('minimize', () => {
+    showBackgroundToast();
   });
   mainWindow.on('close', (event) => {
     if (!isQuitting) {
@@ -143,8 +179,14 @@ function createWindow() {
 
 function showWindow() {
   const window = createWindow();
-  window.show();
+  if (window.isMinimized()) {
+    window.restore();
+  }
+  if (!window.isVisible()) {
+    window.show();
+  }
   window.focus();
+  broadcast('monitor-update', { type: 'window_focused' });
 }
 
 function setupAutostart() {
@@ -209,6 +251,42 @@ function registerIpc() {
   ipcMain.handle('history-list', (_event, { token, filters }) => {
     requireSession(token);
     return database.listCheckHistory(filters || {});
+  });
+
+  ipcMain.handle('history-export-monthly-report', async (_event, { token, month }) => {
+    const session = requireSession(token);
+    const report = database.getMonthlyReport(month);
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: 'Export monthly monitoring report',
+      defaultPath: path.join(app.getPath('downloads'), `Remote Care Monitor report ${report.month}.csv`),
+      filters: [{ name: 'CSV report', extensions: ['csv'] }],
+      properties: ['createDirectory', 'showOverwriteConfirmation']
+    });
+    if (result.canceled || !result.filePath) return { cancelled: true };
+    fs.writeFileSync(result.filePath, monthlyReportCsv(report), 'utf8');
+    database.audit(session.userId, 'export_monthly_history_report', 'check_history', report.month, {
+      month: report.month,
+      recordedChanges: report.summary.recordedChanges
+    });
+    return { cancelled: false, filePath: result.filePath, rowCount: report.summary.recordedChanges };
+  });
+
+  ipcMain.handle('notification-test', (_event, { token }) => {
+    const session = requireSession(token, ROLES.SUPER_ADMIN);
+    const settings = database.getAppSettings();
+    const event = {
+      kind: 'warning',
+      title: 'Test alert',
+      body: 'This confirms that Remote Care Monitor can show desktop alerts on this device.',
+      target: { name: 'Alert test', locationName: 'Local device', severity: 'warning' },
+      occurredAt: new Date().toISOString()
+    };
+    // A test is intentionally shown even when regular alerts are disabled, so
+    // an administrator can verify desktop permission and popup placement.
+    notificationCenter.show(event, settings.notificationDurationSeconds * 1000);
+    database.audit(session.userId, 'test_desktop_notification', 'application', null, {});
+    broadcast('monitor-update', { type: 'notification', event });
+    return { ok: true };
   });
 
   ipcMain.handle('network-adapters', async (_event, { token }) => {
