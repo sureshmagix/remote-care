@@ -26,6 +26,8 @@ test('Linux autostart entry quotes executable paths and starts in the background
   assert.match(entry, /Exec="\/opt\/Remote Care\/monitor" --background/);
   assert.match(entry, /Hidden=false/);
   assert.match(entry, /X-GNOME-Autostart-enabled=true/);
+  assert.match(entry, /X-GNOME-Autostart-Phase=Application/);
+  assert.match(entry, /X-KDE-autostart-after=panel/);
 });
 
 test('Linux and Raspberry Pi packaged builds create an XDG graphical-session launcher', () => {

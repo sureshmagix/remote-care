@@ -9,6 +9,13 @@ const STATUSES = new Set(['unknown', 'healthy', 'warning', 'down', 'disabled']);
 const HISTORY_STATUSES = new Set(['unknown', 'healthy', 'warning', 'down']);
 const HISTORY_OUTCOMES = new Set(['all', 'success', 'failure']);
 const DEFAULT_LOCATION_NAME = 'Local device';
+const RESULT_SIGNATURE_PREFIX = 'v2:';
+const VOLATILE_RESULT_DETAIL_KEYS = new Set([
+  'output', 'stdout', 'stderr', 'stack', 'trace',
+  'latencyms', 'durationms', 'elapsedms',
+  'timestamp', 'checkedat', 'startedat', 'endedat',
+  'pid', 'processid'
+]);
 const DEFAULT_APP_SETTINGS = Object.freeze({
   minimizeToTray: true,
   showTrayReminder: true,
@@ -37,11 +44,15 @@ function parseJson(value, fallback = {}) {
   }
 }
 
-function canonicalize(value) {
-  if (Array.isArray(value)) return value.map(canonicalize);
+function stableResultDetails(value) {
+  if (Array.isArray(value)) return value.map(stableResultDetails);
   if (value && typeof value === 'object') {
     return Object.keys(value).sort().reduce((result, key) => {
-      if (value[key] !== undefined) result[key] = canonicalize(value[key]);
+      // Command output and timings are useful in a saved history row, but are
+      // not monitor state. They commonly change for every poll and must not
+      // turn an unchanged result into a new history entry.
+      if (VOLATILE_RESULT_DETAIL_KEYS.has(key.toLowerCase()) || value[key] === undefined) return result;
+      result[key] = stableResultDetails(value[key]);
       return result;
     }, {});
   }
@@ -50,15 +61,16 @@ function canonicalize(value) {
 }
 
 function resultSignature(result, status) {
-  // Response timing naturally varies between checks; including it would defeat
-  // change-only history storage. The outcome, status, message, and details are
-  // the meaningful result state that users need to audit.
-  return JSON.stringify({
+  // Response timing and raw command output naturally vary between checks;
+  // including them would defeat change-only history storage. Keep stable
+  // result details such as HTTP status, error code, selected gateway, or
+  // interface state so a real diagnostic change remains auditable.
+  return `${RESULT_SIGNATURE_PREFIX}${JSON.stringify({
     ok: Boolean(result.ok),
     status,
     message: String(result.message || '').replace(/\b\d+(?:\.\d+)?\s*ms\b/gi, '<latency>'),
-    details: canonicalize(result.details || {})
-  });
+    details: stableResultDetails(result.details || {})
+  })}`;
 }
 
 function bool(value) {
@@ -395,6 +407,25 @@ class LocalDatabase {
       WHERE location_name IS NULL OR TRIM(location_name) = ''`).run(DEFAULT_LOCATION_NAME);
     this.db.prepare(`UPDATE notifications SET location_name = COALESCE(NULLIF((SELECT location_name FROM targets WHERE targets.id = notifications.target_id), ''), ?)
       WHERE location_name IS NULL OR TRIM(location_name) = ''`).run(DEFAULT_LOCATION_NAME);
+
+    // Version 1.1.2 excludes volatile command output and timing from the
+    // history fingerprint. Upgrade prior signatures in place so an unchanged
+    // target does not create an extra history row immediately after updating.
+    const legacyResults = this.db.prepare(`SELECT id, ok, status, message, details_json FROM check_results
+      WHERE result_signature NOT LIKE ?`).all(`${RESULT_SIGNATURE_PREFIX}%`);
+    if (legacyResults.length) {
+      const updateSignature = this.db.prepare('UPDATE check_results SET result_signature = ? WHERE id = ?');
+      const migrateSignatures = this.db.transaction((rows) => {
+        for (const row of rows) {
+          updateSignature.run(resultSignature({
+            ok: row.ok === 1,
+            message: row.message,
+            details: parseJson(row.details_json)
+          }, row.status), row.id);
+        }
+      });
+      migrateSignatures(legacyResults);
+    }
   }
 
   close() {

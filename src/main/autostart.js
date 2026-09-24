@@ -17,7 +17,7 @@ function linuxAutostartDirectory(app, environment, pathApi) {
 }
 
 function linuxDesktopEntry(executablePath) {
-  return `[Desktop Entry]\nVersion=1.0\nType=Application\nName=Remote Care Monitor\nComment=Local network and service monitor\nExec=${desktopExecArgument(executablePath)} --background\nTerminal=false\nStartupNotify=false\nHidden=false\nX-GNOME-Autostart-enabled=true\nX-GNOME-Autostart-Delay=0\n`;
+  return `[Desktop Entry]\nVersion=1.0\nType=Application\nName=Remote Care Monitor\nComment=Local network and service monitor\nExec=${desktopExecArgument(executablePath)} --background\nTerminal=false\nStartupNotify=false\nHidden=false\nX-GNOME-Autostart-enabled=true\nX-GNOME-Autostart-Phase=Application\nX-GNOME-Autostart-Delay=0\nX-KDE-autostart-after=panel\n`;
 }
 
 function disabledStatus(message) {

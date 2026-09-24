@@ -1,3 +1,4 @@
+const fs = require('node:fs');
 const path = require('node:path');
 const { BrowserWindow, ipcMain, screen, Notification } = require('electron');
 
@@ -7,8 +8,9 @@ const RENDERER_READY_TIMEOUT_MS = 3_000;
 // silently suppress alerts or choose a different timeout. Queue bursts so every
 // change gets its full display time, including while the dashboard is hidden.
 class NotificationCenter {
-  constructor({ openDashboard }) {
+  constructor({ openDashboard, platform = process.platform }) {
     this.openDashboard = openDashboard;
+    this.platform = platform;
     this.queue = [];
     this.current = null;
     this.window = null;
@@ -40,11 +42,14 @@ class NotificationCenter {
         if (typeof this.window.setAlwaysOnTop === 'function') {
           this.window.setAlwaysOnTop(true, 'pop-up-menu');
         }
+        // Start the expiry clock from Electron's show event. On macOS and
+        // Linux this can lag behind the renderer IPC that measured the popup,
+        // so starting it here would cut the user-visible duration short.
+        this.window.once('show', () => this.startDismissTimer(id));
         this.window.showInactive();
         if (typeof this.window.moveTop === 'function') {
           this.window.moveTop();
         }
-        this.timer = setTimeout(() => this.dismiss(id), this.current.durationMs);
       },
       'desktop-notification-dismiss': (event, id) => {
         if (this.isSender(event)) this.dismiss(id);
@@ -63,7 +68,16 @@ class NotificationCenter {
   }
 
   show(event, durationMs) {
-    this.queue.push({ ...event, id: ++this.sequence, occurredAt: event.occurredAt || new Date().toISOString(), durationMs });
+    const notification = { ...event, id: ++this.sequence, occurredAt: event.occurredAt || new Date().toISOString(), durationMs };
+    // Linux compositors are free to ignore a frameless always-on-top window,
+    // especially on Wayland. Native Electron notifications use libnotify and
+    // remain visible while the dashboard is hidden or has not been created.
+    if (this.platform === 'linux' && this.showNative(notification, { fallbackToPopup: true })) return;
+    this.enqueuePopup(notification);
+  }
+
+  enqueuePopup(notification) {
+    this.queue.push(notification);
     if (!this.window) this.createWindow();
     this.showNext();
   }
@@ -75,6 +89,7 @@ class NotificationCenter {
       resizable: false, minimizable: false, maximizable: false,
       alwaysOnTop: true, skipTaskbar: true, backgroundColor: '#0d2132',
       title: 'Remote Care notification',
+      ...(this.platform === 'linux' ? { type: 'notification' } : {}),
       webPreferences: {
         preload: path.join(__dirname, 'notification-preload.js'),
         contextIsolation: true, nodeIntegration: false, sandbox: true,
@@ -121,6 +136,11 @@ class NotificationCenter {
     this.showNext();
   }
 
+  startDismissTimer(id) {
+    if (id !== this.current?.id || this.timer) return;
+    this.timer = setTimeout(() => this.dismiss(id), this.current.durationMs);
+  }
+
   fallback() {
     const pending = [...(this.current ? [this.current] : []), ...this.queue];
     this.current = null;
@@ -132,12 +152,31 @@ class NotificationCenter {
     this.ready = false;
     this.window?.destroy();
     this.window = null;
-    for (const event of pending) {
-      if (!Notification.isSupported()) continue;
-      const notification = new Notification({
+    for (const event of pending) this.showNative(event);
+  }
+
+  showNative(event, { fallbackToPopup = false } = {}) {
+    if (!Notification.isSupported()) return false;
+
+    let notification;
+    let didFallback = false;
+    const fallbackToAlert = () => {
+      if (!fallbackToPopup || didFallback) return;
+      didFallback = true;
+      this.enqueuePopup(event);
+    };
+    try {
+      const iconPath = path.join(__dirname, '..', '..', 'assets', 'icon.png');
+      notification = new Notification({
         title: event.title,
         body: `${event.target?.locationName ? `${event.target.locationName}\n` : ''}${event.body}\n${new Date(event.occurredAt).toLocaleString()}`,
-        closeButtonText: 'Close', timeoutType: 'never'
+        icon: fs.existsSync(iconPath) ? iconPath : undefined,
+        closeButtonText: 'Close',
+        // Keep the notification open until the same application-controlled
+        // timeout used by the custom alert. Electron supports this on Linux
+        // and Windows; other platforms safely ignore it.
+        timeoutType: 'never',
+        urgency: ['down', 'warning'].includes(event.kind) ? 'critical' : 'normal'
       });
       const dispose = () => {
         clearTimeout(this.nativeNotifications.get(notification));
@@ -145,9 +184,19 @@ class NotificationCenter {
       };
       notification.on('click', () => { this.openDashboard(); notification.close(); });
       notification.on('close', dispose);
-      notification.on('failed', dispose);
+      notification.on('failed', () => {
+        dispose();
+        fallbackToAlert();
+      });
       notification.show();
       this.nativeNotifications.set(notification, setTimeout(() => { notification.close(); dispose(); }, event.durationMs));
+      return true;
+    } catch {
+      if (notification) {
+        clearTimeout(this.nativeNotifications.get(notification));
+        this.nativeNotifications.delete(notification);
+      }
+      return false;
     }
   }
 

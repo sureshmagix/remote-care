@@ -13,6 +13,11 @@ app.setName('Remote Care Monitor');
 if (process.platform === 'win32') {
   app.setAppUserModelId('in.archidtech.remotecare');
 }
+if (process.platform === 'linux') {
+  // Match the packaged .desktop file so libnotify, docks, and taskbars can
+  // associate background alerts with this installed application.
+  app.setDesktopName('remote-care-monitor');
+}
 
 if (!app.requestSingleInstanceLock()) app.quit();
 
@@ -110,6 +115,13 @@ function notify(event) {
   if (!enabled) return;
   notificationCenter.show(event, settings.notificationDurationSeconds * 1000);
   broadcast('monitor-update', { type: 'notification', event });
+  if (['down', 'warning'].includes(event.kind)) {
+    if (process.platform === 'darwin' && app.dock) {
+      app.dock.bounce('critical');
+    } else if (process.platform === 'win32' && mainWindow && !mainWindow.isFocused()) {
+      mainWindow.flashFrame(true);
+    }
+  }
 }
 
 function showBackgroundToast() {
@@ -444,6 +456,10 @@ app.whenReady().then(() => {
 
 app.on('second-instance', () => showWindow());
 app.on('activate', () => showWindow());
+// Electron quits by default on Windows and Linux when the last window closes.
+// Keep an explicit listener so monitoring and native notifications continue if
+// a window is closed by the desktop environment while the tray is available.
+app.on('window-all-closed', () => {});
 app.on('before-quit', (event) => {
   if (!isQuitting) {
     event.preventDefault();

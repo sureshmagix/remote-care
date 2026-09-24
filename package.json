@@ -1,6 +1,6 @@
 {
   "name": "remote-care-phase1",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Local-first cross-platform network, internet, target, and local-service monitor.",
   "homepage": "https://archidtech.in",
   "desktopName": "remote-care-monitor",

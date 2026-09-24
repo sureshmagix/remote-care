@@ -180,9 +180,18 @@ test('history snapshots the location and records only material result changes', 
       name: 'Warehouse gateway', locationName: 'Mysuru warehouse', type: 'ping', host: '192.168.1.1', intervalSeconds: 5, timeoutMs: 1000,
       failureThreshold: 1, recoveryThreshold: 1, severity: 'warning', downMessage: 'Gateway unavailable', recoveryMessage: 'Gateway recovered', enabled: true
     }, admin.id);
-    const first = database.recordCheck(target.id, { ok: true, message: 'Gateway replied.', latencyMs: 4, details: { gateway: '192.168.1.1' } });
-    const unchanged = database.recordCheck(target.id, { ok: true, message: 'Gateway replied.', latencyMs: 19, details: { gateway: '192.168.1.1' } });
-    const changed = database.recordCheck(target.id, { ok: true, message: 'Gateway replied.', latencyMs: 6, details: { gateway: '192.168.1.254' } });
+    const first = database.recordCheck(target.id, {
+      ok: true, message: 'Gateway replied.', latencyMs: 4,
+      details: { gateway: '192.168.1.1', output: 'reply time=4ms', checkedAt: '2026-09-24T10:00:00.000Z' }
+    });
+    const unchanged = database.recordCheck(target.id, {
+      ok: true, message: 'Gateway replied.', latencyMs: 19,
+      details: { gateway: '192.168.1.1', output: 'reply time=19ms', checkedAt: '2026-09-24T10:00:19.000Z' }
+    });
+    const changed = database.recordCheck(target.id, {
+      ok: true, message: 'Gateway replied.', latencyMs: 6,
+      details: { gateway: '192.168.1.254', output: 'reply time=6ms', checkedAt: '2026-09-24T10:00:25.000Z' }
+    });
 
     assert.equal(first.recorded, true);
     assert.equal(unchanged.recorded, false);
@@ -201,6 +210,33 @@ test('history snapshots the location and records only material result changes', 
     assert.throws(() => database.getMonthlyReport('not-a-month'), /valid report month/i);
   } finally {
     database.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('an upgraded history signature does not record an unchanged check again', () => {
+  const { database, directory } = temporaryDatabase();
+  try {
+    const admin = database.createInitialAdmin({ username: 'admin', displayName: 'Local Admin', password: 'monitor-password' });
+    const target = database.saveTarget({
+      name: 'Upgrade signature test', type: 'system_service', serviceName: 'remote-care', intervalSeconds: 5, timeoutMs: 1000,
+      failureThreshold: 1, recoveryThreshold: 1, severity: 'warning', downMessage: 'Service unavailable', recoveryMessage: 'Service recovered', enabled: true
+    }, admin.id);
+    database.recordCheck(target.id, { ok: true, message: 'Service is running.', details: { serviceName: 'remote-care', output: 'pid=101' } });
+    // Simulate a database created by the previous signature format.
+    database.db.prepare("UPDATE check_results SET result_signature = 'legacy-signature' WHERE target_id = ?").run(target.id);
+    database.close();
+
+    const reopened = new LocalDatabase(path.join(directory, 'remote-care.sqlite'));
+    try {
+      const unchanged = reopened.recordCheck(target.id, { ok: true, message: 'Service is running.', details: { serviceName: 'remote-care', output: 'pid=202' } });
+      assert.equal(unchanged.recorded, false);
+      assert.equal(reopened.listCheckHistory({ targetId: target.id }).results.length, 1);
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    try { database.close(); } catch {}
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
