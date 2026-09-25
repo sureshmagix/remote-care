@@ -14,9 +14,14 @@ if (process.platform === 'win32') {
   app.setAppUserModelId('in.archidtech.remotecare');
 }
 if (process.platform === 'linux') {
-  // Match the packaged .desktop file so libnotify, docks, and taskbars can
-  // associate background alerts with this installed application.
+  // Match the packaged .desktop file so docks, taskbars, and the native-alert
+  // fallback can associate this installed application correctly.
   app.setDesktopName('remote-care-monitor');
+  // Wayland does not let Electron position a popup. Ubuntu normally exposes
+  // Xwayland through DISPLAY, which lets the app-rendered notification keep
+  // the same top-right placement as Windows and macOS.
+  const isWaylandSession = process.env.XDG_SESSION_TYPE === 'wayland' || Boolean(process.env.WAYLAND_DISPLAY);
+  if (isWaylandSession && process.env.DISPLAY) app.commandLine.appendSwitch('ozone-platform', 'x11');
 }
 
 if (!app.requestSingleInstanceLock()) app.quit();
