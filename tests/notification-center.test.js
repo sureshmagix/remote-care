@@ -133,51 +133,26 @@ test('a popup that never signals readiness falls back to native alerts', (t) => 
   assert.equal(h.natives[0].visible, false);
 });
 
-test('Linux uses native critical alerts while the dashboard is in the background', (t) => {
+test('Linux uses the same app-rendered alert and top-right placement as other desktops', (t) => {
   const h = harness(t, 'linux');
   h.show('Linux monitor alert');
 
-  assert.equal(h.windows.length, 0);
-  assert.equal(h.natives.length, 1);
-  assert.match(h.natives[0].options.icon, /assets[\\/]icon\.png$/);
-  assert.equal(h.natives[0].options.timeoutType, 'never');
-  assert.equal(h.natives[0].options.urgency, 'critical');
-  assert.equal(h.natives[0].visible, true);
-  h.natives[0].emit('click');
-  assert.equal(h.opened(), 1);
-  assert.equal(h.natives[0].visible, false);
-});
-
-test('a Linux native show acknowledgement prevents a duplicate fallback popup', (t) => {
-  const h = harness(t, 'linux');
-  h.show('Confirmed native alert');
-  h.natives[0].emit('show');
-  t.mock.timers.tick(1_500);
-
-  assert.equal(h.windows.length, 0);
-  assert.equal(h.natives[0].visible, true);
-});
-
-test('Linux uses the notification window if native delivery is not acknowledged', (t) => {
-  const h = harness(t, 'linux');
-  h.show('Native acknowledgement timeout');
-  t.mock.timers.tick(1_500);
-
   assert.equal(h.windows.length, 1);
+  assert.equal(h.natives.length, 0);
   assert.equal(h.windows[0].options.type, 'notification');
   h.send('ready');
   h.send('visible', h.windows[0].event.id, 118);
   assert.equal(h.windows[0].visible, true);
+  assert.equal(h.windows[0].bounds.x, -360);
 });
 
-test('Linux falls back to a notification-type alert window when native delivery fails', (t) => {
+test('Linux uses a native alert only if the app-rendered notification fails', (t) => {
   const h = harness(t, 'linux');
   h.show('Native fallback');
-  h.natives[0].emit('failed');
-
-  assert.equal(h.windows.length, 1);
-  assert.equal(h.windows[0].options.type, 'notification');
   h.send('ready');
-  h.send('visible', h.windows[0].event.id, 118);
-  assert.equal(h.windows[0].visible, true);
+  h.windows[0].webContents.emit('render-process-gone');
+
+  assert.equal(h.natives.length, 1);
+  assert.match(h.natives[0].options.icon, /assets[\\/]icon\.png$/);
+  assert.equal(h.natives[0].visible, true);
 });
