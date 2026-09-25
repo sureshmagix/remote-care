@@ -3,6 +3,18 @@ const path = require('node:path');
 const { BrowserWindow, ipcMain, screen, Notification } = require('electron');
 
 const RENDERER_READY_TIMEOUT_MS = 3_000;
+const LINUX_NATIVE_SHOW_TIMEOUT_MS = 1_500;
+
+// A notification daemon is a separate process on Linux, so it cannot open an
+// image inside app.asar. The build explicitly unpacks this file; the source
+// path keeps development builds working too.
+function nativeNotificationIconPath() {
+  const candidates = [
+    typeof process !== 'undefined' && process.resourcesPath && path.join(process.resourcesPath, 'app.asar.unpacked', 'assets', 'icon.png'),
+    path.join(__dirname, '..', '..', 'assets', 'icon.png')
+  ].filter(Boolean);
+  return candidates.find((candidate) => fs.existsSync(candidate));
+}
 
 // Own the popup and its lifetime so desktop notification preferences cannot
 // silently suppress alerts or choose a different timeout. Queue bursts so every
@@ -19,6 +31,7 @@ class NotificationCenter {
     this.timer = null;
     this.readyTimer = null;
     this.nativeNotifications = new Map();
+    this.nativeShowTimers = new Map();
     this.handlers = {
       'desktop-notification-ready': (event) => {
         if (!this.isSender(event)) return;
@@ -70,8 +83,8 @@ class NotificationCenter {
   show(event, durationMs) {
     const notification = { ...event, id: ++this.sequence, occurredAt: event.occurredAt || new Date().toISOString(), durationMs };
     // Linux compositors are free to ignore a frameless always-on-top window,
-    // especially on Wayland. Native Electron notifications use libnotify and
-    // remain visible while the dashboard is hidden or has not been created.
+    // especially on Wayland. The desktop notification service is the reliable
+    // primary path there and keeps alerts visible while the dashboard is hidden.
     if (this.platform === 'linux' && this.showNative(notification, { fallbackToPopup: true })) return;
     this.enqueuePopup(notification);
   }
@@ -160,17 +173,17 @@ class NotificationCenter {
 
     let notification;
     let didFallback = false;
+    let didShow = false;
     const fallbackToAlert = () => {
       if (!fallbackToPopup || didFallback) return;
       didFallback = true;
       this.enqueuePopup(event);
     };
     try {
-      const iconPath = path.join(__dirname, '..', '..', 'assets', 'icon.png');
       notification = new Notification({
         title: event.title,
         body: `${event.target?.locationName ? `${event.target.locationName}\n` : ''}${event.body}\n${new Date(event.occurredAt).toLocaleString()}`,
-        icon: fs.existsSync(iconPath) ? iconPath : undefined,
+        icon: nativeNotificationIconPath(),
         closeButtonText: 'Close',
         // Keep the notification open until the same application-controlled
         // timeout used by the custom alert. Electron supports this on Linux
@@ -181,15 +194,35 @@ class NotificationCenter {
       const dispose = () => {
         clearTimeout(this.nativeNotifications.get(notification));
         this.nativeNotifications.delete(notification);
+        clearTimeout(this.nativeShowTimers.get(notification));
+        this.nativeShowTimers.delete(notification);
       };
+      notification.on('show', () => {
+        didShow = true;
+        clearTimeout(this.nativeShowTimers.get(notification));
+        this.nativeShowTimers.delete(notification);
+      });
       notification.on('click', () => { this.openDashboard(); notification.close(); });
       notification.on('close', dispose);
       notification.on('failed', () => {
         dispose();
         fallbackToAlert();
       });
+      this.nativeNotifications.set(notification, null);
       notification.show();
+      if (!this.nativeNotifications.has(notification)) return true;
       this.nativeNotifications.set(notification, setTimeout(() => { notification.close(); dispose(); }, event.durationMs));
+      // Electron does not emit the `failed` event on Linux. If the notification
+      // service does not acknowledge that it showed the alert, use our small
+      // notification window rather than silently losing a monitoring warning.
+      if (fallbackToPopup && this.platform === 'linux' && !didShow) {
+        this.nativeShowTimers.set(notification, setTimeout(() => {
+          if (didShow || !this.nativeNotifications.has(notification)) return;
+          dispose();
+          notification.close();
+          fallbackToAlert();
+        }, LINUX_NATIVE_SHOW_TIMEOUT_MS));
+      }
       return true;
     } catch {
       if (notification) {

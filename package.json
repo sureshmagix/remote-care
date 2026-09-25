@@ -29,11 +29,13 @@
     },
     "files": [
       "src/**/*",
+      "assets/icon.png",
       "package.json",
       "README.md"
     ],
     "asar": true,
     "asarUnpack": [
+      "assets/icon.png",
       "node_modules/better-sqlite3/**/*"
     ],
     "win": {
