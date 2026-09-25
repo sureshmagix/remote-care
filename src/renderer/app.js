@@ -2,15 +2,22 @@
 const state = {
   session: null,
   dashboard: null,
-  adapters: [],
+  adapters: null,
   users: [],
   settings: null,
   appInfo: null,
   page: 'overview',
   refreshTimer: null,
+  dashboardPollTimer: null,
   clockTimer: null,
   historyFilters: {}
 };
+
+const DASHBOARD_POLL_INTERVAL_MS = 2_000;
+const ADAPTER_REFRESH_INTERVAL_MS = 30_000;
+let adapterRefreshInFlight = false;
+let lastAdapterRefreshAt = 0;
+let dashboardRefreshVersion = 0;
 
 const root = document.getElementById('app');
 const toastRegion = document.getElementById('toast-region');
@@ -40,12 +47,16 @@ function toDateTimeLocal(value) {
   return `${date.getFullYear()}-${part(date.getMonth() + 1)}-${part(date.getDate())}T${part(date.getHours())}:${part(date.getMinutes())}:${part(date.getSeconds())}`;
 }
 
+function currentMonthValue() {
+  const date = new Date();
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+}
+
 function liveClockMarkup() {
   return '<div class="live-clock"><span>Local date &amp; time</span><time id="local-clock"></time></div>';
 }
 
 function startLiveClock() {
-  clearInterval(state.clockTimer);
   const update = () => {
     const clock = document.getElementById('local-clock');
     if (!clock) return;
@@ -54,7 +65,9 @@ function startLiveClock() {
     clock.textContent = prettyTime(timestamp);
   };
   update();
-  state.clockTimer = setInterval(update, 1_000);
+  if (!state.clockTimer) {
+    state.clockTimer = setInterval(update, 1_000);
+  }
 }
 
 function stopLiveClock() {
@@ -259,6 +272,8 @@ async function request(action) {
     return await action();
   } catch (error) {
     if (/session has expired/i.test(error.message)) {
+      stopDashboardPolling();
+      clearTimeout(state.refreshTimer);
       state.session = null;
       sessionStorage.removeItem('remote-care-session');
       renderAuth();
@@ -316,14 +331,10 @@ function renderAuth(setup = null) {
 }
 
 async function openDashboard() {
-  const [dashboard, settings] = await Promise.all([
-    request(() => remoteCare.getDashboard(state.session.token)),
-    request(() => remoteCare.getAppSettings(state.session.token))
-  ]);
-  state.dashboard = dashboard;
-  state.settings = settings;
+  state.settings = await request(() => remoteCare.getAppSettings(state.session.token));
   renderShell();
-  await renderPage();
+  await refreshDashboard(true);
+  startDashboardPolling();
   const control = await request(() => remoteCare.getAppControlState(state.session.token));
   if (control.pendingProtectedQuit) {
     if (control.canAuthorizeQuit) openQuitDialog('tray');
@@ -369,7 +380,13 @@ function renderShell() {
   document.getElementById('logout').addEventListener('click', async () => {
     await remoteCare.logout(state.session.token);
     stopLiveClock();
+    stopDashboardPolling();
+    clearTimeout(state.refreshTimer);
+    dashboardRefreshVersion += 1;
     state.session = null;
+    state.dashboard = null;
+    state.adapters = null;
+    lastAdapterRefreshAt = 0;
     state.historyFilters = {};
     sessionStorage.removeItem('remote-care-session');
     const setup = await remoteCare.getSetupState();
@@ -398,75 +415,147 @@ async function renderPage() {
   startLiveClock();
 }
 
+function renderAdapterList() {
+  const adapterList = document.getElementById('adapter-list');
+  if (!adapterList) return;
+  const markup = !Array.isArray(state.adapters)
+    ? '<div class="empty">Loading adapters…</div>'
+    : state.adapters.length
+      ? `<div class="adapter-list">${state.adapters.map((adapter) => `
+        <div class="adapter">
+          <div>
+            <strong>${escapeHtml(adapter.description || (adapter.kind === 'wireless' ? 'Wi‑Fi' : adapter.kind === 'wired' ? 'Wired' : adapter.name))}</strong>
+            <small>${escapeHtml(adapter.name)}${adapter.linkSpeed ? ` · ${escapeHtml(adapter.linkSpeed)}` : ''}</small>
+          </div>
+          ${badge(adapter.connected ? 'healthy' : 'down', adapter.connected ? 'connected' : 'disconnected')}
+        </div>`).join('')}</div>`
+      : '<div class="empty">No physical adapters found.</div>';
+  if (adapterList._lastMarkup !== markup) {
+    adapterList.innerHTML = markup;
+    adapterList._lastMarkup = markup;
+  }
+}
+
+function renderIncidentsList(activeIncidents) {
+  const incidents = document.getElementById('incident-list');
+  if (!incidents) return;
+  const markup = activeIncidents.length ? activeIncidents.map((incident) => `
+    <div class="incident"><div class="incident-meta">${badge(incident.severity === 'critical' ? 'down' : 'warning', incident.severity)}<time datetime="${escapeHtml(incident.startedAt)}">${escapeHtml(prettyTime(incident.startedAt))}</time></div><h4>${escapeHtml(incident.targetName)}</h4><span class="location-label">${escapeHtml(incident.locationName)}</span><p>${escapeHtml(incident.message)}</p>${isAdmin() && !incident.acknowledgedAt ? `<div><button class="button secondary small" data-ack="${incident.id}">Acknowledge</button></div>` : incident.acknowledgedAt ? `<span class="muted">Acknowledged ${escapeHtml(prettyTime(incident.acknowledgedAt))}</span>` : ''}</div>`).join('') : '<div class="empty">No active incidents. Monitoring is currently clear.</div>';
+  if (incidents._lastMarkup !== markup) {
+    incidents.innerHTML = markup;
+    incidents._lastMarkup = markup;
+    incidents.querySelectorAll('[data-ack]').forEach((button) => button.addEventListener('click', async () => {
+      await request(() => remoteCare.acknowledgeIncident(state.session.token, Number(button.dataset.ack)));
+      await refreshDashboard(true);
+    }));
+  }
+}
+
+function renderNotificationsList(notifications) {
+  const notifyList = document.getElementById('notification-list');
+  if (!notifyList) return;
+  const markup = notifications.length ? notifications.slice(0, 6).map((item) => `<div class="notification-item"><strong>${escapeHtml(item.title)}</strong><span class="location-label">${escapeHtml(item.locationName)}</span><span>${escapeHtml(item.body)}</span><time datetime="${escapeHtml(item.deliveredAt)}">${escapeHtml(prettyTime(item.deliveredAt))}</time></div>`).join('') : '<div class="empty">Notifications will be stored here.</div>';
+  if (notifyList._lastMarkup !== markup) {
+    notifyList.innerHTML = markup;
+    notifyList._lastMarkup = markup;
+  }
+}
+
 async function renderOverview(content) {
   const { summary, activeIncidents, notifications } = state.dashboard;
   const overall = overallStatus();
   content.innerHTML = `
-    <header class="page-header"><div><h2>Monitoring overview</h2><p>Local checks continue while this window is hidden in the tray.</p></div><div class="header-tools">${liveClockMarkup()}<div class="status-line"><span class="dot ${overall.className}"></span>${overall.text}</div></div></header>
+    <header class="page-header"><div><h2>Monitoring overview</h2><p>Local checks continue while this window is hidden in the tray.</p></div><div class="header-tools">${liveClockMarkup()}<div class="status-line"><span class="dot ${overall.className}" id="overall-dot"></span><span id="overall-text">${overall.text}</span></div></div></header>
     <section class="stat-grid">
-      <article class="card stat"><div class="label">Active monitors</div><div class="number">${summary.total}</div></article>
-      <article class="card stat good"><div class="label">Healthy</div><div class="number">${summary.healthy}</div></article>
-      <article class="card stat warning"><div class="label">Checking</div><div class="number">${summary.warning}</div></article>
-      <article class="card stat down"><div class="label">Unavailable</div><div class="number">${summary.down}</div></article>
-      <article class="card stat"><div class="label">Not checked yet</div><div class="number">${summary.unknown}</div></article>
+      <article class="card stat"><div class="label">Active monitors</div><div class="number" id="stat-total">${summary.total}</div></article>
+      <article class="card stat good"><div class="label">Healthy</div><div class="number" id="stat-healthy">${summary.healthy}</div></article>
+      <article class="card stat warning"><div class="label">Checking</div><div class="number" id="stat-warning">${summary.warning}</div></article>
+      <article class="card stat down"><div class="label">Unavailable</div><div class="number" id="stat-down">${summary.down}</div></article>
+      <article class="card stat"><div class="label">Not checked yet</div><div class="number" id="stat-unknown">${summary.unknown}</div></article>
     </section>
     <section class="section-grid">
-      <article class="card"><div class="panel-title"><h3>Active incidents</h3><span>${activeIncidents.length} open</span></div><div class="panel-body" id="incident-list"></div></article>
+      <article class="card"><div class="panel-title"><h3>Active incidents</h3><span id="incident-count">${activeIncidents.length} open</span></div><div class="panel-body" id="incident-list"></div></article>
       <div class="section-stack">
         <article class="card"><div class="panel-title"><h3>Network adapters</h3><span>Local device</span></div><div class="panel-body" id="adapter-list"><div class="empty">Loading adapters…</div></div></article>
         <article class="card" style="margin-top:18px"><div class="panel-title"><h3>Recent notifications</h3><span>Local history</span></div><div class="panel-body" id="notification-list"></div></article>
       </div>
     </section>`;
-  const incidents = document.getElementById('incident-list');
-  incidents.innerHTML = activeIncidents.length ? activeIncidents.map((incident) => `
-    <div class="incident"><div class="incident-meta">${badge(incident.severity === 'critical' ? 'down' : 'warning', incident.severity)}<time datetime="${escapeHtml(incident.startedAt)}">${escapeHtml(prettyTime(incident.startedAt))}</time></div><h4>${escapeHtml(incident.targetName)}</h4><p>${escapeHtml(incident.message)}</p>${isAdmin() && !incident.acknowledgedAt ? `<div><button class="button secondary small" data-ack="${incident.id}">Acknowledge</button></div>` : incident.acknowledgedAt ? `<span class="muted">Acknowledged ${escapeHtml(prettyTime(incident.acknowledgedAt))}</span>` : ''}</div>`).join('') : '<div class="empty">No active incidents. Monitoring is currently clear.</div>';
-  incidents.querySelectorAll('[data-ack]').forEach((button) => button.addEventListener('click', async () => {
-    await request(() => remoteCare.acknowledgeIncident(state.session.token, Number(button.dataset.ack)));
-    await refreshDashboard();
-  }));
-  const notifyList = document.getElementById('notification-list');
-  notifyList.innerHTML = notifications.length ? notifications.slice(0, 6).map((item) => `<div class="notification-item"><strong>${escapeHtml(item.title)}</strong><span>${escapeHtml(item.body)}</span><time datetime="${escapeHtml(item.deliveredAt)}">${escapeHtml(prettyTime(item.deliveredAt))}</time></div>`).join('') : '<div class="empty">Notifications will be stored here.</div>';
-  try {
-    state.adapters = await request(() => remoteCare.getNetworkAdapters(state.session.token));
-    const adapterList = document.getElementById('adapter-list');
-    adapterList.innerHTML = state.adapters.length ? `<div class="adapter-list">${state.adapters.map((adapter) => `<div class="adapter"><div><strong>${escapeHtml(adapter.kind === 'wireless' ? 'Wi‑Fi' : adapter.kind === 'wired' ? 'Wired' : adapter.description)}</strong><small>${escapeHtml(adapter.name)}${adapter.linkSpeed ? ` · ${escapeHtml(adapter.linkSpeed)}` : ''}</small></div>${badge(adapter.connected ? 'healthy' : 'down', adapter.connected ? 'connected' : 'disconnected')}</div>`).join('')}</div>` : '<div class="empty">No physical adapters found.</div>';
-  } catch (error) {
-    document.getElementById('adapter-list').innerHTML = `<div class="empty">Unable to read adapters: ${escapeHtml(error.message)}</div>`;
-  }
+  renderIncidentsList(activeIncidents);
+  renderNotificationsList(notifications);
+  renderAdapterList();
+  void refreshNetworkAdapters();
+}
+
+function updateOverviewLive() {
+  const { summary, activeIncidents, notifications } = state.dashboard;
+  const overall = overallStatus();
+  const elTotal = document.getElementById('stat-total');
+  if (elTotal && elTotal.textContent !== String(summary.total)) elTotal.textContent = summary.total;
+  const elHealthy = document.getElementById('stat-healthy');
+  if (elHealthy && elHealthy.textContent !== String(summary.healthy)) elHealthy.textContent = summary.healthy;
+  const elWarning = document.getElementById('stat-warning');
+  if (elWarning && elWarning.textContent !== String(summary.warning)) elWarning.textContent = summary.warning;
+  const elDown = document.getElementById('stat-down');
+  if (elDown && elDown.textContent !== String(summary.down)) elDown.textContent = summary.down;
+  const elUnknown = document.getElementById('stat-unknown');
+  if (elUnknown && elUnknown.textContent !== String(summary.unknown)) elUnknown.textContent = summary.unknown;
+
+  const dot = document.getElementById('overall-dot');
+  const expectedDotClass = `dot ${overall.className}`.trim();
+  if (dot && dot.className !== expectedDotClass) dot.className = expectedDotClass;
+  const text = document.getElementById('overall-text');
+  if (text && text.textContent !== overall.text) text.textContent = overall.text;
+
+  const incidentCount = document.getElementById('incident-count');
+  if (incidentCount) incidentCount.textContent = `${activeIncidents.length} open`;
+
+  renderIncidentsList(activeIncidents);
+  renderNotificationsList(notifications);
+  renderAdapterList();
+}
+
+function monitorRowMarkup(target) {
+  return `
+    <tr data-target-id="${target.id}">
+      <td class="target-name-cell"><div class="target-name">${escapeHtml(target.name)}<small>${escapeHtml(targetDestination(target))}${target.enabled ? '' : ' · disabled'}</small></div></td>
+      <td class="target-location-cell">${escapeHtml(target.locationName)}</td>
+      <td class="target-type-cell">${escapeHtml(prettyType(target.type))}</td>
+      <td class="target-status-cell">${target.enabled ? badge(target.status) : badge('unknown', 'disabled')}</td>
+      <td class="target-time-cell"><time class="timestamp" datetime="${escapeHtml(target.lastCheckedAt || '')}">${escapeHtml(prettyTime(target.lastCheckedAt))}</time></td>
+      <td class="target-latency-cell">${target.lastLatencyMs === null || target.lastLatencyMs === undefined ? '—' : `${target.lastLatencyMs} ms`}</td>
+      ${isAdmin() ? `<td><div class="actions" style="margin:0"><button class="button secondary small" data-run="${target.id}">Run</button><button class="button ghost small" data-edit="${target.id}">Edit</button><button class="button danger small" data-delete="${target.id}">Delete</button></div></td>` : ''}
+    </tr>`;
 }
 
 function renderMonitors(content) {
   const targets = state.dashboard.targets;
   content.innerHTML = `
     <header class="page-header"><div><h2>Monitors</h2><p>Configure local connectivity, server, and service checks.</p></div><div class="header-tools">${liveClockMarkup()}${isAdmin() ? '<button class="button" id="add-monitor">+ Add monitor</button>' : '<div class="status-line">Viewer access · configuration locked</div>'}</div></header>
-    <article class="card"><div class="table-wrap"><table><thead><tr><th>Monitor</th><th>Type</th><th>Status</th><th>Last check</th><th>Latency</th>${isAdmin() ? '<th>Actions</th>' : ''}</tr></thead><tbody id="monitor-table"></tbody></table></div></article>`;
-  const body = document.getElementById('monitor-table');
-  body.innerHTML = targets.length ? targets.map((target) => `<tr>
-    <td><div class="target-name">${escapeHtml(target.name)}<small>${escapeHtml(targetDestination(target))}${target.enabled ? '' : ' · disabled'}</small></div></td>
-    <td>${escapeHtml(prettyType(target.type))}</td>
-    <td>${target.enabled ? badge(target.status) : badge('unknown', 'disabled')}</td>
-    <td><time class="timestamp" datetime="${escapeHtml(target.lastCheckedAt || '')}">${escapeHtml(prettyTime(target.lastCheckedAt))}</time></td>
-    <td>${target.lastLatencyMs === null || target.lastLatencyMs === undefined ? '—' : `${target.lastLatencyMs} ms`}</td>
-    ${isAdmin() ? `<td><div class="actions" style="margin:0"><button class="button secondary small" data-run="${target.id}">Run</button><button class="button ghost small" data-edit="${target.id}">Edit</button><button class="button danger small" data-delete="${target.id}">Delete</button></div></td>` : ''}
-  </tr>`).join('') : `<tr><td colspan="${isAdmin() ? 6 : 5}" class="empty">No monitors configured.</td></tr>`;
+    <article class="card"><div class="table-wrap"><table><thead><tr><th>Monitor</th><th>Location</th><th>Type</th><th>Status</th><th>Last check</th><th>Latency</th>${isAdmin() ? '<th>Actions</th>' : ''}</tr></thead><tbody id="monitor-table">${targets.length ? targets.map(monitorRowMarkup).join('') : `<tr><td colspan="${isAdmin() ? 7 : 6}" class="empty">No monitors configured.</td></tr>`}</tbody></table></div></article>`;
   if (!isAdmin()) return;
-  document.getElementById('add-monitor').addEventListener('click', () => openMonitorDialog());
+  document.getElementById('add-monitor')?.addEventListener('click', () => openMonitorDialog());
+  attachMonitorTableListeners(document.getElementById('monitor-table'));
+}
+
+function attachMonitorTableListeners(body) {
+  if (!body) return;
+  const targets = state.dashboard.targets;
   body.querySelectorAll('[data-run]').forEach((button) => button.addEventListener('click', async () => {
     button.disabled = true;
     try {
       const outcome = await request(() => remoteCare.runTarget(state.session.token, Number(button.dataset.run)));
-      await refreshDashboard();
+      await refreshDashboard(true);
       if (!outcome?.transition) {
         const target = state.dashboard.targets.find((item) => item.id === Number(button.dataset.run));
         if (outcome?.result?.ok) {
           flash(outcome.result.message || `${target?.name || 'Monitor'} is healthy.`, 'recovered', {
             title: `Check passed: ${target?.name || 'Monitor'}`,
-            subtitle: `${outcome.result.latencyMs !== null && outcome.result.latencyMs !== undefined ? `${outcome.result.latencyMs} ms · ` : ''}Manual check`
+            subtitle: `${target?.locationName || 'Local device'} · ${outcome.result.latencyMs !== null && outcome.result.latencyMs !== undefined ? `${outcome.result.latencyMs} ms · ` : ''}Manual check`
           });
         } else {
           flash(outcome?.result?.message || `${target?.name || 'Monitor'} check failed.`, 'down', {
             title: `Check failed: ${target?.name || 'Monitor'}`,
-            subtitle: `Status: ${outcome?.status || 'warning'} · Manual check`
+            subtitle: `${target?.locationName || 'Local device'} · ${outcome?.status || 'warning'} · Manual check`
           });
         }
       }
@@ -480,8 +569,71 @@ function renderMonitors(content) {
   body.querySelectorAll('[data-delete]').forEach((button) => button.addEventListener('click', async () => {
     const target = targets.find((item) => item.id === Number(button.dataset.delete));
     if (!window.confirm(`Delete monitor “${target.name}”? Its local history will also be removed.`)) return;
-    try { await request(() => remoteCare.deleteTarget(state.session.token, target.id)); await refreshDashboard(); } catch (error) { flash(error.message, 'down'); }
+    try { await request(() => remoteCare.deleteTarget(state.session.token, target.id)); await refreshDashboard(true); } catch (error) { flash(error.message, 'down'); }
   }));
+}
+
+function updateMonitorsLive() {
+  const body = document.getElementById('monitor-table');
+  if (!body) return;
+  const targets = state.dashboard.targets;
+  if (!targets.length) {
+    body.innerHTML = `<tr><td colspan="${isAdmin() ? 7 : 6}" class="empty">No monitors configured.</td></tr>`;
+    return;
+  }
+  const currentRows = Array.from(body.querySelectorAll('tr[data-target-id]'));
+  const currentIds = currentRows.map((r) => Number(r.dataset.targetId));
+  const newIds = targets.map((t) => t.id);
+  const idsMatch = currentIds.length === newIds.length && currentIds.every((id, i) => id === newIds[i]);
+  if (!idsMatch) {
+    body.innerHTML = targets.map(monitorRowMarkup).join('');
+    attachMonitorTableListeners(body);
+    return;
+  }
+  for (const target of targets) {
+    const row = body.querySelector(`tr[data-target-id="${target.id}"]`);
+    if (!row) continue;
+    const nameCell = row.querySelector('.target-name-cell');
+    const newNameMarkup = `<div class="target-name">${escapeHtml(target.name)}<small>${escapeHtml(targetDestination(target))}${target.enabled ? '' : ' · disabled'}</small></div>`;
+    if (nameCell && nameCell.innerHTML !== newNameMarkup) nameCell.innerHTML = newNameMarkup;
+
+    const locationCell = row.querySelector('.target-location-cell');
+    const newLocation = escapeHtml(target.locationName);
+    if (locationCell && locationCell.innerHTML !== newLocation) locationCell.innerHTML = newLocation;
+
+    const typeCell = row.querySelector('.target-type-cell');
+    const newType = escapeHtml(prettyType(target.type));
+    if (typeCell && typeCell.textContent !== newType) typeCell.textContent = newType;
+
+    const statusCell = row.querySelector('.target-status-cell');
+    const newStatus = target.enabled ? badge(target.status) : badge('unknown', 'disabled');
+    if (statusCell && statusCell.innerHTML !== newStatus) statusCell.innerHTML = newStatus;
+
+    const timeCell = row.querySelector('.target-time-cell');
+    const timeVal = escapeHtml(prettyTime(target.lastCheckedAt));
+    const dtVal = escapeHtml(target.lastCheckedAt || '');
+    const newTime = `<time class="timestamp" datetime="${dtVal}">${timeVal}</time>`;
+    if (timeCell && timeCell.innerHTML !== newTime) timeCell.innerHTML = newTime;
+
+    const latencyCell = row.querySelector('.target-latency-cell');
+    const newLatency = target.lastLatencyMs === null || target.lastLatencyMs === undefined ? '—' : `${target.lastLatencyMs} ms`;
+    if (latencyCell && latencyCell.textContent !== newLatency) latencyCell.textContent = newLatency;
+  }
+}
+
+function updateDashboardLive() {
+  if (state.page === 'overview') {
+    if (document.getElementById('stat-total')) updateOverviewLive();
+    else renderPage();
+  } else if (state.page === 'monitors') {
+    if (document.getElementById('monitor-table')) updateMonitorsLive();
+    else renderPage();
+  } else if (state.page === 'history') {
+    const form = document.getElementById('history-filters');
+    if (form && !form.contains(document.activeElement)) {
+      loadHistory(historyFilterValues(form)).catch(() => {});
+    }
+  }
 }
 
 function historyFilterValues(form) {
@@ -494,6 +646,7 @@ function historyFilterValues(form) {
     status: values.status || '',
     outcome: values.outcome || 'all',
     search: values.search || '',
+    location: values.location || '',
     limit: 200
   };
 }
@@ -504,9 +657,9 @@ function renderHistoryRows(history) {
   if (!container || !summary) return;
   const results = history.results;
   summary.textContent = results.length === history.filters.limit
-    ? `Showing the newest ${results.length} matching checks. Refine the filters to narrow the result set.`
-    : `${results.length} matching check${results.length === 1 ? '' : 's'} found.`;
-  container.innerHTML = `<div class="table-wrap"><table><thead><tr><th>Date & time</th><th>Monitor</th><th>Type</th><th>Result</th><th>Message</th><th>Latency</th></tr></thead><tbody>${results.length ? results.map((result) => `<tr><td><time class="timestamp" datetime="${escapeHtml(result.checkedAt)}">${escapeHtml(prettyTime(result.checkedAt))}</time></td><td>${escapeHtml(result.targetName)}</td><td>${escapeHtml(prettyType(result.targetType))}</td><td>${badge(result.status, result.ok ? 'success' : result.status)}</td><td class="muted">${escapeHtml(result.message)}</td><td>${result.latencyMs === null || result.latencyMs === undefined ? '—' : `${result.latencyMs} ms`}</td></tr>`).join('') : '<tr><td colspan="6" class="empty">No checks match these filters.</td></tr>'}</tbody></table></div>`;
+    ? `Showing the newest ${results.length} recorded changes. Refine the filters to narrow the result set.`
+    : `${results.length} recorded change${results.length === 1 ? '' : 's'} found.`;
+  container.innerHTML = `<div class="table-wrap"><table><thead><tr><th>Date & time</th><th>Location</th><th>Monitor</th><th>Type</th><th>Result</th><th>Message</th><th>Latency</th></tr></thead><tbody>${results.length ? results.map((result) => `<tr><td><time class="timestamp" datetime="${escapeHtml(result.checkedAt)}">${escapeHtml(prettyTime(result.checkedAt))}</time></td><td>${escapeHtml(result.locationName)}</td><td>${escapeHtml(result.targetName)}</td><td>${escapeHtml(prettyType(result.targetType))}</td><td>${badge(result.status, result.ok ? 'success' : result.status)}</td><td class="muted">${escapeHtml(result.message)}</td><td>${result.latencyMs === null || result.latencyMs === undefined ? '—' : `${result.latencyMs} ms`}</td></tr>`).join('') : '<tr><td colspan="7" class="empty">No checks match these filters.</td></tr>'}</tbody></table></div>`;
 }
 
 async function loadHistory(filters) {
@@ -518,10 +671,10 @@ async function loadHistory(filters) {
 
 async function renderHistory(content) {
   const filters = state.historyFilters;
-  const targetOptions = state.dashboard.targets.map((target) => `<option value="${target.id}" ${Number(filters.targetId) === target.id ? 'selected' : ''}>${escapeHtml(target.name)}</option>`).join('');
+  const targetOptions = state.dashboard.targets.map((target) => `<option value="${target.id}" ${Number(filters.targetId) === target.id ? 'selected' : ''}>${escapeHtml(target.name)} — ${escapeHtml(target.locationName)}</option>`).join('');
   const selected = (name, value) => filters[name] === value ? 'selected' : '';
   content.innerHTML = `
-    <header class="page-header"><div><h2>Check history</h2><p>Every completed check is stored locally with its precise timestamp. Results are retained for 30 days.</p></div><div class="header-tools">${liveClockMarkup()}<button class="button secondary" id="refresh-history">Refresh</button></div></header>
+    <header class="page-header"><div><h2>Check history</h2><p>Only the first and changed monitor results are stored locally, with precise timestamps. Results are retained for 30 days.</p></div><div class="header-tools">${liveClockMarkup()}<label class="report-month"><span>Monthly report</span><input id="report-month" type="month" value="${currentMonthValue()}" max="${currentMonthValue()}" /></label><button class="button" id="export-history-report">Export CSV</button><button class="button secondary" id="refresh-history">Refresh</button></div></header>
     <article class="card history-filter-card"><div class="panel-title"><h3>Search and filters</h3><span>All dates and times are local to this device</span></div><form class="history-filters" id="history-filters">
       <div class="field"><label for="history-from">From date &amp; time</label><input id="history-from" name="from" type="datetime-local" step="1" value="${escapeHtml(toDateTimeLocal(filters.from))}" /></div>
       <div class="field"><label for="history-to">To date &amp; time</label><input id="history-to" name="to" type="datetime-local" step="1" value="${escapeHtml(toDateTimeLocal(filters.to))}" /></div>
@@ -529,7 +682,8 @@ async function renderHistory(content) {
       <div class="field"><label for="history-type">Monitor type</label><select id="history-type" name="type"><option value="">All types</option><option value="internet" ${selected('type', 'internet')}>Internet</option><option value="interface" ${selected('type', 'interface')}>Network interface</option><option value="gateway" ${selected('type', 'gateway')}>Default gateway</option><option value="ping" ${selected('type', 'ping')}>ICMP ping</option><option value="tcp" ${selected('type', 'tcp')}>TCP port</option><option value="http" ${selected('type', 'http')}>HTTP/HTTPS</option><option value="system_service" ${selected('type', 'system_service')}>Local service</option><option value="process" ${selected('type', 'process')}>Local process</option></select></div>
       <div class="field"><label for="history-outcome">Outcome</label><select id="history-outcome" name="outcome"><option value="all" ${selected('outcome', 'all')}>All outcomes</option><option value="success" ${selected('outcome', 'success')}>Successful checks</option><option value="failure" ${selected('outcome', 'failure')}>Failed checks</option></select></div>
       <div class="field"><label for="history-status">Recorded status</label><select id="history-status" name="status"><option value="">All statuses</option><option value="healthy" ${selected('status', 'healthy')}>Healthy</option><option value="warning" ${selected('status', 'warning')}>Warning</option><option value="down" ${selected('status', 'down')}>Down</option><option value="unknown" ${selected('status', 'unknown')}>Unknown</option></select></div>
-      <div class="field history-search"><label for="history-search">Monitor or message</label><input id="history-search" name="search" maxlength="120" value="${escapeHtml(filters.search || '')}" placeholder="Search text" /></div>
+      <div class="field"><label for="history-location">Location</label><input id="history-location" name="location" maxlength="100" value="${escapeHtml(filters.location || '')}" placeholder="e.g. Bengaluru office" /></div>
+      <div class="field history-search"><label for="history-search">Location, monitor, or message</label><input id="history-search" name="search" maxlength="120" value="${escapeHtml(filters.search || '')}" placeholder="Search text" /></div>
       <div class="history-filter-actions"><button class="button" type="submit">Apply filters</button><button class="button ghost" type="button" id="clear-history-filters">Clear</button></div>
       <div class="error history-filter-error" id="history-filter-error"></div>
     </form></article>
@@ -555,6 +709,20 @@ async function renderHistory(content) {
   document.getElementById('refresh-history').addEventListener('click', async () => {
     error.textContent = '';
     try { await loadHistory(historyFilterValues(form)); } catch (exception) { error.textContent = exception.message || 'Unable to refresh history.'; }
+  });
+  document.getElementById('export-history-report').addEventListener('click', async () => {
+    const button = document.getElementById('export-history-report');
+    const month = document.getElementById('report-month').value;
+    error.textContent = '';
+    button.disabled = true;
+    try {
+      const result = await request(() => remoteCare.exportMonthlyReport(state.session.token, month));
+      if (!result.cancelled) flash(`Monthly report exported with ${result.rowCount} recorded change${result.rowCount === 1 ? '' : 's'}.`, 'info');
+    } catch (exception) {
+      error.textContent = exception.message || 'Unable to export the monthly report.';
+    } finally {
+      button.disabled = false;
+    }
   });
   try {
     await loadHistory(filters);
@@ -614,6 +782,7 @@ async function renderSettings(content) {
         <label class="setting-row"><span><strong>Failure and warning alerts</strong><small>Show a desktop popup whenever a monitor changes to warning or down, including while the dashboard is hidden.</small></span><input name="showFailureNotifications" type="checkbox" ${checked('showFailureNotifications')} /></label>
         <label class="setting-row"><span><strong>Healthy and recovery alerts</strong><small>Show a desktop popup whenever a monitor becomes healthy, including its first successful check.</small></span><input name="showRecoveryNotifications" type="checkbox" ${checked('showRecoveryNotifications')} /></label>
         <label class="setting-row"><span><strong>Notification duration (seconds)</strong><small>Automatically close each new notification after this time. Default: 5 seconds; allowed: 1–300 seconds. Applies to desktop popups, tray reminders, and in-app toasts.</small></span><input name="notificationDurationSeconds" type="number" min="1" max="300" step="1" required value="${settings.notificationDurationSeconds}" /></label>
+        <div class="setting-row notification-test"><span><strong>Test desktop alert</strong><small>Show a test popup now. This bypasses the two alert toggles so you can verify system permissions and placement.</small></span><button class="button secondary small" id="test-notification" type="button">Show test alert</button></div>
       </div></article>
       <article class="card"><div class="panel-title"><h3>Protected exit</h3><span>Super Admin only</span></div><div class="panel-body protected-exit"><div><strong>Quit Remote Care Monitor</strong><p class="helper">To stop local monitoring, confirm the current Super Admin password. Closing this dashboard only sends it back to the system tray.</p></div><button class="button danger" type="button" id="request-quit">Quit app…</button></div></article>
       <div class="actions"><button class="button" type="submit">Save settings</button><span class="helper settings-help">Alert history remains available on the overview even when a display notification is turned off.</span></div>
@@ -634,16 +803,32 @@ async function renderSettings(content) {
       error.textContent = exception.message || 'Unable to save settings.';
     }
   });
+  document.getElementById('test-notification').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    const error = document.getElementById('settings-error');
+    error.textContent = '';
+    button.disabled = true;
+    try {
+      await request(() => remoteCare.testNotification(state.session.token));
+      flash('Test alert requested. Check the top-right of the active display.', 'info', { silent: true });
+    } catch (exception) {
+      error.textContent = exception.message || 'Unable to show the test alert.';
+    } finally {
+      button.disabled = false;
+    }
+  });
   document.getElementById('request-quit').addEventListener('click', () => openQuitDialog('settings'));
 }
 
 async function renderAbout(content) {
   if (!state.appInfo) state.appInfo = await request(() => remoteCare.getAppInfo(state.session.token));
   const runtime = state.appInfo.runtime || {};
+  const autostart = state.appInfo.autostart || {};
   const previousShutdown = runtime.lastUnexpectedShutdownAt
     ? `Unexpected shutdown recorded ${prettyTime(runtime.lastUnexpectedShutdownAt)}`
     : 'No unexpected shutdown has been recorded';
-  content.innerHTML = `<header class="page-header"><div><h2>About this device</h2><p>Phase 1 works completely locally. Cloud publishing is deliberately disabled.</p></div>${liveClockMarkup()}</header><article class="card"><div class="panel-body"><div class="info-grid"><div class="info-item"><span>Application version</span><strong>${escapeHtml(state.appInfo.version)}</strong></div><div class="info-item"><span>Platform</span><strong>${escapeHtml(state.appInfo.platform)} / ${escapeHtml(state.appInfo.arch)}</strong></div><div class="info-item"><span>Data location</span><strong>${escapeHtml(state.appInfo.dataPath)}</strong></div><div class="info-item"><span>Cloud sync</span><strong>${escapeHtml(state.appInfo.cloudSync)}</strong></div><div class="info-item"><span>Runtime integrity</span><strong>${escapeHtml(previousShutdown)}</strong></div><div class="info-item"><span>Current session started</span><strong>${escapeHtml(prettyTime(runtime.startedAt))}</strong></div></div><p class="helper" style="margin:20px 0 0">The durable local event queue is ready for a Phase 2 HTTPS or MQTT sender. It currently sends no data outside this computer.</p></div></article>`;
+  const autostartMessage = autostart.message || 'Not available';
+  content.innerHTML = `<header class="page-header"><div><h2>About this device</h2><p>Phase 1 works completely locally. Cloud publishing is deliberately disabled.</p></div>${liveClockMarkup()}</header><article class="card"><div class="panel-body"><div class="info-grid"><div class="info-item"><span>Application version</span><strong>${escapeHtml(state.appInfo.version)}</strong></div><div class="info-item"><span>Platform</span><strong>${escapeHtml(state.appInfo.platform)} / ${escapeHtml(state.appInfo.arch)}</strong></div><div class="info-item"><span>Automatic startup</span><strong>${escapeHtml(autostartMessage)}</strong></div><div class="info-item"><span>Data location</span><strong>${escapeHtml(state.appInfo.dataPath)}</strong></div><div class="info-item"><span>Cloud sync</span><strong>${escapeHtml(state.appInfo.cloudSync)}</strong></div><div class="info-item"><span>Runtime integrity</span><strong>${escapeHtml(previousShutdown)}</strong></div><div class="info-item"><span>Current session started</span><strong>${escapeHtml(prettyTime(runtime.startedAt))}</strong></div></div><p class="helper" style="margin:20px 0 0">The durable local event queue is ready for a Phase 2 HTTPS or MQTT sender. It currently sends no data outside this computer.</p></div></article>`;
 }
 
 function monitorFields(type) {
@@ -687,7 +872,8 @@ function openMonitorDialog(target = null) {
   dialog.innerHTML = `
     <div class="dialog-header"><h3>${target ? 'Edit monitor' : 'Add monitor'}</h3><button class="button ghost small" type="button" data-close>Close</button></div>
     <form id="monitor-form"><div class="dialog-body">
-      <div class="two-col"><div class="field"><label>Name</label><input name="name" required maxlength="80" value="${value('name')}" placeholder="Production API" /></div><div class="field"><label>Check type</label><select name="type"><option value="internet">Internet connection</option><option value="interface">Network interface</option><option value="gateway">Default gateway</option><option value="ping">ICMP ping</option><option value="tcp">TCP port</option><option value="http">HTTP/HTTPS endpoint</option><option value="system_service">Local system service</option><option value="process">Local process</option></select></div></div>
+      <div class="two-col"><div class="field"><label>Name</label><input name="name" required maxlength="80" value="${value('name')}" placeholder="Production API" /></div><div class="field"><label>Location name</label><input name="locationName" required minlength="2" maxlength="100" value="${value('locationName', 'Local device')}" placeholder="e.g. Bengaluru office" /></div></div>
+      <div class="field"><label>Check type</label><select name="type"><option value="internet">Internet connection</option><option value="interface">Network interface</option><option value="gateway">Default gateway</option><option value="ping">ICMP ping</option><option value="tcp">TCP port</option><option value="http">HTTP/HTTPS endpoint</option><option value="system_service">Local system service</option><option value="process">Local process</option></select></div>
       <div class="field" data-monitor-field="host"><label>Host or IP address</label><input name="host" value="${value('host')}" placeholder="192.168.1.20 or api.example.com" /></div>
       <div class="field" data-monitor-field="port"><label>TCP port</label><input name="port" type="number" min="1" max="65535" value="${value('port')}" placeholder="1883" /></div>
       <div class="field" data-monitor-field="url"><label>HTTP/HTTPS URL</label><input name="url" type="url" value="${value('url')}" placeholder="https://api.example.com/health" /></div>
@@ -712,7 +898,7 @@ function openMonitorDialog(target = null) {
   dialog.querySelectorAll('[data-close]').forEach((button) => button.addEventListener('click', () => dialog.close()));
   dialog.addEventListener('close', () => dialog.remove());
 
-  if (!state.adapters.length) {
+  if (!Array.isArray(state.adapters)) {
     remoteCare.getNetworkAdapters(state.session.token).then((adapters) => {
       state.adapters = adapters;
       const select = dialog.querySelector('select[name="interfaceName"]');
@@ -726,7 +912,7 @@ function openMonitorDialog(target = null) {
     error.textContent = '';
     const values = Object.fromEntries(new FormData(form).entries());
     const payload = { ...values, id: target?.id, enabled: form.elements.enabled.checked, metadata: { dnsHost: values.dnsHost } };
-    try { await request(() => remoteCare.saveTarget(state.session.token, payload)); dialog.close(); await refreshDashboard(); flash(`Monitor “${values.name}” saved.`); } catch (exception) { error.textContent = exception.message; }
+    try { await request(() => remoteCare.saveTarget(state.session.token, payload)); dialog.close(); await refreshDashboard(true); flash(`Monitor “${values.name}” saved.`); } catch (exception) { error.textContent = exception.message; }
   });
   dialog.showModal();
 }
@@ -902,16 +1088,90 @@ function openQuitDialog(source = 'settings') {
   dialog.showModal();
 }
 
-async function refreshDashboard() {
-  if (!state.session) return;
-  state.dashboard = await request(() => remoteCare.getDashboard(state.session.token));
-  await renderPage();
+async function refreshNetworkAdapters(force = false) {
+  const session = state.session;
+  if (!session || state.page !== 'overview' || adapterRefreshInFlight) return;
+  if (!force && Date.now() - lastAdapterRefreshAt < ADAPTER_REFRESH_INTERVAL_MS) return;
+
+  adapterRefreshInFlight = true;
+  try {
+    const adapters = await request(() => remoteCare.getNetworkAdapters(session.token));
+    if (state.session?.token !== session.token || state.page !== 'overview') return;
+    state.adapters = adapters;
+    lastAdapterRefreshAt = Date.now();
+    renderAdapterList();
+  } catch (error) {
+    if (state.session?.token === session.token && state.page === 'overview') {
+      lastAdapterRefreshAt = Date.now();
+      const adapterList = document.getElementById('adapter-list');
+      if (adapterList) adapterList.innerHTML = `<div class="empty">Unable to read adapters: ${escapeHtml(error.message)}</div>`;
+    }
+  } finally {
+    adapterRefreshInFlight = false;
+  }
+}
+
+async function refreshDashboard(force = false) {
+  const session = state.session;
+  if (!session) return;
+  const version = ++dashboardRefreshVersion;
+  const dashboard = await request(() => remoteCare.getDashboard(session.token));
+  if (version !== dashboardRefreshVersion || state.session?.token !== session.token) return;
+
+  state.dashboard = dashboard;
+  if (force) {
+    await renderPage();
+  } else {
+    updateDashboardLive();
+  }
+  void refreshNetworkAdapters();
+}
+
+let refreshInFlight = false;
+let refreshQueued = false;
+async function triggerDashboardRefresh(force = false) {
+  if (force) {
+    await refreshDashboard(true);
+    return;
+  }
+  if (refreshInFlight) {
+    refreshQueued = true;
+    return;
+  }
+  refreshInFlight = true;
+  try {
+    await refreshDashboard(false);
+  } catch (error) {
+    flash(error.message, 'down');
+  } finally {
+    refreshInFlight = false;
+    if (refreshQueued) {
+      refreshQueued = false;
+      setTimeout(() => triggerDashboardRefresh(false), 120);
+    }
+  }
 }
 
 function scheduleRefresh() {
+  if (!state.session) return;
   clearTimeout(state.refreshTimer);
-  state.refreshTimer = setTimeout(() => refreshDashboard().catch((error) => flash(error.message, 'down')), 160);
+  state.refreshTimer = setTimeout(() => triggerDashboardRefresh(false), 100);
 }
+
+function startDashboardPolling() {
+  if (state.dashboardPollTimer) return;
+  state.dashboardPollTimer = setInterval(() => triggerDashboardRefresh(false), DASHBOARD_POLL_INTERVAL_MS);
+}
+
+function stopDashboardPolling() {
+  clearInterval(state.dashboardPollTimer);
+  state.dashboardPollTimer = null;
+}
+
+window.addEventListener('focus', () => triggerDashboardRefresh(false));
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) triggerDashboardRefresh(false);
+});
 
 remoteCare.onUpdate((event) => {
   if (event?.type === 'app_settings_updated') state.settings = event.settings;

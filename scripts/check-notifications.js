@@ -21,7 +21,17 @@ app.whenReady().then(async () => {
   try {
     const occurredAt = new Date().toISOString();
     center.show({ kind: 'warning', title: 'Notification display check', body: 'Monitor changed from healthy to warning.', occurredAt }, 5000);
-    await until(() => center.window?.isVisible());
+    // Ubuntu and Raspberry Pi OS normally use the desktop notification
+    // service, while the other platforms use the application popup. Either is
+    // a valid production delivery path; do not wait only for a popup on Linux.
+    await until(() => center.window?.isVisible()
+      || (center.nativeNotifications.size > 0 && center.nativeShowTimers.size === 0));
+    if (center.nativeNotifications.size > 0) {
+      assert.equal(center.window, null);
+      await until(() => center.nativeNotifications.size === 0, 6500);
+      console.log('Native Linux notification passed: request accepted and configured expiry completed. Confirm the visible system alert during this check.');
+      return;
+    }
     const displayedAt = Date.now();
     const content = await center.window.webContents.executeJavaScript(`({
       title: document.getElementById('notification-title').textContent,
@@ -39,7 +49,8 @@ app.whenReady().then(async () => {
     const output = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'remote-care-notification-')), 'notification.png');
     fs.writeFileSync(output, screenshot.toPNG());
     await until(() => !center.window.isVisible());
-    assert.ok(Date.now() - displayedAt >= 4800, 'Popup expired before its five-second duration.');
+    const visibleDuration = Date.now() - displayedAt;
+    assert.ok(visibleDuration >= 4800, `Popup expired after ${visibleDuration}ms, before its five-second duration.`);
     center.show({ kind: 'recovered', title: 'Close button check', body: 'Monitor recovered.', occurredAt }, 12000);
     await until(() => center.window.isVisible());
     await center.window.webContents.executeJavaScript("document.getElementById('notification-close').click()");
