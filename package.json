@@ -16,6 +16,7 @@
     "postinstall": "electron-builder install-app-deps",
     "daemon": "node src/daemon/index.js",
     "test": "node scripts/run-tests.js",
+    "test:server": "node scripts/test-remote-server.js",
     "test:notifications-ui": "electron scripts/check-notifications.js",
     "lint": "node --check src/main/app.js && node --check src/main/autostart.js && node --check src/main/database.js && node --check src/main/monitor-engine.js && node --check src/main/checks.js && node --check src/main/notification-center.js && node --check src/main/notification-preload.js && node --check src/main/webhooks.js && node --check src/main/cloud-publisher.js && node --check src/main/heartbeat.js && node --check src/daemon/index.js && node --check src/renderer/notification.js && node --check src/renderer/app.js",
     "pack": "electron-builder --dir",
