@@ -485,3 +485,57 @@ test('dashboard SLA calculation and sparklines are populated correctly', () => {
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('migrates Phase 1 database with existing foreign key references to users without constraint failure', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-care-migration-test-'));
+  const dbPath = path.join(directory, 'legacy.sqlite');
+  try {
+    const Database = require('better-sqlite3');
+    const legacy = new Database(dbPath);
+    legacy.pragma('foreign_keys = ON');
+    legacy.exec(`
+      CREATE TABLE users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        display_name TEXT NOT NULL,
+        role TEXT NOT NULL CHECK(role IN ('super_admin', 'viewer')),
+        password_salt TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_login_at TEXT
+      );
+      CREATE TABLE audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        action TEXT NOT NULL,
+        entity_type TEXT NOT NULL,
+        entity_id TEXT,
+        details_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO users (username, display_name, role, password_salt, password_hash, created_at, updated_at)
+        VALUES ('admin', 'Admin', 'super_admin', 'salt', 'hash', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+      INSERT INTO audit_log (actor_user_id, action, entity_type, created_at)
+        VALUES (1, 'legacy_action', 'system', '2026-01-01T00:00:00.000Z');
+    `);
+    legacy.close();
+
+    // Now open via LocalDatabase which runs migrate()
+    const migrated = new LocalDatabase(dbPath);
+    try {
+      const users = migrated.listUsers();
+      assert.equal(users.length, 1);
+      assert.equal(users[0].username, 'admin');
+
+      // Operator can now be created
+      const op = migrated.createOperator({ username: 'operator1', displayName: 'Ops', password: 'password-1234' }, 1);
+      assert.equal(op.role, 'operator');
+    } finally {
+      migrated.close();
+    }
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});

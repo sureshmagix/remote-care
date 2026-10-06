@@ -428,7 +428,9 @@ class LocalDatabase {
     }
     const userSql = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").get()?.sql || '';
     if (userSql.includes("'viewer'") && !userSql.includes("'operator'")) {
+      this.db.pragma('foreign_keys = OFF');
       this.db.exec(`
+        DROP TABLE IF EXISTS users_migrated;
         CREATE TABLE users_migrated (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           username TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -446,6 +448,7 @@ class LocalDatabase {
         DROP TABLE users;
         ALTER TABLE users_migrated RENAME TO users;
       `);
+      this.db.pragma('foreign_keys = ON');
     }
     const targetColumns = columns('targets');
     if (!targetColumns.has('location_name')) {
