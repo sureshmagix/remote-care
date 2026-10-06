@@ -70,11 +70,11 @@ test('disk monitor checks storage utilization and honors threshold', async () =>
 });
 
 test('memory monitor checks RAM utilization and honors threshold', async () => {
-  const healthy = await checkMemory({ metadata: { thresholdPercent: 100 } });
+  const healthy = await checkMemory({ metadata: { thresholdPercent: 90, totalMem: 1000, freeMem: 500 } });
   assert.equal(healthy.ok, true);
   assert.match(healthy.message, /System RAM normal/);
 
-  const critical = await checkMemory({ metadata: { thresholdPercent: 1 } });
+  const critical = await checkMemory({ metadata: { thresholdPercent: 80, totalMem: 1000, freeMem: 100 } });
   assert.equal(critical.ok, false);
   assert.match(critical.message, /System RAM critical/);
 });

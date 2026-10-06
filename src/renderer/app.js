@@ -398,6 +398,8 @@ function renderShell() {
           <button data-page="monitors">◉ Monitors</button>
           <button data-page="history">◷ History</button>
           <button data-page="users">♙ Users</button>
+          ${isAdmin() ? '<button data-page="server">☁ Server</button>' : ''}
+          ${isAdmin() ? '<button data-page="webhooks">⚑ Webhooks</button>' : ''}
           ${isAdmin() ? '<button data-page="settings">⚙ Settings</button>' : ''}
           <button data-page="about">ⓘ About</button>
         </nav>
@@ -455,6 +457,8 @@ async function renderPage() {
   else if (state.page === 'monitors') await renderMonitors(content);
   else if (state.page === 'history') await renderHistory(content);
   else if (state.page === 'users') await renderUsers(content);
+  else if (state.page === 'server') await renderServer(content);
+  else if (state.page === 'webhooks') await renderWebhooks(content);
   else if (state.page === 'settings') await renderSettings(content);
   else await renderAbout(content);
   startLiveClock();
@@ -865,7 +869,7 @@ async function renderSettings(content) {
   const settings = state.settings;
   const checked = (name) => settings[name] ? 'checked' : '';
   content.innerHTML = `
-    <header class="page-header"><div><h2>Settings</h2><p>Configure background monitoring, audio alerts, webhooks, and cloud publishing.</p></div>${liveClockMarkup()}</header>
+    <header class="page-header"><div><h2>Settings</h2><p>Configure background monitoring, desktop notifications, audio chimes, and backup.</p></div>${liveClockMarkup()}</header>
     <form id="settings-form" class="settings-form">
       <article class="card"><div class="panel-title"><h3>Background behavior</h3><span>System tray</span></div><div class="panel-body settings-list">
         <label class="setting-row"><span><strong>Always run from the system tray</strong><small>Minimizing or closing the dashboard always keeps monitoring active in the background. Quitting requires the Super Admin password.</small></span><input name="minimizeToTray" type="checkbox" checked disabled aria-label="Always enabled" /></label>
@@ -881,20 +885,6 @@ async function renderSettings(content) {
         <label class="setting-row"><span><strong>Enable sound alerts</strong><small>Play an audible alert chime when a monitor fails or recovers.</small></span><input name="soundAlertsEnabled" type="checkbox" ${checked('soundAlertsEnabled')} /></label>
         <div class="setting-row"><span><strong>Alert volume (<span id="sound-volume-label">${settings.soundVolume ?? 70}%</span>)</strong><small>Adjust volume level for audible alert chimes.</small></span><div style="display:flex;align-items:center;gap:10px"><input name="soundVolume" type="range" min="0" max="100" step="5" value="${settings.soundVolume ?? 70}" id="sound-volume-slider" style="width:130px" /><button class="button secondary small" type="button" id="test-sound">Test sound</button></div></div>
       </div></article>
-      <article class="card"><div class="panel-title"><h3>Team webhooks</h3><span>Slack, Discord, Teams, Telegram, Generic</span></div><div class="panel-body settings-list">
-        <label class="setting-row"><span><strong>Enable team webhook</strong><small>Dispatch incident alerts to external chat platforms or webhook endpoints.</small></span><input name="webhookEnabled" type="checkbox" ${checked('webhookEnabled')} /></label>
-        <div class="field" style="margin-top:10px"><label>Webhook provider</label><select name="webhookType"><option value="generic" ${settings.webhookType === 'generic' ? 'selected' : ''}>Generic JSON (HTTP POST)</option><option value="slack" ${settings.webhookType === 'slack' ? 'selected' : ''}>Slack Incoming Webhook</option><option value="discord" ${settings.webhookType === 'discord' ? 'selected' : ''}>Discord Webhook</option><option value="teams" ${settings.webhookType === 'teams' ? 'selected' : ''}>Microsoft Teams Webhook</option><option value="telegram" ${settings.webhookType === 'telegram' ? 'selected' : ''}>Telegram Bot API</option></select></div>
-        <div class="field"><label>Destination URL</label><input name="webhookUrl" type="url" value="${escapeHtml(settings.webhookUrl || '')}" placeholder="https://hooks.slack.com/services/..." /><span class="helper">For Telegram: https://api.telegram.org/bot&lt;TOKEN&gt;/sendMessage?chat_id=&lt;CHAT_ID&gt;</span></div>
-        <div class="field"><label>Event filter</label><select name="webhookEvents"><option value="failures_only" ${settings.webhookEvents === 'failures_only' ? 'selected' : ''}>Only failures and warnings</option><option value="all" ${settings.webhookEvents === 'all' ? 'selected' : ''}>All state transitions (failures &amp; recoveries)</option></select></div>
-        <div class="setting-row notification-test"><span><strong>Verify webhook connection</strong><small>Dispatch a test payload now to confirm endpoint availability.</small></span><button class="button secondary small" id="test-webhook" type="button">Send test webhook</button></div>
-      </div></article>
-      <article class="card"><div class="panel-title"><h3>Cloud telemetry &amp; heartbeat</h3><span>Outbound sync engine</span></div><div class="panel-body settings-list">
-        <label class="setting-row"><span><strong>Enable cloud telemetry</strong><small>Publish outbound monitoring events and periodic device heartbeats over HTTPS.</small></span><input name="cloudSyncEnabled" type="checkbox" ${checked('cloudSyncEnabled')} /></label>
-        <div class="field" style="margin-top:10px"><label>Cloud ingest HTTPS URL</label><input name="cloudHttpsUrl" type="url" value="${escapeHtml(settings.cloudHttpsUrl || '')}" placeholder="https://care-cloud.example.com/api/v1/telemetry/batch" /></div>
-        <div class="field"><label>Bearer auth token</label><input name="cloudAuthToken" type="password" value="${escapeHtml(settings.cloudAuthToken || '')}" placeholder="Optional Bearer token" /></div>
-        <div class="field"><label>Periodic heartbeat interval (minutes)</label><input name="cloudHeartbeatMinutes" type="number" min="1" max="1440" value="${settings.cloudHeartbeatMinutes ?? 5}" required /></div>
-        <div class="setting-row notification-test"><span><strong>Sync pending events now</strong><small id="cloud-sync-status-text">Checking queue status…</small></span><button class="button secondary small" id="trigger-cloud-sync" type="button">Publish now</button></div>
-      </div></article>
       <article class="card"><div class="panel-title"><h3>Backup &amp; Migration</h3><span>JSON import / export</span></div><div class="panel-body settings-list">
         <div class="setting-row"><span><strong>Export monitor definitions</strong><small>Download your configured monitors as a JSON file for backup.</small></span><button class="button secondary small" id="settings-export-monitors" type="button">Export JSON</button></div>
         <div class="setting-row"><span><strong>Import monitor definitions</strong><small>Load monitors from a JSON file. Duplicates will be safely handled.</small></span><button class="button secondary small" id="settings-import-monitors" type="button">Import JSON</button></div>
@@ -907,18 +897,6 @@ async function renderSettings(content) {
   const form = document.getElementById('settings-form');
   const error = document.getElementById('settings-error');
 
-  const updateCloudStatus = async () => {
-    const statusEl = document.getElementById('cloud-sync-status-text');
-    if (!statusEl) return;
-    try {
-      const status = await remoteCare.getCloudSyncStatus(state.session.token);
-      statusEl.textContent = `Pending events: ${status?.pendingCount ?? 0}${status?.lastAttemptAt ? ` · Last attempt: ${prettyTime(status.lastAttemptAt)}` : ''}`;
-    } catch {
-      statusEl.textContent = 'Queue status unavailable';
-    }
-  };
-  void updateCloudStatus();
-
   document.getElementById('sound-volume-slider')?.addEventListener('input', (e) => {
     const label = document.getElementById('sound-volume-label');
     if (label) label.textContent = `${e.target.value}%`;
@@ -930,35 +908,6 @@ async function renderSettings(content) {
       if (state.settings) state.settings.soundVolume = Number(slider.value);
     }
     playNotificationChime('down', true);
-  });
-
-  document.getElementById('test-webhook')?.addEventListener('click', async (event) => {
-    const button = event.currentTarget;
-    error.textContent = '';
-    button.disabled = true;
-    try {
-      const res = await request(() => remoteCare.testWebhook(state.session.token));
-      flash(res?.message || 'Test webhook delivered successfully!', 'info');
-    } catch (err) {
-      error.textContent = err.message || 'Failed to dispatch test webhook.';
-    } finally {
-      button.disabled = false;
-    }
-  });
-
-  document.getElementById('trigger-cloud-sync')?.addEventListener('click', async (event) => {
-    const button = event.currentTarget;
-    error.textContent = '';
-    button.disabled = true;
-    try {
-      const res = await request(() => remoteCare.triggerCloudSync(state.session.token));
-      flash(`Cloud sync triggered: ${res?.deliveredCount ?? 0} event(s) published.`, 'info');
-      await updateCloudStatus();
-    } catch (err) {
-      error.textContent = err.message || 'Cloud sync failed.';
-    } finally {
-      button.disabled = false;
-    }
   });
 
   document.getElementById('settings-export-monitors')?.addEventListener('click', async () => {
@@ -986,22 +935,14 @@ async function renderSettings(content) {
     event.preventDefault();
     error.textContent = '';
     const next = {
+      ...state.settings,
       minimizeToTray: true,
       showTrayReminder: Boolean(form.elements.showTrayReminder?.checked),
       showFailureNotifications: Boolean(form.elements.showFailureNotifications?.checked),
       showRecoveryNotifications: Boolean(form.elements.showRecoveryNotifications?.checked),
       notificationDurationSeconds: form.elements.notificationDurationSeconds ? form.elements.notificationDurationSeconds.valueAsNumber : 5,
       soundAlertsEnabled: Boolean(form.elements.soundAlertsEnabled?.checked),
-      soundVolume: form.elements.soundVolume ? Number(form.elements.soundVolume.value) : 70,
-      webhookEnabled: Boolean(form.elements.webhookEnabled?.checked),
-      webhookType: form.elements.webhookType?.value || 'generic',
-      webhookUrl: form.elements.webhookUrl?.value?.trim() || '',
-      webhookEvents: form.elements.webhookEvents?.value || 'failures_only',
-      cloudSyncEnabled: Boolean(form.elements.cloudSyncEnabled?.checked),
-      cloudSyncProtocol: 'https',
-      cloudHttpsUrl: form.elements.cloudHttpsUrl?.value?.trim() || '',
-      cloudAuthToken: form.elements.cloudAuthToken?.value?.trim() || '',
-      cloudHeartbeatMinutes: form.elements.cloudHeartbeatMinutes ? form.elements.cloudHeartbeatMinutes.valueAsNumber : 5
+      soundVolume: form.elements.soundVolume ? Number(form.elements.soundVolume.value) : 70
     };
     try {
       state.settings = await request(() => remoteCare.saveAppSettings(state.session.token, next));
@@ -1026,6 +967,472 @@ async function renderSettings(content) {
   });
 
   document.getElementById('request-quit')?.addEventListener('click', () => openQuitDialog('settings'));
+}
+
+async function renderServer(content) {
+  if (!isAdmin()) {
+    state.page = 'overview';
+    return renderOverview(content);
+  }
+  state.settings = await request(() => remoteCare.getAppSettings(state.session.token));
+  const settings = state.settings;
+  const checked = (name) => settings[name] ? 'checked' : '';
+  const isSelected = (val) => (settings.telemetrySelection || 'all') === val ? 'selected' : '';
+
+  // Calculate default endpoints derived from base URL if not explicitly set
+  const base = (settings.serverBaseUrl || '').trim().replace(/\/+$/, '');
+  const derivedHealth = base ? `${base}/health` : '';
+  const derivedHistory = base ? `${base}/api/history` : '';
+  const currentHealth = settings.serverHealthUrl || derivedHealth;
+  const currentHistory = settings.historySyncUrl || derivedHistory;
+
+  const targets = state.dashboard?.targets || [];
+  const savedTargetIdsRaw = settings.historySyncTargetIds || '';
+  const savedTargetIds = savedTargetIdsRaw && savedTargetIdsRaw !== 'all'
+    ? savedTargetIdsRaw.split(',').map((s) => Number(s.trim())).filter((n) => Number.isInteger(n) && n > 0)
+    : null;
+
+  const isTargetChecked = (targetId) => {
+    if (savedTargetIds === null || savedTargetIds.length === 0) return true; // default all checked
+    return savedTargetIds.includes(targetId);
+  };
+
+  content.innerHTML = `
+    <header class="page-header"><div><h2>Server Integration</h2><p>Configure remote care server base URL, telemetry options, health verification, and result changes history sync.</p></div>${liveClockMarkup()}</header>
+    <form id="server-form" class="settings-form">
+      <article class="card">
+        <div class="panel-title"><h3>Server Connection</h3><span>Core integration</span></div>
+        <div class="panel-body settings-list">
+          <label class="setting-row">
+            <span><strong>Enable server synchronization</strong><small>Publish outbound monitoring events, telemetry, and heartbeats to the remote care server.</small></span>
+            <input name="cloudSyncEnabled" type="checkbox" ${checked('cloudSyncEnabled')} />
+          </label>
+          <div class="field" style="margin-top:10px">
+            <label>Server Base URL</label>
+            <input name="serverBaseUrl" type="url" value="${escapeHtml(settings.serverBaseUrl || '')}" placeholder="http://192.168.1.50:3000 or https://care-cloud.example.com" id="server-base-url-input" />
+            <span class="helper">Enter only the base URL of your remote care server. API endpoints like <code>/api/sync</code>, <code>/api/history</code>, and <code>/health</code> are derived automatically.</span>
+          </div>
+          <div class="field">
+            <label>Server Bearer / Auth Token</label>
+            <input name="serverAuthToken" type="password" value="${escapeHtml(settings.serverAuthToken || settings.cloudAuthToken || '')}" placeholder="Optional Bearer token" />
+            <span class="helper">Supplied as Authorization: Bearer &lt;token&gt; with outbound server requests.</span>
+          </div>
+          <div class="field">
+            <label>Sync Interval (seconds)</label>
+            <input name="serverSyncIntervalSeconds" type="number" min="2" max="3600" step="1" value="${settings.serverSyncIntervalSeconds ?? 15}" required />
+            <span class="helper">How frequently pending outbound event batches are flushed to the server.</span>
+          </div>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="panel-title"><h3>Result Changes History Sync</h3><span>Periodic delta history</span></div>
+        <div class="panel-body settings-list">
+          <label class="setting-row">
+            <span><strong>Enable History of Changes Sync</strong><small>Send the recorded history of changes in monitor results to the server periodically.</small></span>
+            <input name="historySyncEnabled" type="checkbox" ${checked('historySyncEnabled')} />
+          </label>
+          <div class="field" style="margin-top:10px">
+            <label>History Sync URL</label>
+            <input name="historySyncUrl" type="url" value="${escapeHtml(settings.historySyncUrl || '')}" placeholder="${escapeHtml(derivedHistory || 'http://localhost:3000/api/history')}" id="history-sync-url-input" />
+            <span class="helper">Dedicated endpoint for result changes history. Defaults to <code>&lt;Base URL&gt;/api/history</code> if left blank.</span>
+          </div>
+          <div class="field">
+            <label>History Sync Delay / Interval (minutes)</label>
+            <input name="historySyncIntervalMinutes" type="number" min="1" max="1440" step="1" value="${settings.historySyncIntervalMinutes ?? 5}" required />
+            <span class="helper">How frequently the recorded changes in monitor result are sent to the server (default: 5 minutes).</span>
+          </div>
+
+          <div class="field">
+            <label>Select Monitors to Send in History Sync</label>
+            <div class="monitor-select-box">
+              <div class="monitor-select-header">
+                <span>Select which monitors are tracked for history transmission:</span>
+                <div class="btn-group">
+                  <button type="button" class="button secondary small" id="btn-select-all-monitors" style="padding:2px 8px;font-size:11px;">Select All</button>
+                  <button type="button" class="button secondary small" id="btn-deselect-all-monitors" style="padding:2px 8px;font-size:11px;">Deselect All</button>
+                </div>
+              </div>
+              <div class="monitor-select-grid" id="history-monitors-list">
+                ${targets.length ? targets.map((t) => `
+                  <label class="monitor-select-item">
+                    <input type="checkbox" data-history-target-id="${t.id}" ${isTargetChecked(t.id) ? 'checked' : ''} />
+                    <div class="monitor-select-info">
+                      <span class="monitor-select-name">${escapeHtml(t.name)}</span>
+                      <span class="monitor-select-sub">${escapeHtml(prettyType(t.type))} · ${escapeHtml(t.locationName || 'Local')}</span>
+                    </div>
+                  </label>
+                `).join('') : '<span style="color:var(--muted);font-size:12px;">No monitors configured yet. Default targets will be included.</span>'}
+              </div>
+            </div>
+          </div>
+
+          <div class="setting-row notification-test">
+            <span><strong>History Transmission &amp; JSON Preview</strong><small id="history-sync-status-text">Click "Preview JSON Payload" to inspect the JSON payload structure.</small></span>
+            <div class="btn-group">
+              <button class="button secondary small" id="btn-preview-history" type="button">Preview JSON Payload</button>
+              <button class="button secondary small" id="btn-sync-history-now" type="button">Sync History Now</button>
+            </div>
+          </div>
+
+          <div class="json-preview-card" id="history-preview-card">
+            <div class="json-preview-toolbar">
+              <div class="meta" id="history-preview-meta">
+                <span>Payload Preview: <strong id="history-preview-mode">Pending / Recent Changes</strong></span>
+                <span id="history-preview-count">0 change(s)</span>
+              </div>
+              <button class="button secondary small" id="btn-copy-history-json" type="button" style="padding:3px 8px;font-size:11px;">Copy JSON</button>
+            </div>
+            <pre class="json-preview-content" id="history-preview-content">// Click "Preview JSON Payload" to generate the live payload…</pre>
+          </div>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="panel-title"><h3>Telemetry Configuration</h3><span>Selected JSON payloads</span></div>
+        <div class="panel-body settings-list">
+          <div class="field" style="margin-top:10px">
+            <label>Telemetry Data to Send (JSON format)</label>
+            <select name="telemetrySelection">
+              <option value="all" ${isSelected('all')}>All Telemetry (System specs, RAM, CPU, load avg, monitor states, incidents)</option>
+              <option value="system_metrics" ${isSelected('system_metrics')}>System &amp; Hardware Metrics Only (CPU cores, load avg, RAM usage, host details)</option>
+              <option value="monitors_only" ${isSelected('monitors_only')}>Monitors &amp; Incidents Only (Active incident counts, monitor health summary)</option>
+              <option value="minimal" ${isSelected('minimal')}>Minimal Status Only (Hostname, overall status, timestamp)</option>
+            </select>
+            <span class="helper">Choose which telemetry payload components are packaged and sent to the server.</span>
+          </div>
+          <div class="field">
+            <label>Periodic heartbeat interval (minutes)</label>
+            <input name="cloudHeartbeatMinutes" type="number" min="1" max="1440" value="${settings.cloudHeartbeatMinutes ?? 5}" required />
+            <span class="helper">How frequently the client sends its telemetry heartbeat JSON.</span>
+          </div>
+          <div class="setting-row notification-test">
+            <span><strong>Publish pending telemetry events now</strong><small id="cloud-sync-status-text">Checking queue status…</small></span>
+            <button class="button secondary small" id="trigger-cloud-sync" type="button">Publish now</button>
+          </div>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="panel-title"><h3>Server Health Check</h3><span>Dedicated health endpoint</span></div>
+        <div class="panel-body settings-list">
+          <div class="field" style="margin-top:10px">
+            <label>Separate Health Check URL</label>
+            <input name="serverHealthUrl" type="url" value="${escapeHtml(settings.serverHealthUrl || '')}" placeholder="${escapeHtml(derivedHealth || 'http://localhost:3000/health')}" id="server-health-url-input" />
+            <span class="helper">Dedicated URL to query server health. Defaults to <code>&lt;Base URL&gt;/health</code> if left blank.</span>
+          </div>
+          <div class="setting-row notification-test">
+            <span><strong>Verify Server Health</strong><small id="server-health-status-text">Check if the server is responding and healthy.</small></span>
+            <button class="button secondary small" id="btn-check-server-health" type="button">Check Health</button>
+          </div>
+          <div id="server-health-result" style="display:none;"></div>
+        </div>
+      </article>
+
+      <div class="actions">
+        <button class="button" type="submit">Save Server Configuration</button>
+        <span class="helper settings-help">Configuration is stored securely in the local SQLite database.</span>
+      </div>
+      <div class="error" id="server-error"></div>
+    </form>`;
+
+  const form = document.getElementById('server-form');
+  const error = document.getElementById('server-error');
+
+  const updateCloudStatus = async () => {
+    const statusEl = document.getElementById('cloud-sync-status-text');
+    if (!statusEl) return;
+    try {
+      const status = await remoteCare.getCloudSyncStatus(state.session.token);
+      statusEl.textContent = `Pending events: ${status?.pendingCount ?? 0} · Endpoint: ${status?.endpoint || 'Not configured'}`;
+    } catch {
+      statusEl.textContent = 'Queue status unavailable';
+    }
+  };
+  void updateCloudStatus();
+
+  // Helper to extract currently checked monitor IDs from UI
+  const getSelectedTargetIds = () => {
+    const checkboxes = form.querySelectorAll('[data-history-target-id]');
+    if (!checkboxes.length) return '';
+    const checked = Array.from(checkboxes).filter((cb) => cb.checked).map((cb) => Number(cb.dataset.historyTargetId));
+    if (checked.length === checkboxes.length) return 'all'; // all selected
+    return checked.join(',');
+  };
+
+  const getSelectedTargetIdsArray = () => {
+    const checkboxes = form.querySelectorAll('[data-history-target-id]');
+    if (!checkboxes.length) return null;
+    const checked = Array.from(checkboxes).filter((cb) => cb.checked).map((cb) => Number(cb.dataset.historyTargetId));
+    if (checked.length === checkboxes.length) return null; // null means all
+    return checked;
+  };
+
+  // Select all / Deselect all monitors handlers
+  document.getElementById('btn-select-all-monitors')?.addEventListener('click', () => {
+    form.querySelectorAll('[data-history-target-id]').forEach((cb) => { cb.checked = true; });
+  });
+  document.getElementById('btn-deselect-all-monitors')?.addEventListener('click', () => {
+    form.querySelectorAll('[data-history-target-id]').forEach((cb) => { cb.checked = false; });
+  });
+
+  // Auto-update health and history URL placeholders when base URL changes
+  const baseInput = document.getElementById('server-base-url-input');
+  const healthInput = document.getElementById('server-health-url-input');
+  const historyInput = document.getElementById('history-sync-url-input');
+  baseInput?.addEventListener('input', () => {
+    const b = baseInput.value.trim().replace(/\/+$/, '');
+    if (b) {
+      if (healthInput) healthInput.placeholder = `${b}/health`;
+      if (historyInput) historyInput.placeholder = `${b}/api/history`;
+    } else {
+      if (healthInput) healthInput.placeholder = 'http://localhost:3000/health';
+      if (historyInput) historyInput.placeholder = 'http://localhost:3000/api/history';
+    }
+  });
+
+  // History Preview generator function
+  const refreshHistoryPreview = async (previewRecent = true) => {
+    const previewContent = document.getElementById('history-preview-content');
+    const previewCount = document.getElementById('history-preview-count');
+    const previewMode = document.getElementById('history-preview-mode');
+    if (!previewContent) return;
+    try {
+      const selectedIds = getSelectedTargetIdsArray();
+      const payload = await remoteCare.getHistorySyncPreview(state.session.token, {
+        previewRecent,
+        targetIds: selectedIds,
+        limit: 25
+      });
+      previewContent.textContent = JSON.stringify(payload, null, 2);
+      if (previewCount) previewCount.textContent = `${payload.entriesCount || 0} change(s)`;
+      if (previewMode) previewMode.textContent = previewRecent ? 'Recent Changes' : 'Pending Queue';
+    } catch (err) {
+      previewContent.textContent = `// Error generating preview: ${err.message}`;
+    }
+  };
+
+  // Preview button click
+  document.getElementById('btn-preview-history')?.addEventListener('click', () => {
+    void refreshHistoryPreview(true);
+  });
+
+  // Copy JSON button
+  document.getElementById('btn-copy-history-json')?.addEventListener('click', (event) => {
+    const previewContent = document.getElementById('history-preview-content');
+    if (!previewContent || !previewContent.textContent) return;
+    navigator.clipboard.writeText(previewContent.textContent).then(() => {
+      const btn = event.currentTarget;
+      const old = btn.textContent;
+      btn.textContent = 'Copied!';
+      setTimeout(() => { btn.textContent = old; }, 1500);
+    });
+  });
+
+  // Sync History Now button
+  document.getElementById('btn-sync-history-now')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    const statusText = document.getElementById('history-sync-status-text');
+    const previewContent = document.getElementById('history-preview-content');
+    error.textContent = '';
+    button.disabled = true;
+    try {
+      const res = await request(() => remoteCare.triggerHistorySync(state.session.token));
+      if (res.ok) {
+        flash(`History sync successful: ${res.sentCount} change(s) transmitted to server.`, 'recovered');
+        if (statusText) statusText.textContent = `Last sent: ${new Date(res.timestamp).toLocaleTimeString()} (${res.sentCount} changes)`;
+        if (res.payload && previewContent) {
+          previewContent.textContent = JSON.stringify(res.payload, null, 2);
+          const previewCount = document.getElementById('history-preview-count');
+          if (previewCount) previewCount.textContent = `${res.sentCount} change(s) sent`;
+          const previewMode = document.getElementById('history-preview-mode');
+          if (previewMode) previewMode.textContent = 'Dispatched Payload (Live)';
+        }
+      } else if (res.skipped) {
+        flash(`History sync skipped: ${res.reason}`, 'info');
+      } else {
+        error.textContent = res.error || 'History sync failed.';
+      }
+    } catch (err) {
+      error.textContent = err.message || 'Error triggering history sync.';
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  // Auto-run initial preview
+  void refreshHistoryPreview(true);
+
+  // Check server health button
+  document.getElementById('btn-check-server-health')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    const resultBox = document.getElementById('server-health-result');
+    error.textContent = '';
+    button.disabled = true;
+    resultBox.style.display = 'none';
+    try {
+      const checkUrl = healthInput.value.trim() || (baseInput.value.trim() ? `${baseInput.value.trim().replace(/\/+$/, '')}/health` : '');
+      const res = await request(() => remoteCare.checkServerHealth(state.session.token, checkUrl));
+      resultBox.style.display = 'block';
+      if (res.ok) {
+        resultBox.className = 'server-health-indicator ok';
+        resultBox.innerHTML = `<span>✓</span> <div><strong>Server is Healthy (HTTP ${res.statusCode})</strong><small style="display:block;opacity:0.85">Endpoint: ${escapeHtml(res.target)} · Latency: ${res.latencyMs}ms</small></div>`;
+      } else {
+        resultBox.className = 'server-health-indicator error';
+        resultBox.innerHTML = `<span>✕</span> <div><strong>Health Check Failed${res.statusCode ? ` (HTTP ${res.statusCode})` : ''}</strong><small style="display:block;opacity:0.85">${escapeHtml(res.message || 'Server did not return 200 OK')}</small></div>`;
+      }
+    } catch (err) {
+      resultBox.style.display = 'block';
+      resultBox.className = 'server-health-indicator error';
+      resultBox.innerHTML = `<span>✕</span> <div><strong>Error connecting to server</strong><small style="display:block;opacity:0.85">${escapeHtml(err.message)}</small></div>`;
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  // Publish telemetry now button
+  document.getElementById('trigger-cloud-sync')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    error.textContent = '';
+    button.disabled = true;
+    try {
+      const res = await request(() => remoteCare.triggerCloudSync(state.session.token));
+      flash(`Server sync triggered: ${res?.publishedCount ?? res?.deliveredCount ?? 0} event(s) published.`, 'info');
+      await updateCloudStatus();
+    } catch (err) {
+      error.textContent = err.message || 'Server sync failed.';
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    error.textContent = '';
+    const baseUrl = form.elements.serverBaseUrl?.value?.trim() || '';
+    const healthUrl = form.elements.serverHealthUrl?.value?.trim() || '';
+    const historyUrl = form.elements.historySyncUrl?.value?.trim() || '';
+    const authToken = form.elements.serverAuthToken?.value?.trim() || '';
+    const selectedTargetIds = getSelectedTargetIds();
+
+    const next = {
+      ...state.settings,
+      cloudSyncEnabled: Boolean(form.elements.cloudSyncEnabled?.checked),
+      serverBaseUrl: baseUrl,
+      serverHealthUrl: healthUrl,
+      historySyncEnabled: Boolean(form.elements.historySyncEnabled?.checked),
+      historySyncUrl: historyUrl,
+      historySyncIntervalMinutes: form.elements.historySyncIntervalMinutes ? form.elements.historySyncIntervalMinutes.valueAsNumber : 5,
+      historySyncTargetIds: selectedTargetIds,
+      serverAuthToken: authToken,
+      cloudAuthToken: authToken,
+      // For backwards compatibility: if cloudHttpsUrl is not customized, derive it
+      cloudHttpsUrl: baseUrl ? `${baseUrl.replace(/\/+$/, '')}/api/sync` : state.settings.cloudHttpsUrl,
+      telemetrySelection: form.elements.telemetrySelection?.value || 'all',
+      cloudHeartbeatMinutes: form.elements.cloudHeartbeatMinutes ? form.elements.cloudHeartbeatMinutes.valueAsNumber : 5,
+      serverSyncIntervalSeconds: form.elements.serverSyncIntervalSeconds ? form.elements.serverSyncIntervalSeconds.valueAsNumber : 15
+    };
+    try {
+      state.settings = await request(() => remoteCare.saveAppSettings(state.session.token, next));
+      flash('Server configuration saved successfully.');
+      await updateCloudStatus();
+      void refreshHistoryPreview(true);
+    } catch (exception) {
+      error.textContent = exception.message || 'Unable to save server configuration.';
+    }
+  });
+}
+
+async function renderWebhooks(content) {
+  if (!isAdmin()) {
+    state.page = 'overview';
+    return renderOverview(content);
+  }
+  state.settings = await request(() => remoteCare.getAppSettings(state.session.token));
+  const settings = state.settings;
+  const checked = (name) => settings[name] ? 'checked' : '';
+
+  content.innerHTML = `
+    <header class="page-header"><div><h2>Webhook Integrations</h2><p>Configure and verify outbound alert webhooks for incident and recovery notifications.</p></div>${liveClockMarkup()}</header>
+    <form id="webhook-form" class="settings-form">
+      <article class="card">
+        <div class="panel-title"><h3>Webhook Configuration</h3><span>Alert notifications</span></div>
+        <div class="panel-body settings-list">
+          <label class="setting-row">
+            <span><strong>Enable Webhook Alerts</strong><small>Dispatch incident alerts and state changes to external systems or chat services.</small></span>
+            <input name="webhookEnabled" type="checkbox" ${checked('webhookEnabled')} />
+          </label>
+          <div class="field" style="margin-top:10px">
+            <label>Webhook Provider Format</label>
+            <select name="webhookType">
+              <option value="generic" ${settings.webhookType === 'generic' ? 'selected' : ''}>Generic JSON (HTTP POST)</option>
+              <option value="slack" ${settings.webhookType === 'slack' ? 'selected' : ''}>Slack Incoming Webhook</option>
+              <option value="discord" ${settings.webhookType === 'discord' ? 'selected' : ''}>Discord Webhook</option>
+              <option value="teams" ${settings.webhookType === 'teams' ? 'selected' : ''}>Microsoft Teams Webhook</option>
+              <option value="telegram" ${settings.webhookType === 'telegram' ? 'selected' : ''}>Telegram Bot API</option>
+            </select>
+            <span class="helper">Formats payload structure specifically for your target platform.</span>
+          </div>
+          <div class="field">
+            <label>Destination Webhook URL</label>
+            <input name="webhookUrl" type="url" value="${escapeHtml(settings.webhookUrl || '')}" placeholder="http://localhost:3000/webhook or https://hooks.slack.com/services/..." required />
+            <span class="helper">URL where HTTP POST notifications will be dispatched. For Telegram: <code>https://api.telegram.org/bot&lt;TOKEN&gt;/sendMessage?chat_id=&lt;CHAT_ID&gt;</code></span>
+          </div>
+          <div class="field">
+            <label>Event Trigger Filter</label>
+            <select name="webhookEvents">
+              <option value="failures_only" ${settings.webhookEvents === 'failures_only' ? 'selected' : ''}>Only failures and warnings</option>
+              <option value="all" ${settings.webhookEvents === 'all' ? 'selected' : ''}>All state transitions (failures &amp; recoveries)</option>
+            </select>
+          </div>
+          <div class="setting-row notification-test">
+            <span><strong>Verify Webhook Delivery</strong><small>Dispatch a sample test alert payload now to verify connectivity.</small></span>
+            <button class="button secondary small" id="test-webhook-btn" type="button">Send Test Webhook</button>
+          </div>
+        </div>
+      </article>
+
+      <div class="actions">
+        <button class="button" type="submit">Save Webhook Configuration</button>
+        <span class="helper settings-help">Webhook configurations are managed separately from core settings and server telemetry.</span>
+      </div>
+      <div class="error" id="webhook-error"></div>
+    </form>`;
+
+  const form = document.getElementById('webhook-form');
+  const error = document.getElementById('webhook-error');
+
+  document.getElementById('test-webhook-btn')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    error.textContent = '';
+    button.disabled = true;
+    try {
+      const res = await request(() => remoteCare.testWebhook(state.session.token));
+      flash(res?.message || 'Test webhook delivered successfully!', 'info');
+    } catch (err) {
+      error.textContent = err.message || 'Failed to dispatch test webhook.';
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    error.textContent = '';
+    const next = {
+      ...state.settings,
+      webhookEnabled: Boolean(form.elements.webhookEnabled?.checked),
+      webhookType: form.elements.webhookType?.value || 'generic',
+      webhookUrl: form.elements.webhookUrl?.value?.trim() || '',
+      webhookEvents: form.elements.webhookEvents?.value || 'failures_only'
+    };
+    try {
+      state.settings = await request(() => remoteCare.saveAppSettings(state.session.token, next));
+      flash('Webhook configuration saved successfully.');
+    } catch (exception) {
+      error.textContent = exception.message || 'Unable to save webhook configuration.';
+    }
+  });
 }
 
 async function renderAbout(content) {

@@ -32,7 +32,16 @@ const DEFAULT_APP_SETTINGS = Object.freeze({
   webhookType: 'generic',
   webhookEvents: 'failures_only',
   soundAlertsEnabled: false,
-  soundVolume: 70
+  soundVolume: 70,
+  serverBaseUrl: '',
+  serverHealthUrl: '',
+  telemetrySelection: 'all',
+  serverAuthToken: '',
+  serverSyncIntervalSeconds: 15,
+  historySyncEnabled: false,
+  historySyncUrl: '',
+  historySyncIntervalMinutes: 5,
+  historySyncTargetIds: ''
 });
 const APP_SETTING_KEYS = Object.freeze({
   minimizeToTray: 'minimize_to_tray',
@@ -50,7 +59,16 @@ const APP_SETTING_KEYS = Object.freeze({
   webhookType: 'webhook_type',
   webhookEvents: 'webhook_events',
   soundAlertsEnabled: 'sound_alerts_enabled',
-  soundVolume: 'sound_volume'
+  soundVolume: 'sound_volume',
+  serverBaseUrl: 'server_base_url',
+  serverHealthUrl: 'server_health_url',
+  telemetrySelection: 'telemetry_selection',
+  serverAuthToken: 'server_auth_token',
+  serverSyncIntervalSeconds: 'server_sync_interval_seconds',
+  historySyncEnabled: 'history_sync_enabled',
+  historySyncUrl: 'history_sync_url',
+  historySyncIntervalMinutes: 'history_sync_interval_minutes',
+  historySyncTargetIds: 'history_sync_target_ids'
 });
 
 function now() {
@@ -524,6 +542,12 @@ class LocalDatabase {
       if (name === 'soundVolume') {
         return [name, Number.isInteger(Number(val)) && Number(val) >= 0 && Number(val) <= 100 ? Number(val) : DEFAULT_APP_SETTINGS[name]];
       }
+      if (name === 'serverSyncIntervalSeconds') {
+        return [name, Number.isInteger(Number(val)) && Number(val) >= 2 && Number(val) <= 3600 ? Number(val) : DEFAULT_APP_SETTINGS[name]];
+      }
+      if (name === 'historySyncIntervalMinutes') {
+        return [name, Number.isInteger(Number(val)) && Number(val) >= 1 && Number(val) <= 1440 ? Number(val) : DEFAULT_APP_SETTINGS[name]];
+      }
       if (typeof DEFAULT_APP_SETTINGS[name] === 'boolean') {
         return [name, storedBool(val, DEFAULT_APP_SETTINGS[name])];
       }
@@ -548,9 +572,20 @@ class LocalDatabase {
         if (!Number.isInteger(input[name]) || input[name] < 0 || input[name] > 100) {
           throw new Error('Sound volume must be between 0 and 100.');
         }
+      } else if (name === 'serverSyncIntervalSeconds') {
+        if (!Number.isInteger(input[name]) || input[name] < 2 || input[name] > 3600) {
+          throw new Error('Server sync interval must be between 2 and 3600 seconds.');
+        }
+      } else if (name === 'historySyncIntervalMinutes') {
+        if (!Number.isInteger(input[name]) || input[name] < 1 || input[name] > 1440) {
+          throw new Error('History sync interval must be between 1 and 1440 minutes.');
+        }
       } else if (typeof DEFAULT_APP_SETTINGS[name] === 'boolean') {
         if (typeof input[name] !== 'boolean') throw new Error('Each setting must be enabled or disabled.');
       } else {
+        if (name === 'historySyncTargetIds' && Array.isArray(input[name])) {
+          input[name] = input[name].join(',');
+        }
         if (typeof input[name] !== 'string') throw new Error(`${name} must be a string.`);
       }
       settings[name] = input[name];
@@ -905,6 +940,90 @@ class LocalDatabase {
       FROM check_results r JOIN targets t ON t.id = r.target_id
       ${where} ORDER BY r.checked_at DESC, r.id DESC LIMIT ?`).all(...parameters, normalized.limit);
     return { filters: normalized, results: rows.map(mapHistoryResult) };
+  }
+
+  getHistoryChanges({ targetIds = null, sinceId = null, limit = 100, reverse = false } = {}) {
+    let query = `
+      SELECT r.id, r.target_id, t.name AS target_name, t.type AS target_type,
+             r.location_name, r.checked_at, r.ok, r.status, r.message, r.latency_ms,
+             r.details_json, r.result_signature
+      FROM check_results r
+      JOIN targets t ON t.id = r.target_id
+    `;
+    const clauses = [];
+    const params = [];
+
+    if (sinceId !== null && sinceId !== undefined && Number(sinceId) > 0) {
+      clauses.push('r.id > ?');
+      params.push(Number(sinceId));
+    }
+
+    if (Array.isArray(targetIds) && targetIds.length > 0) {
+      const placeholders = targetIds.map(() => '?').join(',');
+      clauses.push(`r.target_id IN (${placeholders})`);
+      params.push(...targetIds.map(Number));
+    }
+
+    if (clauses.length > 0) {
+      query += ` WHERE ${clauses.join(' AND ')}`;
+    }
+
+    const safeLimit = Number.isInteger(Number(limit)) && Number(limit) > 0 ? Math.min(Number(limit), 500) : 100;
+
+    if (reverse) {
+      query += ` ORDER BY r.id DESC LIMIT ?`;
+      params.push(safeLimit);
+      const rows = this.db.prepare(query).all(...params);
+      return rows.reverse().map((row) => ({
+        id: row.id,
+        targetId: row.target_id,
+        targetName: row.target_name,
+        targetType: row.target_type,
+        locationName: row.location_name,
+        checkedAt: row.checked_at,
+        ok: Boolean(row.ok),
+        status: row.status,
+        message: row.message,
+        latencyMs: row.latency_ms,
+        details: parseJson(row.details_json, {})
+      }));
+    }
+
+    query += ` ORDER BY r.id ASC LIMIT ?`;
+    params.push(safeLimit);
+    const rows = this.db.prepare(query).all(...params);
+    return rows.map((row) => ({
+      id: row.id,
+      targetId: row.target_id,
+      targetName: row.target_name,
+      targetType: row.target_type,
+      locationName: row.location_name,
+      checkedAt: row.checked_at,
+      ok: Boolean(row.ok),
+      status: row.status,
+      message: row.message,
+      latencyMs: row.latency_ms,
+      details: parseJson(row.details_json, {})
+    }));
+  }
+
+  setHistorySyncCursor(lastId, lastSyncAt) {
+    const timestamp = now();
+    this.db.prepare(`INSERT INTO app_settings (key, value, updated_at) VALUES ('last_history_sync_id', ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`).run(String(lastId ?? 0), timestamp);
+    if (lastSyncAt) {
+      this.db.prepare(`INSERT INTO app_settings (key, value, updated_at) VALUES ('last_history_sync_at', ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`).run(String(lastSyncAt), timestamp);
+    }
+  }
+
+  getHistorySyncCursor() {
+    const rowId = this.db.prepare("SELECT value FROM app_settings WHERE key = 'last_history_sync_id'").get();
+    const rowAt = this.db.prepare("SELECT value FROM app_settings WHERE key = 'last_history_sync_at'").get();
+    return {
+      lastId: rowId && Number.isInteger(Number(rowId.value)) ? Number(rowId.value) : 0,
+      lastSyncAt: rowAt ? rowAt.value : null
+    };
   }
 
   getMonthlyReport(month) {

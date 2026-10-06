@@ -34,11 +34,26 @@ class CloudPublisher extends EventEmitter {
     return this.publishPending();
   }
 
+  getEndpointUrl() {
+    const settings = this.getSettings();
+    if (settings?.serverBaseUrl && settings.serverBaseUrl.trim()) {
+      const base = settings.serverBaseUrl.trim().replace(/\/+$/, '');
+      return `${base}/api/sync`;
+    }
+    return settings?.cloudHttpsUrl?.trim() || '';
+  }
+
+  getAuthToken() {
+    const settings = this.getSettings();
+    return (settings?.serverAuthToken?.trim() || settings?.cloudAuthToken?.trim() || '');
+  }
+
   async publishPending(batchSize = 25) {
     if (this.isPublishing) return;
     const settings = this.getSettings();
-    if (!settings?.cloudSyncEnabled || !settings?.cloudHttpsUrl) {
-      return { skipped: true, reason: 'Cloud sync is disabled or endpoint is not configured.' };
+    const endpoint = this.getEndpointUrl();
+    if (!settings?.cloudSyncEnabled || !endpoint) {
+      return { skipped: true, reason: 'Cloud/Server sync is disabled or endpoint is not configured.' };
     }
 
     this.isPublishing = true;
@@ -59,7 +74,8 @@ class CloudPublisher extends EventEmitter {
         }))
       };
 
-      const result = await this.sendBatch(settings.cloudHttpsUrl, settings.cloudAuthToken, payload);
+      const authToken = this.getAuthToken();
+      const result = await this.sendBatch(endpoint, authToken, payload);
       const deliveredIds = pending.map((p) => p.id);
       this.database.markEventsDelivered(deliveredIds);
       this.deliveredCount += deliveredIds.length;
@@ -134,11 +150,20 @@ class CloudPublisher extends EventEmitter {
 
   getStatus() {
     const settings = this.getSettings();
+    const endpoint = this.getEndpointUrl();
+    let protocol = 'https';
+    if (endpoint) {
+      try {
+        protocol = new URL(endpoint).protocol.replace(':', '');
+      } catch {
+        protocol = 'http';
+      }
+    }
     const pendingCount = this.database.getPendingOutboundCount?.() ?? 0;
     return {
       enabled: Boolean(settings?.cloudSyncEnabled),
-      protocol: settings?.cloudSyncProtocol || 'https',
-      endpoint: settings?.cloudHttpsUrl || null,
+      protocol,
+      endpoint: endpoint || null,
       lastSyncAt: this.lastSyncAt,
       lastError: this.lastError,
       deliveredCount: this.deliveredCount,

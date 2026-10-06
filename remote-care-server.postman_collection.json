@@ -1,0 +1,234 @@
+{
+  "info": {
+    "_postman_id": "a91823ef-4b21-4f32-9cb1-8b776e27d81a",
+    "name": "Remote Care Monitor — Server API (150.241.246.207:3001)",
+    "description": "Ready-to-use Postman Collection for testing Remote Care Monitor endpoints against http://150.241.246.207:3001.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://150.241.246.207:3001",
+      "type": "string"
+    },
+    {
+      "key": "authToken",
+      "value": "",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Result Changes History Sync",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          },
+          {
+            "key": "Authorization",
+            "value": "Bearer {{authToken}}",
+            "type": "text",
+            "disabled": true
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"version\": \"2.0\",\n  \"dispatchedAt\": \"2026-10-06T12:45:00.000Z\",\n  \"clientHostname\": \"postman-client\",\n  \"targetIds\": \"all\",\n  \"entriesCount\": 2,\n  \"history\": [\n    {\n      \"id\": 1,\n      \"targetId\": 1,\n      \"targetName\": \"Internet connection\",\n      \"targetType\": \"internet\",\n      \"locationName\": \"Local device\",\n      \"checkedAt\": \"2026-10-06T12:44:50.000Z\",\n      \"ok\": true,\n      \"status\": \"healthy\",\n      \"message\": \"Connected\",\n      \"latencyMs\": 24,\n      \"details\": {\n        \"statusCode\": 200\n      }\n    },\n    {\n      \"id\": 2,\n      \"targetId\": 2,\n      \"targetName\": \"Default gateway\",\n      \"targetType\": \"gateway\",\n      \"locationName\": \"Local device\",\n      \"checkedAt\": \"2026-10-06T12:44:55.000Z\",\n      \"ok\": false,\n      \"status\": \"down\",\n      \"message\": \"Gateway unreachable\",\n      \"latencyMs\": 1500,\n      \"details\": {}\n    }\n  ]\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/history",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "history"
+          ]
+        },
+        "description": "Periodically sends the recorded history of changes in monitor results to the server."
+      },
+      "response": []
+    },
+    {
+      "name": "2. Telemetry & Heartbeat Sync",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          },
+          {
+            "key": "Authorization",
+            "value": "Bearer {{authToken}}",
+            "type": "text",
+            "disabled": true
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"version\": \"2.0\",\n  \"dispatchedAt\": \"2026-10-06T12:45:00.000Z\",\n  \"events\": [\n    {\n      \"id\": 101,\n      \"eventType\": \"device.heartbeat\",\n      \"createdAt\": \"2026-10-06T12:45:00.000Z\",\n      \"payload\": {\n        \"hostname\": \"postman-client\",\n        \"platform\": \"darwin\",\n        \"arch\": \"arm64\",\n        \"uptimeSeconds\": 14200,\n        \"cpuCores\": 8,\n        \"memory\": {\n          \"totalMb\": 16384,\n          \"freeMb\": 8192,\n          \"usedMb\": 8192,\n          \"usedPercent\": 50\n        },\n        \"monitorsSummary\": {\n          \"total\": 3,\n          \"healthy\": 3,\n          \"warning\": 0,\n          \"down\": 0\n        },\n        \"activeIncidentsCount\": 0,\n        \"timestamp\": \"2026-10-06T12:45:00.000Z\"\n      }\n    }\n  ]\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/sync",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "sync"
+          ]
+        },
+        "description": "Publishes outbound events, heartbeats, and device telemetry to the server."
+      },
+      "response": []
+    },
+    {
+      "name": "3. Alert Webhook Receiver",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"source\": \"remote-care-monitor\",\n  \"event\": \"down\",\n  \"title\": \"Monitor alert: Database API\",\n  \"subtitle\": \"Down\",\n  \"body\": \"Connection refused on port 5432\",\n  \"timestamp\": \"2026-10-06T12:45:00.000Z\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/webhook",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "webhook"
+          ]
+        },
+        "description": "Receives instant webhook notifications triggered by monitor down/recovery events."
+      },
+      "response": []
+    },
+    {
+      "name": "4. Server Health Check",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/health",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "health"
+          ]
+        },
+        "description": "Health verification endpoint used by Remote Care Monitor to test server availability."
+      },
+      "response": []
+    },
+    {
+      "name": "5. Force 500 Outage (Diagnostic)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/fail",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "fail"
+          ]
+        },
+        "description": "Always returns HTTP 500 to test client incident detection and alerts."
+      },
+      "response": []
+    },
+    {
+      "name": "6. Slow Response Latency Check",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/slow?delay=3000",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "slow"
+          ],
+          "query": [
+            {
+              "key": "delay",
+              "value": "3000",
+              "description": "Milliseconds to delay response"
+            }
+          ]
+        },
+        "description": "Delays response by the specified number of milliseconds to test timeout thresholds."
+      },
+      "response": []
+    },
+    {
+      "name": "7. Toggle Outage Simulation on /health",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/toggle-simulation",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "toggle-simulation"
+          ]
+        },
+        "description": "Toggles /health between 200 OK and 500 Simulated Outage."
+      },
+      "response": []
+    },
+    {
+      "name": "8. Query Ingested Server Data (API)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/data",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "data"
+          ]
+        },
+        "description": "Returns all received events, heartbeats, history batches, and webhooks stored in memory."
+      },
+      "response": []
+    }
+  ]
+}

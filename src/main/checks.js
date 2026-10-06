@@ -424,8 +424,8 @@ async function checkDisk(target) {
 
 async function checkMemory(target) {
   const thresholdPercent = Number.parseInt(target.metadata?.thresholdPercent ?? 90, 10);
-  const totalMem = os.totalmem();
-  const freeMem = os.freemem();
+  const totalMem = target.metadata?.totalMem ?? os.totalmem();
+  const freeMem = target.metadata?.freeMem ?? os.freemem();
   const usedMem = totalMem - freeMem;
   const usedPercent = totalMem > 0 ? Math.round((usedMem / totalMem) * 100) : 0;
   const totalMb = Math.round(totalMem / (1024 * 1024));

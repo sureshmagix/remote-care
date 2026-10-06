@@ -1,0 +1,279 @@
+================================================================================
+  REMOTE CARE MONITOR — 5-MINUTE SERVER POST API SPECIFICATION
+  For Custom Server & Backend Integration (Raspberry Pi / Node.js / Python / Go)
+================================================================================
+
+This document specifies the exact JSON data structures sent by the Remote Care 
+desktop client application to your server every 5 minutes.
+
+You can use these specifications to implement your receiving API endpoint in any
+backend framework (Node.js/Express, Python/Flask/FastAPI, Go, PHP, etc.).
+
+There are two primary POST endpoints sent by the client:
+  1. POST /api/history  -> Logged history of monitor status changes (Every 5 min)
+  2. POST /api/sync     -> System telemetry, hardware stats & heartbeat (Every 5 min)
+
+--------------------------------------------------------------------------------
+PART 1: POST /api/history (LOGGED HISTORY OF RESULT CHANGES)
+--------------------------------------------------------------------------------
+
+Trigger: Dispatched periodically every 5 minutes (configurable in Client Settings).
+Purpose: Sends every genuine monitor state change (e.g. healthy -> down, or down -> healthy)
+         recorded during that interval for all selected monitors.
+
+HTTP Request Details:
+  - Method:       POST
+  - URL Path:     /api/history  (e.g., http://150.241.246.207:3001/api/history)
+  - Content-Type: application/json
+  - User-Agent:   RemoteCareMonitor-HistorySync/2.0
+  - Authorization: Bearer <TOKEN>  (Optional: sent if Auth Token configured in app)
+
+--------------------------------------------------------------------------------
+SAMPLE JSON PAYLOAD (SENT TO YOUR SERVER):
+--------------------------------------------------------------------------------
+{
+  "version": "2.0",
+  "dispatchedAt": "2026-10-06T13:00:00.123Z",
+  "clientHostname": "store-pi-terminal-01",
+  "targetIds": "all",
+  "entriesCount": 3,
+  "history": [
+    {
+      "id": 1042,
+      "targetId": 1,
+      "targetName": "Billing Cloud API",
+      "targetType": "http",
+      "locationName": "Main Office",
+      "checkedAt": "2026-10-06T12:56:15.000Z",
+      "ok": false,
+      "status": "down",
+      "message": "HTTP 502 Bad Gateway from upstream service",
+      "latencyMs": 1420,
+      "details": {
+        "statusCode": 502,
+        "url": "https://api.example.com/v1/billing/health"
+      }
+    },
+    {
+      "id": 1043,
+      "targetId": 2,
+      "targetName": "Local Gateway Router",
+      "targetType": "gateway",
+      "locationName": "Main Office",
+      "checkedAt": "2026-10-06T12:57:30.000Z",
+      "ok": true,
+      "status": "healthy",
+      "message": "Local network gateway 192.168.1.1 is reachable.",
+      "latencyMs": 4,
+      "details": {
+        "gatewayIp": "192.168.1.1"
+      }
+    },
+    {
+      "id": 1044,
+      "targetId": 3,
+      "targetName": "Primary NVMe Storage",
+      "targetType": "disk",
+      "locationName": "Main Office",
+      "checkedAt": "2026-10-06T12:58:45.000Z",
+      "ok": false,
+      "status": "warning",
+      "message": "Disk usage at 88.5% exceeds warning threshold of 85%",
+      "latencyMs": null,
+      "details": {
+        "path": "/",
+        "totalGb": 256.0,
+        "freeGb": 29.4,
+        "usedPercent": 88.5,
+        "thresholdPercent": 85
+      }
+    }
+  ]
+}
+
+--------------------------------------------------------------------------------
+FIELD DEFINITIONS FOR /api/history:
+--------------------------------------------------------------------------------
+Top-Level Fields:
+  - version         (String)  : Protocol version, currently "2.0".
+  - dispatchedAt    (String)  : ISO 8601 UTC timestamp when client sent the payload.
+  - clientHostname  (String)  : OS hostname of the client machine.
+  - targetIds       (String/Array) : "all" or array of integer IDs [1, 3] indicating
+                                which monitors were selected for transmission.
+  - entriesCount    (Integer) : Number of change records included in "history".
+  - history         (Array)   : Array of recorded change objects (empty [] if no changes).
+
+History Item Fields:
+  - id              (Integer) : Unique auto-increment record ID in client SQLite database.
+  - targetId        (Integer) : ID of the monitor.
+  - targetName      (String)  : Human-readable monitor name configured by user.
+  - targetType      (String)  : Type of check. Supported types:
+                                "http"           -> HTTP/HTTPS endpoint
+                                "tcp"            -> TCP port check
+                                "ping"           -> ICMP/Host ping
+                                "gateway"        -> Default gateway ping
+                                "interface"      -> Network adapter state
+                                "system_service" -> Systemd / OS service
+                                "process"        -> Process running check
+                                "disk"           -> Storage capacity threshold
+                                "memory"         -> RAM usage threshold
+                                "cpu"            -> CPU load threshold
+                                "command"        -> Custom shell script / command
+  - locationName    (String)  : Device / location name (default: "Local device").
+  - checkedAt       (String)  : ISO 8601 UTC timestamp when check executed.
+  - ok              (Boolean) : true if check passed, false if failed.
+  - status          (String)  : Monitor state: "healthy", "warning", or "down".
+  - message         (String)  : Diagnostic message or error explanation.
+  - latencyMs       (Integer|null) : Latency in milliseconds (null if not applicable).
+  - details         (Object)  : Additional diagnostic JSON metadata.
+
+--------------------------------------------------------------------------------
+EXPECTED SERVER RESPONSE FOR /api/history:
+--------------------------------------------------------------------------------
+Your server should respond with HTTP 200 (or any 2xx status code):
+
+Status: 200 OK
+Content-Type: application/json
+
+{
+  "ok": true,
+  "received": 3,
+  "timestamp": "2026-10-06T13:00:00.250Z"
+}
+
+Note: If the server returns HTTP 4xx or 5xx, the client will mark the sync as failed,
+retain the changes, and attempt re-delivery on the next 5-minute interval.
+
+
+================================================================================
+PART 2: POST /api/sync (PERIODIC DEVICE TELEMETRY & HEARTBEAT)
+================================================================================
+
+Trigger: Dispatched every 5 minutes (configured by "Periodic heartbeat interval").
+Purpose: Sends full device health, CPU, memory, uptime, and monitor count summary.
+
+HTTP Request Details:
+  - Method:       POST
+  - URL Path:     /api/sync  (e.g., http://150.241.246.207:3001/api/sync)
+  - Content-Type: application/json
+  - User-Agent:   RemoteCareMonitor-CloudSync/2.0
+  - Authorization: Bearer <TOKEN>  (Optional)
+
+--------------------------------------------------------------------------------
+SAMPLE JSON PAYLOAD FOR /api/sync:
+--------------------------------------------------------------------------------
+{
+  "version": "2.0",
+  "dispatchedAt": "2026-10-06T13:00:00.000Z",
+  "events": [
+    {
+      "id": 1,
+      "eventType": "device.heartbeat",
+      "createdAt": "2026-10-06T13:00:00.000Z",
+      "payload": {
+        "hostname": "store-pi-terminal-01",
+        "platform": "linux",
+        "arch": "arm64",
+        "release": "6.6.20+rpt-rpi-2712",
+        "uptimeSeconds": 864200,
+        "processUptimeSeconds": 7200,
+        "memory": {
+          "totalMb": 8192,
+          "freeMb": 4200,
+          "usedMb": 3992,
+          "usedPercent": 49
+        },
+        "loadAverage": [0.42, 0.35, 0.28],
+        "cpuCores": 4,
+        "monitorsSummary": {
+          "total": 6,
+          "healthy": 5,
+          "warning": 1,
+          "down": 0
+        },
+        "activeIncidentsCount": 0,
+        "timestamp": "2026-10-06T13:00:00.000Z"
+      }
+    }
+  ]
+}
+
+--------------------------------------------------------------------------------
+EXPECTED SERVER RESPONSE FOR /api/sync:
+--------------------------------------------------------------------------------
+Status: 200 OK
+Content-Type: application/json
+
+{
+  "ok": true,
+  "received": 1,
+  "timestamp": "2026-10-06T13:00:00.100Z"
+}
+
+
+================================================================================
+PART 3: MINIMAL PYTHON (FLASK) RECEIVER EXAMPLE FOR YOUR SERVICE / PI
+================================================================================
+
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+@app.route('/api/history', methods=['POST'])
+def receive_history():
+    data = request.get_json(silent=True) or {}
+    changes = data.get('history', [])
+    hostname = data.get('clientHostname', 'unknown')
+    print(f"[{hostname}] Received {len(changes)} result changes.")
+    for change in changes:
+        print(f"  -> Monitor: {change.get('targetName')} | Status: {change.get('status')} | {change.get('message')}")
+    # Save to your database / process as needed
+    return jsonify({"ok": True, "received": len(changes)}), 200
+
+@app.route('/api/sync', methods=['POST'])
+def receive_sync():
+    data = request.get_json(silent=True) or {}
+    events = data.get('events', [])
+    print(f"Received sync batch with {len(events)} events.")
+    return jsonify({"ok": True, "received": len(events)}), 200
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({"status": "healthy"}), 200
+
+if __name__ == '__main__':
+    # Listen on port 3001
+    app.run(host='0.0.0.0', port=3001)
+
+================================================================================
+PART 4: MINIMAL NODE.JS (EXPRESS) RECEIVER EXAMPLE
+================================================================================
+
+const express = require('express');
+const app = express();
+app.use(express.json({ limit: '2mb' }));
+
+app.post('/api/history', (req, res) => {
+  const { clientHostname, history = [] } = req.body;
+  console.log(`[History] From ${clientHostname}: ${history.length} change(s)`);
+  history.forEach(item => {
+    console.log(`  * ${item.targetName} (${item.targetType}) -> ${item.status}: ${item.message}`);
+  });
+  res.status(200).json({ ok: true, received: history.length });
+});
+
+app.post('/api/sync', (req, res) => {
+  const events = req.body.events || [];
+  console.log(`[Sync] Received ${events.length} event(s)`);
+  res.status(200).json({ ok: true, received: events.length });
+});
+
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'healthy', uptime: process.uptime() });
+});
+
+app.listen(3001, '0.0.0.0', () => console.log('Receiver listening on port 3001'));
+
+================================================================================
+END OF SPECIFICATION
+================================================================================

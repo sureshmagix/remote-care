@@ -32,6 +32,10 @@ contextBridge.exposeInMainWorld('remoteCare', {
   testWebhook: (token) => invoke('webhook-test', { token }),
   getCloudSyncStatus: (token) => invoke('cloud-sync-status', { token }),
   triggerCloudSync: (token) => invoke('cloud-sync-trigger', { token }),
+  checkServerHealth: (token, healthUrl) => invoke('server-health-check', { token, healthUrl }),
+  getHistorySyncPreview: (token, options) => invoke('history-sync-preview', { token, options }),
+  triggerHistorySync: (token) => invoke('history-sync-trigger', { token }),
+  getHistorySyncStatus: (token) => invoke('history-sync-status', { token }),
   exportMonitors: (token, targetIds) => invoke('targets-export', { token, targetIds }),
   importMonitors: (token, options) => invoke('targets-import', { token, options }),
   onUpdate: (listener) => {

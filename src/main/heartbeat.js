@@ -30,8 +30,10 @@ class HeartbeatService {
     const freeMem = os.freemem();
     const usedMem = totalMem - freeMem;
     const dashboard = this.database.getDashboard();
+    const settings = this.getSettings();
+    const selection = settings?.telemetrySelection || 'all';
 
-    return {
+    const fullTelemetry = {
       hostname: os.hostname(),
       platform: process.platform,
       arch: process.arch,
@@ -50,6 +52,37 @@ class HeartbeatService {
       activeIncidentsCount: dashboard?.activeIncidents?.length || 0,
       timestamp: new Date().toISOString()
     };
+
+    if (selection === 'system_metrics') {
+      return {
+        hostname: fullTelemetry.hostname,
+        platform: fullTelemetry.platform,
+        uptimeSeconds: fullTelemetry.uptimeSeconds,
+        memory: fullTelemetry.memory,
+        loadAverage: fullTelemetry.loadAverage,
+        cpuCores: fullTelemetry.cpuCores,
+        timestamp: fullTelemetry.timestamp
+      };
+    }
+
+    if (selection === 'monitors_only') {
+      return {
+        hostname: fullTelemetry.hostname,
+        monitorsSummary: fullTelemetry.monitorsSummary,
+        activeIncidentsCount: fullTelemetry.activeIncidentsCount,
+        timestamp: fullTelemetry.timestamp
+      };
+    }
+
+    if (selection === 'minimal') {
+      return {
+        hostname: fullTelemetry.hostname,
+        status: fullTelemetry.monitorsSummary.down > 0 ? 'down' : 'healthy',
+        timestamp: fullTelemetry.timestamp
+      };
+    }
+
+    return fullTelemetry;
   }
 
   sendHeartbeat() {

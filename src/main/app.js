@@ -11,6 +11,7 @@ const { configureAutostart, startedInBackground } = require('./autostart');
 const { dispatchWebhook } = require('./webhooks');
 const { CloudPublisher } = require('./cloud-publisher');
 const { HeartbeatService } = require('./heartbeat');
+const { HistorySyncService } = require('./history-sync');
 
 app.setName('Remote Care Monitor');
 if (process.platform === 'win32') {
@@ -43,6 +44,9 @@ let autostartStatus = { enabled: false, message: 'Automatic startup has not been
 let startedAtLogin = false;
 let cloudPublisher;
 let heartbeatService;
+let historySyncService;
+let currentTrayMenu = null;
+let lastTraySignature = '';
 const sessions = new SessionStore();
 
 function csvCell(value) {
@@ -102,7 +106,12 @@ function updateTray() {
   const localTime = new Date().toLocaleString();
   const lastCheckText = latestCheck ? new Date(latestCheck).toLocaleString() : 'No checks completed yet';
   tray.setToolTip(`Remote Care Monitor — ${state}\nUpdated: ${localTime}`);
-  tray.setContextMenu(Menu.buildFromTemplate([
+
+  const signature = `${state}|${lastCheckText}`;
+  if (signature === lastTraySignature && currentTrayMenu) return;
+  lastTraySignature = signature;
+
+  currentTrayMenu = Menu.buildFromTemplate([
     { label: `Status: ${state}`, enabled: false },
     { label: `Last recorded check: ${lastCheckText}`, enabled: false },
     { label: `Tray updated: ${localTime}`, enabled: false },
@@ -112,7 +121,8 @@ function updateTray() {
     { label: 'Run all checks now', click: () => monitor?.refreshSchedule(true) },
     { type: 'separator' },
     { label: 'Quit Remote Care Monitor…', click: () => requestProtectedQuit('tray') }
-  ]));
+  ]);
+  tray.setContextMenu(currentTrayMenu);
 }
 
 function broadcast(channel, payload) {
@@ -180,6 +190,7 @@ function completeShutdown() {
   if (shutdownComplete) return;
   shutdownComplete = true;
   if (trayClockTimer) clearInterval(trayClockTimer);
+  historySyncService?.stop();
   heartbeatService?.stop();
   cloudPublisher?.stop();
   database?.endRuntimeSession(runtimeSessionId, 'authorized_quit');
@@ -208,7 +219,9 @@ function createWindow() {
       devTools: !app.isPackaged
     }
   });
-  mainWindow.removeMenu();
+  if (process.platform !== 'darwin') {
+    mainWindow.removeMenu();
+  }
   mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   mainWindow.on('minimize', () => {
@@ -263,6 +276,8 @@ function registerIpc() {
     cloudPublisher.start();
     heartbeatService = new HeartbeatService({ database, publisher: cloudPublisher, getSettings: () => database.getAppSettings() });
     heartbeatService.start();
+    historySyncService = new HistorySyncService({ database, getSettings: () => database.getAppSettings() });
+    historySyncService.start();
     const session = sessions.issue(user);
     database.markLogin(user.id);
     database.audit(user.id, 'login', 'session', session.token, {});
@@ -401,6 +416,62 @@ function registerIpc() {
     return cloudPublisher?.publishPending() || { skipped: true };
   });
 
+  ipcMain.handle('server-health-check', async (_event, { token, healthUrl }) => {
+    requireSession(token, [ROLES.SUPER_ADMIN, ROLES.OPERATOR]);
+    const settings = database.getAppSettings();
+    let target = (healthUrl || '').trim();
+    if (!target) {
+      if (settings.serverHealthUrl && settings.serverHealthUrl.trim()) {
+        target = settings.serverHealthUrl.trim();
+      } else if (settings.serverBaseUrl && settings.serverBaseUrl.trim()) {
+        target = `${settings.serverBaseUrl.trim().replace(/\/+$/, '')}/health`;
+      }
+    }
+    if (!target) {
+      throw new Error('No server health URL configured.');
+    }
+
+    const { checkHttp } = require('./checks');
+    const start = Date.now();
+    try {
+      const res = await checkHttp({ url: target, timeoutMs: 5000, metadata: {} });
+      const latency = Date.now() - start;
+      return {
+        ok: res.ok,
+        target,
+        statusCode: res.details?.statusCode || (res.ok ? 200 : 500),
+        latencyMs: res.latencyMs ?? latency,
+        message: res.message
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        target,
+        statusCode: null,
+        latencyMs: Date.now() - start,
+        message: err.message
+      };
+    }
+  });
+
+  ipcMain.handle('history-sync-preview', (_event, { token, options }) => {
+    requireSession(token);
+    return historySyncService
+      ? historySyncService.buildPayload(options || { previewRecent: true })
+      : { error: 'History sync service not initialized' };
+  });
+
+  ipcMain.handle('history-sync-trigger', async (_event, { token }) => {
+    requireSession(token, [ROLES.SUPER_ADMIN, ROLES.OPERATOR]);
+    if (!historySyncService) return { skipped: true, reason: 'History sync service not initialized' };
+    return historySyncService.syncNow({ force: true });
+  });
+
+  ipcMain.handle('history-sync-status', (_event, { token }) => {
+    requireSession(token);
+    return historySyncService ? historySyncService.getStatus() : { enabled: false };
+  });
+
   ipcMain.handle('targets-export', async (_event, { token, targetIds }) => {
     const session = requireSession(token, [ROLES.SUPER_ADMIN, ROLES.OPERATOR]);
     const exportData = database.exportMonitorsJson(targetIds);
@@ -495,6 +566,7 @@ function registerIpc() {
   ipcMain.handle('app-settings-save', (_event, { token, settings }) => {
     const session = requireSession(token, ROLES.SUPER_ADMIN);
     const saved = database.updateAppSettings(settings, session.userId);
+    historySyncService?.restart();
     broadcast('monitor-update', { type: 'app_settings_updated', settings: saved });
     return saved;
   });
@@ -557,7 +629,11 @@ app.whenReady().then(() => {
   });
   registerIpc();
   tray = new Tray(createTrayIcon());
-  tray.on('click', () => showWindow());
+  if (process.platform !== 'darwin') {
+    tray.on('click', () => showWindow());
+  } else {
+    tray.on('double-click', () => showWindow());
+  }
   updateTray();
   trayClockTimer = setInterval(updateTray, 60_000);
   trayClockTimer.unref?.();
@@ -568,6 +644,8 @@ app.whenReady().then(() => {
     cloudPublisher.start();
     heartbeatService = new HeartbeatService({ database, publisher: cloudPublisher, getSettings: () => database.getAppSettings() });
     heartbeatService.start();
+    historySyncService = new HistorySyncService({ database, getSettings: () => database.getAppSettings() });
+    historySyncService.start();
   }
   createWindow();
   if (!startedAtLogin || !database.hasSuperAdmin()) showWindow();

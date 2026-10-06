@@ -61,7 +61,16 @@ test('app notification and tray settings use safe defaults and persist changes',
       webhookType: 'generic',
       webhookEvents: 'failures_only',
       soundAlertsEnabled: false,
-      soundVolume: 70
+      soundVolume: 70,
+      serverBaseUrl: '',
+      serverHealthUrl: '',
+      telemetrySelection: 'all',
+      serverAuthToken: '',
+      serverSyncIntervalSeconds: 15,
+      historySyncEnabled: false,
+      historySyncUrl: '',
+      historySyncIntervalMinutes: 5,
+      historySyncTargetIds: ''
     });
     const saved = database.updateAppSettings({
       minimizeToTray: true,
