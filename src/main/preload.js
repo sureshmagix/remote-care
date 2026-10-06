@@ -29,10 +29,20 @@ contextBridge.exposeInMainWorld('remoteCare', {
   quitWithPassword: (token, password, source) => invoke('quit-with-password', { token, password, source }),
   cancelProtectedQuit: (token) => invoke('cancel-protected-quit', { token }),
   getAppInfo: (token) => invoke('app-info', { token }),
+  testWebhook: (token) => invoke('webhook-test', { token }),
+  getCloudSyncStatus: (token) => invoke('cloud-sync-status', { token }),
+  triggerCloudSync: (token) => invoke('cloud-sync-trigger', { token }),
+  exportMonitors: (token, targetIds) => invoke('targets-export', { token, targetIds }),
+  importMonitors: (token, options) => invoke('targets-import', { token, options }),
   onUpdate: (listener) => {
     const wrapped = (_event, payload) => listener(payload);
     ipcRenderer.on('monitor-update', wrapped);
     return () => ipcRenderer.removeListener('monitor-update', wrapped);
+  },
+  onSoundAlert: (listener) => {
+    const wrapped = (_event, payload) => listener(payload);
+    ipcRenderer.on('sound-alert', wrapped);
+    return () => ipcRenderer.removeListener('sound-alert', wrapped);
   },
   onAppControl: (listener) => {
     const wrapped = (_event, payload) => listener(payload);

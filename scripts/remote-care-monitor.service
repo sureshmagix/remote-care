@@ -1,0 +1,23 @@
+[Unit]
+Description=Remote Care Monitor Daemon (Headless Service)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/opt/remote-care-monitor
+ExecStart=/usr/bin/node /opt/remote-care-monitor/src/daemon/index.js
+Restart=always
+RestartSec=10
+Environment=NODE_ENV=production
+Environment=REMOTE_CARE_DB_PATH=/var/lib/remote-care-monitor/remote-care.sqlite
+
+# Security Sandbox Sandboxing
+ProtectSystem=full
+ProtectHome=read-only
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

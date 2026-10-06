@@ -12,4 +12,4 @@ run(process.execPath, ['--test', 'tests/auth.test.js', 'tests/autostart.test.js'
 // better-sqlite3 is rebuilt for Electron during packaging. Run the database test
 // inside Electron's Node runtime so it validates the exact native binary used by the app.
 const electronBinary = require('electron');
-run(electronBinary, ['--test', 'tests/database.test.js'], { ...process.env, ELECTRON_RUN_AS_NODE: '1' });
+run(electronBinary, ['--test', 'tests/database.test.js', 'tests/phase2.test.js'], { ...process.env, ELECTRON_RUN_AS_NODE: '1' });

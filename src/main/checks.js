@@ -385,6 +385,166 @@ async function checkProcess(processName, timeoutMs) {
   return { ok: active, latencyMs: 0, message: active ? `Process “${processName}” is running.` : `Process “${processName}” is not running.`, details: { processName } };
 }
 
+async function checkDisk(target) {
+  const targetPath = String(target.metadata?.path || (process.platform === 'win32' ? 'C:\\' : '/')).trim();
+  const thresholdPercent = Number.parseInt(target.metadata?.thresholdPercent ?? 90, 10);
+  try {
+    const stats = await fs.promises.statfs(targetPath);
+    const totalBytes = Number(stats.blocks) * Number(stats.bsize);
+    const freeBytes = Number(stats.bavail) * Number(stats.bsize);
+    const usedBytes = totalBytes - freeBytes;
+    const usedPercent = totalBytes > 0 ? Math.round((usedBytes / totalBytes) * 100) : 0;
+    const totalGb = (totalBytes / (1024 * 1024 * 1024)).toFixed(1);
+    const freeGb = (freeBytes / (1024 * 1024 * 1024)).toFixed(1);
+    const usedGb = (usedBytes / (1024 * 1024 * 1024)).toFixed(1);
+
+    if (usedPercent >= thresholdPercent) {
+      return {
+        ok: false,
+        latencyMs: 0,
+        message: `Disk space critical on “${targetPath}”: ${usedPercent}% used (${freeGb} GB free of ${totalGb} GB, threshold ${thresholdPercent}%).`,
+        details: { targetPath, totalGb, freeGb, usedGb, usedPercent, thresholdPercent }
+      };
+    }
+    return {
+      ok: true,
+      latencyMs: 0,
+      message: `Disk space normal on “${targetPath}”: ${usedPercent}% used (${freeGb} GB free of ${totalGb} GB).`,
+      details: { targetPath, totalGb, freeGb, usedGb, usedPercent, thresholdPercent }
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      latencyMs: null,
+      message: `Failed to inspect disk space at “${targetPath}”: ${err.message}`,
+      details: { targetPath, error: err.message }
+    };
+  }
+}
+
+async function checkMemory(target) {
+  const thresholdPercent = Number.parseInt(target.metadata?.thresholdPercent ?? 90, 10);
+  const totalMem = os.totalmem();
+  const freeMem = os.freemem();
+  const usedMem = totalMem - freeMem;
+  const usedPercent = totalMem > 0 ? Math.round((usedMem / totalMem) * 100) : 0;
+  const totalMb = Math.round(totalMem / (1024 * 1024));
+  const freeMb = Math.round(freeMem / (1024 * 1024));
+  const usedMb = Math.round(usedMem / (1024 * 1024));
+
+  if (usedPercent >= thresholdPercent) {
+    return {
+      ok: false,
+      latencyMs: 0,
+      message: `System RAM critical: ${usedPercent}% used (${usedMb} MB / ${totalMb} MB, threshold ${thresholdPercent}%).`,
+      details: { totalMb, freeMb, usedMb, usedPercent, thresholdPercent }
+    };
+  }
+  return {
+    ok: true,
+    latencyMs: 0,
+    message: `System RAM normal: ${usedPercent}% used (${freeMb} MB free of ${totalMb} MB).`,
+    details: { totalMb, freeMb, usedMb, usedPercent, thresholdPercent }
+  };
+}
+
+function cpuTimes() {
+  const cpus = os.cpus();
+  let idle = 0;
+  let total = 0;
+  for (const cpu of cpus) {
+    for (const type in cpu.times) total += cpu.times[type];
+    idle += cpu.times.idle;
+  }
+  return { idle, total };
+}
+
+async function checkCpu(target) {
+  const thresholdPercent = Number.parseInt(target.metadata?.thresholdPercent ?? 90, 10);
+  const cpus = os.cpus();
+  const coreCount = cpus.length || 1;
+
+  const sample1 = cpuTimes();
+  await new Promise((r) => setTimeout(r, 100));
+  const sample2 = cpuTimes();
+
+  const idleDelta = sample2.idle - sample1.idle;
+  const totalDelta = sample2.total - sample1.total;
+  let cpuPercent = totalDelta > 0 ? Math.max(0, Math.min(100, Math.round((1 - idleDelta / totalDelta) * 100))) : 0;
+
+  if (cpuPercent >= thresholdPercent) {
+    return {
+      ok: false,
+      latencyMs: 100,
+      message: `CPU utilization high: ${cpuPercent}% (${coreCount} cores, threshold ${thresholdPercent}%).`,
+      details: { cpuPercent, coreCount, thresholdPercent, loadAvg: os.loadavg() }
+    };
+  }
+  return {
+    ok: true,
+    latencyMs: 100,
+    message: `CPU utilization normal: ${cpuPercent}% (${coreCount} cores).`,
+    details: { cpuPercent, coreCount, thresholdPercent, loadAvg: os.loadavg() }
+  };
+}
+
+async function checkCommand(target) {
+  const script = String(target.metadata?.command || target.host || '').trim();
+  if (!script) {
+    return { ok: false, latencyMs: null, message: 'No command specified.', details: {} };
+  }
+  const timeoutMs = target.timeoutMs || 5000;
+  const expectedCode = Number.parseInt(target.metadata?.expectedExitCode ?? 0, 10);
+  const pattern = target.metadata?.expectedOutput ? String(target.metadata.expectedOutput).trim() : null;
+  const started = process.hrtime.bigint();
+  const shellCmd = process.platform === 'win32' ? 'cmd.exe' : '/bin/sh';
+  const shellArgs = process.platform === 'win32' ? ['/d', '/s', '/c', script] : ['-c', script];
+  const result = await runCommand(shellCmd, shellArgs, timeoutMs);
+  const latencyMs = elapsed(started);
+
+  if (result.timedOut) {
+    return { ok: false, latencyMs, message: `Command timed out after ${timeoutMs}ms.`, details: { script, timedOut: true } };
+  }
+  if (result.exitCode !== expectedCode) {
+    const errorOutput = (result.stderr || result.stdout || '').trim().slice(0, 200);
+    return {
+      ok: false,
+      latencyMs,
+      message: `Command exited with code ${result.exitCode} (expected ${expectedCode})${errorOutput ? `: ${errorOutput}` : '.'}`,
+      details: { script, exitCode: result.exitCode, expectedCode, stdout: result.stdout?.slice(-1000), stderr: result.stderr?.slice(-1000) }
+    };
+  }
+  if (pattern) {
+    try {
+      const regex = new RegExp(pattern, 'i');
+      if (!regex.test(result.stdout || '')) {
+        return {
+          ok: false,
+          latencyMs,
+          message: `Command output did not match expected pattern: "${pattern}".`,
+          details: { script, exitCode: result.exitCode, pattern, stdout: result.stdout?.slice(-1000) }
+        };
+      }
+    } catch {
+      if (!(result.stdout || '').toLowerCase().includes(pattern.toLowerCase())) {
+        return {
+          ok: false,
+          latencyMs,
+          message: `Command output did not contain text: "${pattern}".`,
+          details: { script, exitCode: result.exitCode, pattern, stdout: result.stdout?.slice(-1000) }
+        };
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    latencyMs,
+    message: `Command completed successfully (exit code ${result.exitCode}).`,
+    details: { script, exitCode: result.exitCode, output: (result.stdout || '').trim().slice(0, 500) }
+  };
+}
+
 async function executeCheck(target) {
   try {
     switch (target.type) {
@@ -396,6 +556,10 @@ async function executeCheck(target) {
       case 'http': return await checkHttp(target.url, target.timeoutMs);
       case 'system_service': return await checkSystemService(target.serviceName, target.timeoutMs);
       case 'process': return await checkProcess(target.processName, target.timeoutMs);
+      case 'disk': return await checkDisk(target);
+      case 'memory': return await checkMemory(target);
+      case 'cpu': return await checkCpu(target);
+      case 'command': return await checkCommand(target);
       default: return { ok: false, latencyMs: null, message: 'Unsupported monitor type.', details: {} };
     }
   } catch (error) {
@@ -403,4 +567,18 @@ async function executeCheck(target) {
   }
 }
 
-module.exports = { executeCheck, getNetworkAdapters, getDefaultGateway, runCommand, checkPing, checkTcp, checkHttp, checkSystemService, checkProcess };
+module.exports = {
+  executeCheck,
+  getNetworkAdapters,
+  getDefaultGateway,
+  runCommand,
+  checkPing,
+  checkTcp,
+  checkHttp,
+  checkSystemService,
+  checkProcess,
+  checkDisk,
+  checkMemory,
+  checkCpu,
+  checkCommand
+};

@@ -1,7 +1,7 @@
 {
-  "name": "remote-care-phase1",
-  "version": "1.1.2",
-  "description": "Local-first cross-platform network, internet, target, and local-service monitor.",
+  "name": "remote-care-monitor",
+  "version": "2.0.0",
+  "description": "Cross-platform network, target, system resource, and headless server monitor.",
   "homepage": "https://archidtech.in",
   "desktopName": "remote-care-monitor",
   "main": "src/main/app.js",
@@ -14,9 +14,10 @@
     "start": "electron .",
     "dev": "electron . --dev",
     "postinstall": "electron-builder install-app-deps",
+    "daemon": "node src/daemon/index.js",
     "test": "node scripts/run-tests.js",
     "test:notifications-ui": "electron scripts/check-notifications.js",
-    "lint": "node --check src/main/app.js && node --check src/main/autostart.js && node --check src/main/database.js && node --check src/main/monitor-engine.js && node --check src/main/checks.js && node --check src/main/notification-center.js && node --check src/main/notification-preload.js && node --check src/renderer/notification.js && node --check src/renderer/app.js",
+    "lint": "node --check src/main/app.js && node --check src/main/autostart.js && node --check src/main/database.js && node --check src/main/monitor-engine.js && node --check src/main/checks.js && node --check src/main/notification-center.js && node --check src/main/notification-preload.js && node --check src/main/webhooks.js && node --check src/main/cloud-publisher.js && node --check src/main/heartbeat.js && node --check src/daemon/index.js && node --check src/renderer/notification.js && node --check src/renderer/app.js",
     "pack": "electron-builder --dir",
     "dist": "electron-builder"
   },

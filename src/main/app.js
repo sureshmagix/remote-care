@@ -8,6 +8,9 @@ const { MonitorEngine } = require('./monitor-engine');
 const { getNetworkAdapters } = require('./checks');
 const { NotificationCenter } = require('./notification-center');
 const { configureAutostart, startedInBackground } = require('./autostart');
+const { dispatchWebhook } = require('./webhooks');
+const { CloudPublisher } = require('./cloud-publisher');
+const { HeartbeatService } = require('./heartbeat');
 
 app.setName('Remote Care Monitor');
 if (process.platform === 'win32') {
@@ -38,6 +41,8 @@ let runtimeSessionId;
 let shutdownComplete = false;
 let autostartStatus = { enabled: false, message: 'Automatic startup has not been checked yet' };
 let startedAtLogin = false;
+let cloudPublisher;
+let heartbeatService;
 const sessions = new SessionStore();
 
 function csvCell(value) {
@@ -117,16 +122,36 @@ function broadcast(channel, payload) {
 function notify(event) {
   const settings = database.getAppSettings();
   const enabled = ['down', 'warning'].includes(event.kind) ? settings.showFailureNotifications : settings.showRecoveryNotifications;
-  if (!enabled) return;
-  notificationCenter.show(event, settings.notificationDurationSeconds * 1000);
-  broadcast('monitor-update', { type: 'notification', event });
-  if (['down', 'warning'].includes(event.kind)) {
-    if (process.platform === 'darwin' && app.dock) {
-      app.dock.bounce('critical');
-    } else if (process.platform === 'win32' && mainWindow && !mainWindow.isFocused()) {
-      mainWindow.flashFrame(true);
+  if (enabled) {
+    notificationCenter.show(event, settings.notificationDurationSeconds * 1000);
+    broadcast('monitor-update', { type: 'notification', event });
+    if (['down', 'warning'].includes(event.kind)) {
+      if (process.platform === 'darwin' && app.dock) {
+        app.dock.bounce('critical');
+      } else if (process.platform === 'win32' && mainWindow && !mainWindow.isFocused()) {
+        mainWindow.flashFrame(true);
+      }
     }
   }
+
+  // Phase 2: Sound alerts
+  if (settings.soundAlertsEnabled) {
+    broadcast('sound-alert', { kind: event.kind, volume: settings.soundVolume });
+  }
+
+  // Phase 2: Webhook integration
+  if (settings.webhookEnabled && settings.webhookUrl) {
+    const shouldDispatch = settings.webhookEvents === 'all' || ['down', 'warning'].includes(event.kind);
+    if (shouldDispatch) {
+      dispatchWebhook({ webhookUrl: settings.webhookUrl, webhookType: settings.webhookType, event })
+        .catch((err) => {
+          database?.audit(null, 'webhook_dispatch_failed', 'application', null, { error: err.message });
+        });
+    }
+  }
+
+  // Phase 2: Trigger immediate cloud sync
+  cloudPublisher?.trigger();
 }
 
 function showBackgroundToast() {
@@ -155,6 +180,8 @@ function completeShutdown() {
   if (shutdownComplete) return;
   shutdownComplete = true;
   if (trayClockTimer) clearInterval(trayClockTimer);
+  heartbeatService?.stop();
+  cloudPublisher?.stop();
   database?.endRuntimeSession(runtimeSessionId, 'authorized_quit');
   monitor?.stop();
   notificationCenter?.dispose();
@@ -209,10 +236,18 @@ function showWindow() {
   broadcast('monitor-update', { type: 'window_focused' });
 }
 
-function requireSession(token, requiredRole = null) {
+function requireSession(token, allowedRoles = null) {
   const session = sessions.get(token);
   if (!session) throw new Error('Your session has expired. Please sign in again.');
-  if (requiredRole && session.role !== requiredRole) throw new Error('Super Admin access is required for this action.');
+  if (allowedRoles) {
+    const roles = Array.isArray(allowedRoles) ? allowedRoles : [allowedRoles];
+    if (!roles.includes(session.role)) {
+      if (roles.includes(ROLES.OPERATOR)) {
+        throw new Error('Operator or Super Admin access is required for this action.');
+      }
+      throw new Error('Super Admin access is required for this action.');
+    }
+  }
   return session;
 }
 
@@ -224,6 +259,10 @@ function registerIpc() {
     database.createDefaultTargets();
     monitor.refreshSchedule(true);
     monitor.start();
+    cloudPublisher = new CloudPublisher({ database, getSettings: () => database.getAppSettings() });
+    cloudPublisher.start();
+    heartbeatService = new HeartbeatService({ database, publisher: cloudPublisher, getSettings: () => database.getAppSettings() });
+    heartbeatService.start();
     const session = sessions.issue(user);
     database.markLogin(user.id);
     database.audit(user.id, 'login', 'session', session.token, {});
@@ -279,7 +318,7 @@ function registerIpc() {
   });
 
   ipcMain.handle('notification-test', (_event, { token }) => {
-    const session = requireSession(token, ROLES.SUPER_ADMIN);
+    const session = requireSession(token, [ROLES.SUPER_ADMIN, ROLES.OPERATOR]);
     const settings = database.getAppSettings();
     const event = {
       kind: 'warning',
@@ -288,11 +327,12 @@ function registerIpc() {
       target: { name: 'Alert test', locationName: 'Local device', severity: 'warning' },
       occurredAt: new Date().toISOString()
     };
-    // A test is intentionally shown even when regular alerts are disabled, so
-    // an administrator can verify desktop permission and popup placement.
     notificationCenter.show(event, settings.notificationDurationSeconds * 1000);
     database.audit(session.userId, 'test_desktop_notification', 'application', null, {});
     broadcast('monitor-update', { type: 'notification', event });
+    if (settings.soundAlertsEnabled) {
+      broadcast('sound-alert', { kind: 'warning', volume: settings.soundVolume });
+    }
     return { ok: true };
   });
 
@@ -320,15 +360,81 @@ function registerIpc() {
   });
 
   ipcMain.handle('target-run', async (_event, { token, targetId }) => {
-    requireSession(token, ROLES.SUPER_ADMIN);
+    requireSession(token, [ROLES.SUPER_ADMIN, ROLES.OPERATOR]);
     return monitor.runNow(Number(targetId));
   });
 
   ipcMain.handle('incident-acknowledge', (_event, { token, incidentId }) => {
-    const session = requireSession(token, ROLES.SUPER_ADMIN);
+    const session = requireSession(token, [ROLES.SUPER_ADMIN, ROLES.OPERATOR]);
     database.acknowledgeIncident(Number(incidentId), session.userId);
     broadcast('monitor-update', { type: 'incident_acknowledged', incidentId: Number(incidentId) });
     return { ok: true };
+  });
+
+  ipcMain.handle('webhook-test', async (_event, { token }) => {
+    const session = requireSession(token, [ROLES.SUPER_ADMIN, ROLES.OPERATOR]);
+    const settings = database.getAppSettings();
+    if (!settings.webhookUrl) throw new Error('No webhook URL configured in Settings.');
+    const testEvent = {
+      kind: 'warning',
+      title: 'Test Webhook Alert',
+      body: 'This confirms that Remote Care Monitor can dispatch webhook notifications.',
+      target: { name: 'Webhook Test', locationName: 'Local device', severity: 'warning' },
+      occurredAt: new Date().toISOString()
+    };
+    const result = await dispatchWebhook({
+      webhookUrl: settings.webhookUrl,
+      webhookType: settings.webhookType,
+      event: testEvent
+    });
+    database.audit(session.userId, 'test_webhook', 'application', null, { type: settings.webhookType });
+    return result;
+  });
+
+  ipcMain.handle('cloud-sync-status', (_event, { token }) => {
+    requireSession(token);
+    return cloudPublisher?.getStatus() || { enabled: false };
+  });
+
+  ipcMain.handle('cloud-sync-trigger', async (_event, { token }) => {
+    requireSession(token, [ROLES.SUPER_ADMIN, ROLES.OPERATOR]);
+    return cloudPublisher?.publishPending() || { skipped: true };
+  });
+
+  ipcMain.handle('targets-export', async (_event, { token, targetIds }) => {
+    const session = requireSession(token, [ROLES.SUPER_ADMIN, ROLES.OPERATOR]);
+    const exportData = database.exportMonitorsJson(targetIds);
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: 'Export monitors configuration',
+      defaultPath: path.join(app.getPath('downloads'), `Remote Care Monitors Export ${new Date().toISOString().slice(0, 10)}.json`),
+      filters: [{ name: 'JSON file', extensions: ['json'] }]
+    });
+    if (result.canceled || !result.filePath) return { cancelled: true };
+    fs.writeFileSync(result.filePath, JSON.stringify(exportData, null, 2), 'utf8');
+    database.audit(session.userId, 'export_monitors', 'targets', null, { count: exportData.monitors.length });
+    return { cancelled: false, filePath: result.filePath, count: exportData.monitors.length };
+  });
+
+  ipcMain.handle('targets-import', async (_event, { token, options }) => {
+    const session = requireSession(token, ROLES.SUPER_ADMIN);
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: 'Import monitors configuration',
+      filters: [{ name: 'JSON file', extensions: ['json'] }],
+      properties: ['openFile']
+    });
+    if (result.canceled || !result.filePaths?.[0]) return { cancelled: true };
+    const raw = fs.readFileSync(result.filePaths[0], 'utf8');
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error('Invalid JSON file format.');
+    }
+    const outcome = database.importMonitorsJson(parsed, session.userId, options);
+    monitor.refreshSchedule(true);
+    updateTray();
+    broadcast('monitor-update', { type: 'targets_imported', outcome });
+    return { cancelled: false, ...outcome };
   });
 
   ipcMain.handle('users-list', (_event, { token }) => {
@@ -421,9 +527,13 @@ function registerIpc() {
 
   ipcMain.handle('app-info', (_event, { token }) => {
     requireSession(token);
+    const syncStatus = cloudPublisher?.getStatus();
+    const syncText = syncStatus?.enabled
+      ? (syncStatus.lastSyncAt ? `Active (last sync: ${new Date(syncStatus.lastSyncAt).toLocaleTimeString()})` : 'Active (connecting)')
+      : 'Disabled in Settings';
     return {
       version: app.getVersion(), platform: process.platform, arch: process.arch, dataPath: app.getPath('userData'),
-      cloudSync: 'Phase 2 disabled', runtime: database.getRuntimeStatus(), autostart: autostartStatus
+      cloudSync: syncText, runtime: database.getRuntimeStatus(), autostart: autostartStatus
     };
   });
 }
@@ -454,6 +564,10 @@ app.whenReady().then(() => {
   if (database.hasSuperAdmin()) {
     database.createDefaultTargets();
     monitor.start();
+    cloudPublisher = new CloudPublisher({ database, getSettings: () => database.getAppSettings() });
+    cloudPublisher.start();
+    heartbeatService = new HeartbeatService({ database, publisher: cloudPublisher, getSettings: () => database.getAppSettings() });
+    heartbeatService.start();
   }
   createWindow();
   if (!startedAtLogin || !database.hasSuperAdmin()) showWindow();

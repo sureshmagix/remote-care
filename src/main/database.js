@@ -3,8 +3,8 @@ const path = require('node:path');
 const Database = require('better-sqlite3');
 const { passwordRecord, validateUsername, verifyPassword } = require('./auth');
 
-const ROLES = Object.freeze({ SUPER_ADMIN: 'super_admin', VIEWER: 'viewer' });
-const CHECK_TYPES = new Set(['internet', 'interface', 'gateway', 'ping', 'tcp', 'http', 'system_service', 'process']);
+const ROLES = Object.freeze({ SUPER_ADMIN: 'super_admin', OPERATOR: 'operator', VIEWER: 'viewer' });
+const CHECK_TYPES = new Set(['internet', 'interface', 'gateway', 'ping', 'tcp', 'http', 'system_service', 'process', 'disk', 'memory', 'cpu', 'command']);
 const STATUSES = new Set(['unknown', 'healthy', 'warning', 'down', 'disabled']);
 const HISTORY_STATUSES = new Set(['unknown', 'healthy', 'warning', 'down']);
 const HISTORY_OUTCOMES = new Set(['all', 'success', 'failure']);
@@ -21,14 +21,36 @@ const DEFAULT_APP_SETTINGS = Object.freeze({
   showTrayReminder: true,
   showFailureNotifications: true,
   showRecoveryNotifications: true,
-  notificationDurationSeconds: 5
+  notificationDurationSeconds: 5,
+  cloudSyncEnabled: false,
+  cloudSyncProtocol: 'https',
+  cloudHttpsUrl: '',
+  cloudAuthToken: '',
+  cloudHeartbeatMinutes: 5,
+  webhookEnabled: false,
+  webhookUrl: '',
+  webhookType: 'generic',
+  webhookEvents: 'failures_only',
+  soundAlertsEnabled: false,
+  soundVolume: 70
 });
 const APP_SETTING_KEYS = Object.freeze({
   minimizeToTray: 'minimize_to_tray',
   showTrayReminder: 'show_tray_reminder',
   showFailureNotifications: 'show_failure_notifications',
   showRecoveryNotifications: 'show_recovery_notifications',
-  notificationDurationSeconds: 'notification_duration_seconds'
+  notificationDurationSeconds: 'notification_duration_seconds',
+  cloudSyncEnabled: 'cloud_sync_enabled',
+  cloudSyncProtocol: 'cloud_sync_protocol',
+  cloudHttpsUrl: 'cloud_https_url',
+  cloudAuthToken: 'cloud_auth_token',
+  cloudHeartbeatMinutes: 'cloud_heartbeat_minutes',
+  webhookEnabled: 'webhook_enabled',
+  webhookUrl: 'webhook_url',
+  webhookType: 'webhook_type',
+  webhookEvents: 'webhook_events',
+  soundAlertsEnabled: 'sound_alerts_enabled',
+  soundVolume: 'sound_volume'
 });
 
 function now() {
@@ -169,8 +191,27 @@ function validateTarget(input) {
   }
   if (type === 'system_service' && !serviceName) throw new Error('A service name is required.');
   if (type === 'process' && !processName) throw new Error('A process name is required.');
+  if (type === 'command' && !host && !input.metadata?.command && !input.command) {
+    throw new Error('A command or script is required for this monitor.');
+  }
 
-  const metadata = input.metadata && typeof input.metadata === 'object' ? input.metadata : {};
+  const metadata = input.metadata && typeof input.metadata === 'object' ? { ...input.metadata } : {};
+  if (['disk', 'memory', 'cpu'].includes(type)) {
+    const rawThreshold = metadata.thresholdPercent ?? input.thresholdPercent ?? 90;
+    metadata.thresholdPercent = toPositiveInteger(rawThreshold, 90, 1, 100);
+    if (type === 'disk') {
+      metadata.path = String(metadata.path || input.path || (process.platform === 'win32' ? 'C:\\' : '/')).trim();
+    }
+  }
+  if (type === 'command') {
+    metadata.command = String(metadata.command || input.command || host).trim();
+    if (metadata.expectedExitCode !== undefined && metadata.expectedExitCode !== null && metadata.expectedExitCode !== '') {
+      metadata.expectedExitCode = Number.parseInt(metadata.expectedExitCode, 10) || 0;
+    }
+    if (metadata.expectedOutput) {
+      metadata.expectedOutput = String(metadata.expectedOutput).trim();
+    }
+  }
   return {
     id: input.id ? Number.parseInt(input.id, 10) : null,
     name,
@@ -269,7 +310,7 @@ class LocalDatabase {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT NOT NULL UNIQUE COLLATE NOCASE,
         display_name TEXT NOT NULL,
-        role TEXT NOT NULL CHECK(role IN ('super_admin', 'viewer')),
+        role TEXT NOT NULL CHECK(role IN ('super_admin', 'operator', 'viewer')),
         password_salt TEXT NOT NULL,
         password_hash TEXT NOT NULL,
         active INTEGER NOT NULL DEFAULT 1,
@@ -372,7 +413,8 @@ class LocalDatabase {
         payload_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
         delivered_at TEXT,
-        attempts INTEGER NOT NULL DEFAULT 0
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT
       );
     `);
 
@@ -380,6 +422,31 @@ class LocalDatabase {
     // these fields from the schema above; existing rows retain a meaningful
     // location instead of becoming blank in history and reports.
     const columns = (table) => new Set(this.db.prepare(`PRAGMA table_info(${table})`).all().map((column) => column.name));
+    const outboundColumns = columns('outbound_events');
+    if (!outboundColumns.has('last_error')) {
+      this.db.exec('ALTER TABLE outbound_events ADD COLUMN last_error TEXT');
+    }
+    const userSql = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").get()?.sql || '';
+    if (userSql.includes("'viewer'") && !userSql.includes("'operator'")) {
+      this.db.exec(`
+        CREATE TABLE users_migrated (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+          display_name TEXT NOT NULL,
+          role TEXT NOT NULL CHECK(role IN ('super_admin', 'operator', 'viewer')),
+          password_salt TEXT NOT NULL,
+          password_hash TEXT NOT NULL,
+          active INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          last_login_at TEXT
+        );
+        INSERT INTO users_migrated (id, username, display_name, role, password_salt, password_hash, active, created_at, updated_at, last_login_at)
+          SELECT id, username, display_name, role, password_salt, password_hash, active, created_at, updated_at, last_login_at FROM users;
+        DROP TABLE users;
+        ALTER TABLE users_migrated RENAME TO users;
+      `);
+    }
     const targetColumns = columns('targets');
     if (!targetColumns.has('location_name')) {
       this.db.exec(`ALTER TABLE targets ADD COLUMN location_name TEXT NOT NULL DEFAULT '${DEFAULT_LOCATION_NAME}'`);
@@ -443,13 +510,22 @@ class LocalDatabase {
   getAppSettings() {
     const rows = this.db.prepare('SELECT key, value FROM app_settings').all();
     const stored = new Map(rows.map((row) => [row.key, row.value]));
-    return Object.fromEntries(Object.entries(APP_SETTING_KEYS).map(([name, key]) => [
-      name,
-      name === 'notificationDurationSeconds'
-        ? (Number.isInteger(Number(stored.get(key))) && Number(stored.get(key)) >= 1 && Number(stored.get(key)) <= 300
-          ? Number(stored.get(key)) : DEFAULT_APP_SETTINGS[name])
-        : storedBool(stored.get(key), DEFAULT_APP_SETTINGS[name])
-    ]));
+    return Object.fromEntries(Object.entries(APP_SETTING_KEYS).map(([name, key]) => {
+      const val = stored.get(key);
+      if (name === 'notificationDurationSeconds') {
+        return [name, Number.isInteger(Number(val)) && Number(val) >= 1 && Number(val) <= 300 ? Number(val) : DEFAULT_APP_SETTINGS[name]];
+      }
+      if (name === 'cloudHeartbeatMinutes') {
+        return [name, Number.isInteger(Number(val)) && Number(val) >= 1 && Number(val) <= 1440 ? Number(val) : DEFAULT_APP_SETTINGS[name]];
+      }
+      if (name === 'soundVolume') {
+        return [name, Number.isInteger(Number(val)) && Number(val) >= 0 && Number(val) <= 100 ? Number(val) : DEFAULT_APP_SETTINGS[name]];
+      }
+      if (typeof DEFAULT_APP_SETTINGS[name] === 'boolean') {
+        return [name, storedBool(val, DEFAULT_APP_SETTINGS[name])];
+      }
+      return [name, val !== undefined && val !== null ? String(val) : DEFAULT_APP_SETTINGS[name]];
+    }));
   }
 
   updateAppSettings(input, actorUserId) {
@@ -461,7 +537,19 @@ class LocalDatabase {
         if (!Number.isInteger(input[name]) || input[name] < 1 || input[name] > 300) {
           throw new Error('Notification duration must be a whole number from 1 to 300 seconds.');
         }
-      } else if (typeof input[name] !== 'boolean') throw new Error('Each setting must be enabled or disabled.');
+      } else if (name === 'cloudHeartbeatMinutes') {
+        if (!Number.isInteger(input[name]) || input[name] < 1 || input[name] > 1440) {
+          throw new Error('Heartbeat interval must be a whole number from 1 to 1440 minutes.');
+        }
+      } else if (name === 'soundVolume') {
+        if (!Number.isInteger(input[name]) || input[name] < 0 || input[name] > 100) {
+          throw new Error('Sound volume must be between 0 and 100.');
+        }
+      } else if (typeof DEFAULT_APP_SETTINGS[name] === 'boolean') {
+        if (typeof input[name] !== 'boolean') throw new Error('Each setting must be enabled or disabled.');
+      } else {
+        if (typeof input[name] !== 'string') throw new Error(`${name} must be a string.`);
+      }
       settings[name] = input[name];
     }
     const timestamp = now();
@@ -469,7 +557,7 @@ class LocalDatabase {
       for (const [name, key] of Object.entries(APP_SETTING_KEYS)) {
         this.db.prepare(`INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
-          .run(key, String(settings[name]), timestamp);
+          .run(key, String(settings[name] ?? ''), timestamp);
       }
     });
     save();
@@ -551,9 +639,10 @@ class LocalDatabase {
     return this.db.prepare('SELECT * FROM users ORDER BY role ASC, username ASC').all().map(mapUser);
   }
 
-  createViewer({ username, displayName, password }, actorUserId) {
-    const count = this.db.prepare('SELECT COUNT(*) AS count FROM users WHERE role = ?').get(ROLES.VIEWER).count;
-    if (count >= 5) throw new Error('A maximum of five Viewer accounts is allowed.');
+  createViewer({ username, displayName, password, role = ROLES.VIEWER }, actorUserId) {
+    const targetRole = role === ROLES.OPERATOR ? ROLES.OPERATOR : ROLES.VIEWER;
+    const count = this.db.prepare('SELECT COUNT(*) AS count FROM users WHERE role IN (?, ?)').get(ROLES.VIEWER, ROLES.OPERATOR).count;
+    if (count >= 5) throw new Error('A maximum of five non-admin (Viewer/Operator) accounts is allowed.');
     const normalizedUsername = validateUsername(username);
     const record = passwordRecord(password);
     const timestamp = now();
@@ -561,8 +650,8 @@ class LocalDatabase {
       const info = this.db.prepare(`INSERT INTO users
         (username, display_name, role, password_salt, password_hash, active, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, 1, ?, ?)`)
-        .run(normalizedUsername, String(displayName || normalizedUsername).trim().slice(0, 80), ROLES.VIEWER, record.salt, record.hash, timestamp, timestamp);
-      this.audit(actorUserId, 'create_viewer', 'user', String(info.lastInsertRowid), { username: normalizedUsername });
+        .run(normalizedUsername, String(displayName || normalizedUsername).trim().slice(0, 80), targetRole, record.salt, record.hash, timestamp, timestamp);
+      this.audit(actorUserId, targetRole === ROLES.OPERATOR ? 'create_operator' : 'create_viewer', 'user', String(info.lastInsertRowid), { username: normalizedUsername, role: targetRole });
       return this.getUserById(info.lastInsertRowid);
     } catch (error) {
       if (/UNIQUE constraint failed/i.test(error.message)) throw new Error('That username already exists.');
@@ -570,21 +659,25 @@ class LocalDatabase {
     }
   }
 
+  createOperator(user, actorUserId) {
+    return this.createViewer({ ...user, role: ROLES.OPERATOR }, actorUserId);
+  }
+
   setViewerActive(userId, active, actorUserId) {
     const user = this.getUserById(userId);
-    if (!user || user.role !== ROLES.VIEWER) throw new Error('Viewer account not found.');
+    if (!user || ![ROLES.VIEWER, ROLES.OPERATOR].includes(user.role)) throw new Error('Account not found.');
     this.db.prepare('UPDATE users SET active = ?, updated_at = ? WHERE id = ?').run(active ? 1 : 0, now(), userId);
-    this.audit(actorUserId, active ? 'enable_viewer' : 'disable_viewer', 'user', String(userId), {});
+    this.audit(actorUserId, active ? 'enable_user' : 'disable_user', 'user', String(userId), {});
     return this.getUserById(userId);
   }
 
   resetViewerPassword(userId, password, actorUserId) {
     const user = this.getUserById(userId);
-    if (!user || user.role !== ROLES.VIEWER) throw new Error('Viewer account not found.');
+    if (!user || ![ROLES.VIEWER, ROLES.OPERATOR].includes(user.role)) throw new Error('Account not found.');
     const record = passwordRecord(password);
     this.db.prepare('UPDATE users SET password_salt = ?, password_hash = ?, updated_at = ? WHERE id = ?')
       .run(record.salt, record.hash, now(), userId);
-    this.audit(actorUserId, 'reset_viewer_password', 'user', String(userId), {});
+    this.audit(actorUserId, 'reset_user_password', 'user', String(userId), {});
   }
 
   changeUserPassword(userId, currentPassword, newPassword) {
@@ -617,16 +710,17 @@ class LocalDatabase {
     }
   }
 
-  updateViewer(userId, { username, displayName, active }, actorUserId) {
+  updateViewer(userId, { username, displayName, active, role } = {}, actorUserId) {
     const user = this.getUserById(userId);
-    if (!user || user.role !== ROLES.VIEWER) throw new Error('Viewer account not found.');
-    const normalizedUsername = validateUsername(username);
-    const trimmedDisplayName = String(displayName || normalizedUsername).trim().slice(0, 80);
-    const isActive = active !== false;
+    if (!user || ![ROLES.VIEWER, ROLES.OPERATOR].includes(user.role)) throw new Error('Account not found.');
+    const normalizedUsername = validateUsername(username || user.username);
+    const trimmedDisplayName = String(displayName || user.displayName || normalizedUsername).trim().slice(0, 80);
+    const targetRole = role && [ROLES.VIEWER, ROLES.OPERATOR].includes(role) ? role : user.role;
+    const isActive = active !== undefined ? Boolean(active) : user.active;
     try {
-      this.db.prepare('UPDATE users SET username = ?, display_name = ?, active = ?, updated_at = ? WHERE id = ?')
-        .run(normalizedUsername, trimmedDisplayName, isActive ? 1 : 0, now(), userId);
-      this.audit(actorUserId, 'update_viewer', 'user', String(userId), { username: normalizedUsername, displayName: trimmedDisplayName, active: isActive });
+      this.db.prepare('UPDATE users SET username = ?, display_name = ?, role = ?, active = ?, updated_at = ? WHERE id = ?')
+        .run(normalizedUsername, trimmedDisplayName, targetRole, isActive ? 1 : 0, now(), userId);
+      this.audit(actorUserId, 'update_managed_user', 'user', String(userId), { username: normalizedUsername, displayName: trimmedDisplayName, role: targetRole, active: isActive });
       return this.getUserById(userId);
     } catch (error) {
       if (/UNIQUE constraint failed/i.test(error.message)) throw new Error('That username is already taken.');
@@ -833,7 +927,27 @@ class LocalDatabase {
   }
 
   getDashboard() {
-    const targets = this.listTargets();
+    const rawTargets = this.listTargets();
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 86_400_000).toISOString();
+    const recentResultsStmt = this.db.prepare(`
+      SELECT latency_ms, ok, status, checked_at FROM check_results
+      WHERE target_id = ? ORDER BY checked_at DESC LIMIT 15
+    `);
+    const uptimeStmt = this.db.prepare(`
+      SELECT COUNT(*) as total, SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END) as healthy
+      FROM check_results WHERE target_id = ? AND checked_at >= ?
+    `);
+
+    const targets = rawTargets.map((target) => {
+      const recent = recentResultsStmt.all(target.id).reverse();
+      const uptimeRow = uptimeStmt.get(target.id, thirtyDaysAgo);
+      const uptimePercent = uptimeRow && uptimeRow.total > 0
+        ? Number(((uptimeRow.healthy / uptimeRow.total) * 100).toFixed(1))
+        : 100.0;
+      const sparkline = recent.map((r) => r.latency_ms ?? (r.ok ? 1 : 0));
+      return { ...target, uptimePercent, sparkline, recentResults: recent };
+    });
+
     const activeIncidents = this.db.prepare(`SELECT i.*, t.name AS target_name FROM incidents i
       JOIN targets t ON t.id = i.target_id WHERE i.resolved_at IS NULL ORDER BY i.started_at DESC`).all()
       .map((row) => ({ id: row.id, targetId: row.target_id, targetName: row.target_name, locationName: row.location_name || DEFAULT_LOCATION_NAME, severity: row.severity, title: row.title, message: row.message, startedAt: row.started_at, acknowledgedAt: row.acknowledged_at }));
@@ -866,6 +980,109 @@ class LocalDatabase {
   enqueueEvent(eventType, payload) {
     this.db.prepare('INSERT INTO outbound_events (event_type, payload_json, created_at) VALUES (?, ?, ?)')
       .run(eventType, JSON.stringify(payload), now());
+  }
+
+  getPendingOutboundEvents(limit = 25) {
+    return this.db.prepare(`SELECT * FROM outbound_events
+      WHERE delivered_at IS NULL AND attempts < 10
+      ORDER BY id ASC LIMIT ?`).all(limit);
+  }
+
+  getPendingOutboundCount() {
+    return this.db.prepare('SELECT COUNT(*) as count FROM outbound_events WHERE delivered_at IS NULL').get()?.count || 0;
+  }
+
+  markEventsDelivered(ids) {
+    if (!ids || !ids.length) return;
+    const update = this.db.prepare('UPDATE outbound_events SET delivered_at = ? WHERE id = ?');
+    const timestamp = now();
+    const tx = this.db.transaction((idList) => {
+      for (const id of idList) update.run(timestamp, id);
+    });
+    tx(ids);
+  }
+
+  markEventFailed(id, errorMessage = '') {
+    this.db.prepare(`UPDATE outbound_events
+      SET attempts = attempts + 1, last_error = ? WHERE id = ?`)
+      .run(String(errorMessage).slice(0, 500), id);
+  }
+
+  exportMonitorsJson(targetIds = null) {
+    let targets = this.listTargets();
+    if (Array.isArray(targetIds) && targetIds.length) {
+      const set = new Set(targetIds.map(Number));
+      targets = targets.filter((t) => set.has(t.id));
+    }
+    const cleanMonitors = targets.map((t) => ({
+      name: t.name,
+      locationName: t.locationName,
+      type: t.type,
+      host: t.host,
+      port: t.port,
+      url: t.url,
+      interfaceName: t.interfaceName,
+      serviceName: t.serviceName,
+      processName: t.processName,
+      intervalSeconds: t.intervalSeconds,
+      timeoutMs: t.timeoutMs,
+      failureThreshold: t.failureThreshold,
+      recoveryThreshold: t.recoveryThreshold,
+      severity: t.severity,
+      downMessage: t.downMessage,
+      recoveryMessage: t.recoveryMessage,
+      enabled: t.enabled,
+      metadata: t.metadata
+    }));
+    return {
+      version: '2.0',
+      exportedAt: now(),
+      monitors: cleanMonitors
+    };
+  }
+
+  importMonitorsJson(input, actorUserId, options = { onDuplicate: 'skip' }) {
+    let monitors = [];
+    if (Array.isArray(input)) {
+      monitors = input;
+    } else if (input && Array.isArray(input.monitors)) {
+      monitors = input.monitors;
+    } else {
+      throw new Error('Invalid JSON format: expected an array of monitors or an object with a "monitors" list.');
+    }
+
+    const existingTargets = this.listTargets();
+    const existingByName = new Map(existingTargets.map((t) => [t.name.toLowerCase(), t]));
+    let importedCount = 0;
+    let skippedCount = 0;
+    let overwrittenCount = 0;
+    const onDuplicate = options?.onDuplicate || 'skip';
+
+    const tx = this.db.transaction(() => {
+      for (const item of monitors) {
+        const validated = validateTarget(item);
+        const existing = existingByName.get(validated.name.toLowerCase());
+        if (existing) {
+          if (onDuplicate === 'skip') {
+            skippedCount++;
+            continue;
+          } else if (onDuplicate === 'overwrite') {
+            validated.id = existing.id;
+            this.saveTarget(validated, actorUserId);
+            overwrittenCount++;
+            continue;
+          } else if (onDuplicate === 'rename') {
+            validated.name = `${validated.name} (Imported ${Date.now().toString().slice(-4)})`;
+          }
+        }
+        this.saveTarget(validated, actorUserId);
+        existingByName.set(validated.name.toLowerCase(), validated);
+        importedCount++;
+      }
+    });
+    tx();
+    this.audit(actorUserId, 'import_monitors', 'targets', null, { importedCount, skippedCount, overwrittenCount, total: monitors.length });
+    return { importedCount, skippedCount, overwrittenCount, total: monitors.length };
   }
 
   pruneHistory(days = 30) {

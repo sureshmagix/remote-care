@@ -22,13 +22,49 @@ let dashboardRefreshVersion = 0;
 const root = document.getElementById('app');
 const toastRegion = document.getElementById('toast-region');
 const isAdmin = () => state.session?.role === 'super_admin';
+const isOperator = () => state.session?.role === 'operator';
+const canOperate = () => state.session?.role === 'super_admin' || state.session?.role === 'operator';
 
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>'"]/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[character]));
 }
 
 function prettyType(type) {
-  return ({ internet: 'Internet', interface: 'Network interface', gateway: 'Default gateway', ping: 'ICMP ping', tcp: 'TCP port', http: 'HTTP/HTTPS', system_service: 'Local service', process: 'Local process' }[type] || type);
+  return ({
+    internet: 'Internet',
+    interface: 'Network interface',
+    gateway: 'Default gateway',
+    ping: 'ICMP ping',
+    tcp: 'TCP port',
+    http: 'HTTP/HTTPS',
+    system_service: 'Local service',
+    process: 'Local process',
+    disk: 'Disk storage',
+    memory: 'System RAM',
+    cpu: 'CPU utilization',
+    command: 'Custom script'
+  }[type] || type);
+}
+
+function renderSparklineSvg(points = []) {
+  if (!points || !points.length) {
+    return '<span class="sparkline-empty">—</span>';
+  }
+  const clean = points.map((p) => (typeof p === 'number' && Number.isFinite(p) ? Math.max(0, p) : 0));
+  if (clean.length === 1) clean.push(clean[0]);
+  const max = Math.max(...clean, 10);
+  const min = 0;
+  const width = 75;
+  const height = 20;
+  const step = width / (clean.length - 1);
+  const coords = clean.map((val, idx) => {
+    const x = (idx * step).toFixed(1);
+    const y = (height - ((val - min) / (max - min)) * (height - 4) - 2).toFixed(1);
+    return `${x},${y}`;
+  });
+  return `<svg class="sparkline-chart" viewBox="0 0 ${width} ${height}" aria-hidden="true" title="Recent checks: ${clean.slice(-1)[0]}ms">
+    <polyline fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="${coords.join(' ')}" />
+  </svg>`;
 }
 
 function prettyTime(value) {
@@ -91,6 +127,10 @@ function targetDestination(target) {
   if (target.type === 'interface') return target.interfaceName === 'auto' ? 'Automatic interface' : target.interfaceName;
   if (target.type === 'system_service') return target.serviceName;
   if (target.type === 'process') return target.processName;
+  if (target.type === 'disk') return `${target.metadata?.path || '/'} (threshold ${target.metadata?.thresholdPercent || 90}%)`;
+  if (target.type === 'memory') return `RAM (threshold ${target.metadata?.thresholdPercent || 90}%)`;
+  if (target.type === 'cpu') return `CPU load (threshold ${target.metadata?.thresholdPercent || 90}%)`;
+  if (target.type === 'command') return target.metadata?.command || target.host || 'Shell command';
   return 'Automatic local gateway';
 }
 
@@ -103,7 +143,11 @@ function badge(status, label = status) {
 }
 
 let audioCtx = null;
-function playNotificationChime(kind = 'info') {
+function playNotificationChime(kind = 'info', force = false) {
+  if (!force && state.settings && state.settings.soundAlertsEnabled === false) {
+    return;
+  }
+  const volume = (state.settings?.soundVolume ?? 70) / 100;
   try {
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     if (!AudioContextClass) return;
@@ -116,30 +160,31 @@ function playNotificationChime(kind = 'info') {
     const gain = audioCtx.createGain();
     osc.connect(gain);
     gain.connect(audioCtx.destination);
+    const vol = Math.max(0.01, Math.min(1, volume));
 
-    if (kind === 'down') {
+    if (kind === 'down' || kind === 'critical') {
       osc.type = 'sawtooth';
       osc.frequency.setValueAtTime(349.23, now);
       osc.frequency.setValueAtTime(261.63, now + 0.12);
-      gain.gain.setValueAtTime(0.18, now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.35);
+      gain.gain.setValueAtTime(vol * 0.25, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.38);
       osc.start(now);
-      osc.stop(now + 0.36);
-    } else if (kind === 'recovered') {
+      osc.stop(now + 0.4);
+    } else if (kind === 'recovered' || kind === 'healthy') {
       osc.type = 'sine';
       osc.frequency.setValueAtTime(523.25, now);
       osc.frequency.setValueAtTime(783.99, now + 0.08);
-      gain.gain.setValueAtTime(0.15, now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.3);
+      gain.gain.setValueAtTime(vol * 0.2, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.35);
       osc.start(now);
-      osc.stop(now + 0.31);
+      osc.stop(now + 0.36);
     } else {
       osc.type = 'sine';
       osc.frequency.setValueAtTime(659.25, now);
-      gain.gain.setValueAtTime(0.08, now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
+      gain.gain.setValueAtTime(vol * 0.15, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.2);
       osc.start(now);
-      osc.stop(now + 0.19);
+      osc.stop(now + 0.22);
     }
   } catch {
     // Audio context may fail if audio is not permitted yet
@@ -343,7 +388,7 @@ async function openDashboard() {
 }
 
 function renderShell() {
-  const role = isAdmin() ? 'Super Admin' : 'Viewer';
+  const role = isAdmin() ? 'Super Admin' : (isOperator() ? 'Operator' : 'Viewer');
   root.innerHTML = `
     <main class="app-shell">
       <aside class="sidebar">
@@ -440,7 +485,7 @@ function renderIncidentsList(activeIncidents) {
   const incidents = document.getElementById('incident-list');
   if (!incidents) return;
   const markup = activeIncidents.length ? activeIncidents.map((incident) => `
-    <div class="incident"><div class="incident-meta">${badge(incident.severity === 'critical' ? 'down' : 'warning', incident.severity)}<time datetime="${escapeHtml(incident.startedAt)}">${escapeHtml(prettyTime(incident.startedAt))}</time></div><h4>${escapeHtml(incident.targetName)}</h4><span class="location-label">${escapeHtml(incident.locationName)}</span><p>${escapeHtml(incident.message)}</p>${isAdmin() && !incident.acknowledgedAt ? `<div><button class="button secondary small" data-ack="${incident.id}">Acknowledge</button></div>` : incident.acknowledgedAt ? `<span class="muted">Acknowledged ${escapeHtml(prettyTime(incident.acknowledgedAt))}</span>` : ''}</div>`).join('') : '<div class="empty">No active incidents. Monitoring is currently clear.</div>';
+    <div class="incident"><div class="incident-meta">${badge(incident.severity === 'critical' ? 'down' : 'warning', incident.severity)}<time datetime="${escapeHtml(incident.startedAt)}">${escapeHtml(prettyTime(incident.startedAt))}</time></div><h4>${escapeHtml(incident.targetName)}</h4><span class="location-label">${escapeHtml(incident.locationName)}</span><p>${escapeHtml(incident.message)}</p>${canOperate() && !incident.acknowledgedAt ? `<div><button class="button secondary small" data-ack="${incident.id}">Acknowledge</button></div>` : incident.acknowledgedAt ? `<span class="muted">Acknowledged ${escapeHtml(prettyTime(incident.acknowledgedAt))}</span>` : ''}</div>`).join('') : '<div class="empty">No active incidents. Monitoring is currently clear.</div>';
   if (incidents._lastMarkup !== markup) {
     incidents.innerHTML = markup;
     incidents._lastMarkup = markup;
@@ -515,25 +560,60 @@ function updateOverviewLive() {
 }
 
 function monitorRowMarkup(target) {
+  const latencyDisplay = target.lastLatencyMs === null || target.lastLatencyMs === undefined ? '—' : `${target.lastLatencyMs} ms`;
+  const slaDisplay = target.uptimePercent !== undefined && target.uptimePercent !== null ? `${target.uptimePercent}% SLA` : '100% SLA';
   return `
     <tr data-target-id="${target.id}">
       <td class="target-name-cell"><div class="target-name">${escapeHtml(target.name)}<small>${escapeHtml(targetDestination(target))}${target.enabled ? '' : ' · disabled'}</small></div></td>
       <td class="target-location-cell">${escapeHtml(target.locationName)}</td>
       <td class="target-type-cell">${escapeHtml(prettyType(target.type))}</td>
       <td class="target-status-cell">${target.enabled ? badge(target.status) : badge('unknown', 'disabled')}</td>
+      <td class="target-latency-cell">
+        <div class="latency-cell-content">
+          <span class="latency-val">${latencyDisplay}</span>
+          <div class="sparkline-wrap" title="Recent check latencies">${renderSparklineSvg(target.sparkline)}</div>
+        </div>
+      </td>
+      <td class="target-sla-cell"><span class="uptime-badge" title="30-day availability SLA">${slaDisplay}</span></td>
       <td class="target-time-cell"><time class="timestamp" datetime="${escapeHtml(target.lastCheckedAt || '')}">${escapeHtml(prettyTime(target.lastCheckedAt))}</time></td>
-      <td class="target-latency-cell">${target.lastLatencyMs === null || target.lastLatencyMs === undefined ? '—' : `${target.lastLatencyMs} ms`}</td>
-      ${isAdmin() ? `<td><div class="actions" style="margin:0"><button class="button secondary small" data-run="${target.id}">Run</button><button class="button ghost small" data-edit="${target.id}">Edit</button><button class="button danger small" data-delete="${target.id}">Delete</button></div></td>` : ''}
+      ${canOperate() ? `<td><div class="actions" style="margin:0"><button class="button secondary small" data-run="${target.id}">Run</button>${isAdmin() ? `<button class="button ghost small" data-edit="${target.id}">Edit</button><button class="button danger small" data-delete="${target.id}">Delete</button>` : ''}</div></td>` : ''}
     </tr>`;
 }
 
 function renderMonitors(content) {
   const targets = state.dashboard.targets;
   content.innerHTML = `
-    <header class="page-header"><div><h2>Monitors</h2><p>Configure local connectivity, server, and service checks.</p></div><div class="header-tools">${liveClockMarkup()}${isAdmin() ? '<button class="button" id="add-monitor">+ Add monitor</button>' : '<div class="status-line">Viewer access · configuration locked</div>'}</div></header>
-    <article class="card"><div class="table-wrap"><table><thead><tr><th>Monitor</th><th>Location</th><th>Type</th><th>Status</th><th>Last check</th><th>Latency</th>${isAdmin() ? '<th>Actions</th>' : ''}</tr></thead><tbody id="monitor-table">${targets.length ? targets.map(monitorRowMarkup).join('') : `<tr><td colspan="${isAdmin() ? 7 : 6}" class="empty">No monitors configured.</td></tr>`}</tbody></table></div></article>`;
-  if (!isAdmin()) return;
-  document.getElementById('add-monitor')?.addEventListener('click', () => openMonitorDialog());
+    <header class="page-header"><div><h2>Monitors</h2><p>Configure local connectivity, server, and service checks.</p></div><div class="header-tools">${liveClockMarkup()}${isAdmin() ? `
+      <div class="btn-group">
+        <button class="button" id="add-monitor">+ Add monitor</button>
+        <button class="button secondary" id="export-monitors" title="Export monitor definitions as JSON">Export JSON</button>
+        <button class="button secondary" id="import-monitors" title="Import monitor definitions from JSON">Import JSON</button>
+      </div>` : (isOperator() ? '<div class="status-line"><span class="badge operator">Operator</span> · manual checks enabled</div>' : '<div class="status-line">Viewer access · configuration locked</div>')}</div></header>
+    <article class="card"><div class="table-wrap"><table><thead><tr><th>Monitor</th><th>Location</th><th>Type</th><th>Status</th><th>Latency &amp; Trend</th><th>30d SLA</th><th>Last check</th>${canOperate() ? '<th>Actions</th>' : ''}</tr></thead><tbody id="monitor-table">${targets.length ? targets.map(monitorRowMarkup).join('') : `<tr><td colspan="${canOperate() ? 8 : 7}" class="empty">No monitors configured.</td></tr>`}</tbody></table></div></article>`;
+  if (isAdmin()) {
+    document.getElementById('add-monitor')?.addEventListener('click', () => openMonitorDialog());
+    document.getElementById('export-monitors')?.addEventListener('click', async () => {
+      try {
+        const res = await request(() => remoteCare.exportMonitors(state.session.token));
+        if (!res.cancelled) {
+          flash(`Exported ${res.count} monitor(s) successfully.`, 'info');
+        }
+      } catch (err) {
+        flash(err.message, 'down');
+      }
+    });
+    document.getElementById('import-monitors')?.addEventListener('click', async () => {
+      try {
+        const res = await request(() => remoteCare.importMonitors(state.session.token));
+        if (!res.cancelled) {
+          flash(`Import completed: ${res.importedCount ?? 0} imported, ${res.skippedCount ?? 0} skipped, ${res.overwrittenCount ?? 0} updated.`, 'info');
+          await refreshDashboard(true);
+        }
+      } catch (err) {
+        flash(err.message, 'down');
+      }
+    });
+  }
   attachMonitorTableListeners(document.getElementById('monitor-table'));
 }
 
@@ -565,12 +645,14 @@ function attachMonitorTableListeners(body) {
       button.disabled = false;
     }
   }));
-  body.querySelectorAll('[data-edit]').forEach((button) => button.addEventListener('click', () => openMonitorDialog(targets.find((target) => target.id === Number(button.dataset.edit)))));
-  body.querySelectorAll('[data-delete]').forEach((button) => button.addEventListener('click', async () => {
-    const target = targets.find((item) => item.id === Number(button.dataset.delete));
-    if (!window.confirm(`Delete monitor “${target.name}”? Its local history will also be removed.`)) return;
-    try { await request(() => remoteCare.deleteTarget(state.session.token, target.id)); await refreshDashboard(true); } catch (error) { flash(error.message, 'down'); }
-  }));
+  if (isAdmin()) {
+    body.querySelectorAll('[data-edit]').forEach((button) => button.addEventListener('click', () => openMonitorDialog(targets.find((target) => target.id === Number(button.dataset.edit)))));
+    body.querySelectorAll('[data-delete]').forEach((button) => button.addEventListener('click', async () => {
+      const target = targets.find((item) => item.id === Number(button.dataset.delete));
+      if (!window.confirm(`Delete monitor “${target.name}”? Its local history will also be removed.`)) return;
+      try { await request(() => remoteCare.deleteTarget(state.session.token, target.id)); await refreshDashboard(true); } catch (error) { flash(error.message, 'down'); }
+    }));
+  }
 }
 
 function updateMonitorsLive() {
@@ -578,7 +660,7 @@ function updateMonitorsLive() {
   if (!body) return;
   const targets = state.dashboard.targets;
   if (!targets.length) {
-    body.innerHTML = `<tr><td colspan="${isAdmin() ? 7 : 6}" class="empty">No monitors configured.</td></tr>`;
+    body.innerHTML = `<tr><td colspan="${canOperate() ? 8 : 7}" class="empty">No monitors configured.</td></tr>`;
     return;
   }
   const currentRows = Array.from(body.querySelectorAll('tr[data-target-id]'));
@@ -609,15 +691,25 @@ function updateMonitorsLive() {
     const newStatus = target.enabled ? badge(target.status) : badge('unknown', 'disabled');
     if (statusCell && statusCell.innerHTML !== newStatus) statusCell.innerHTML = newStatus;
 
+    const latencyCell = row.querySelector('.target-latency-cell');
+    const latencyDisplay = target.lastLatencyMs === null || target.lastLatencyMs === undefined ? '—' : `${target.lastLatencyMs} ms`;
+    const newLatencyMarkup = `
+      <div class="latency-cell-content">
+        <span class="latency-val">${latencyDisplay}</span>
+        <div class="sparkline-wrap" title="Recent check latencies">${renderSparklineSvg(target.sparkline)}</div>
+      </div>`;
+    if (latencyCell && latencyCell.innerHTML.trim() !== newLatencyMarkup.trim()) latencyCell.innerHTML = newLatencyMarkup;
+
+    const slaCell = row.querySelector('.target-sla-cell');
+    const slaDisplay = target.uptimePercent !== undefined && target.uptimePercent !== null ? `${target.uptimePercent}% SLA` : '100% SLA';
+    const newSlaMarkup = `<span class="uptime-badge" title="30-day availability SLA">${slaDisplay}</span>`;
+    if (slaCell && slaCell.innerHTML !== newSlaMarkup) slaCell.innerHTML = newSlaMarkup;
+
     const timeCell = row.querySelector('.target-time-cell');
     const timeVal = escapeHtml(prettyTime(target.lastCheckedAt));
     const dtVal = escapeHtml(target.lastCheckedAt || '');
     const newTime = `<time class="timestamp" datetime="${dtVal}">${timeVal}</time>`;
     if (timeCell && timeCell.innerHTML !== newTime) timeCell.innerHTML = newTime;
-
-    const latencyCell = row.querySelector('.target-latency-cell');
-    const newLatency = target.lastLatencyMs === null || target.lastLatencyMs === undefined ? '—' : `${target.lastLatencyMs} ms`;
-    if (latencyCell && latencyCell.textContent !== newLatency) latencyCell.textContent = newLatency;
   }
 }
 
@@ -679,7 +771,7 @@ async function renderHistory(content) {
       <div class="field"><label for="history-from">From date &amp; time</label><input id="history-from" name="from" type="datetime-local" step="1" value="${escapeHtml(toDateTimeLocal(filters.from))}" /></div>
       <div class="field"><label for="history-to">To date &amp; time</label><input id="history-to" name="to" type="datetime-local" step="1" value="${escapeHtml(toDateTimeLocal(filters.to))}" /></div>
       <div class="field"><label for="history-monitor">Monitor</label><select id="history-monitor" name="targetId"><option value="">All monitors</option>${targetOptions}</select></div>
-      <div class="field"><label for="history-type">Monitor type</label><select id="history-type" name="type"><option value="">All types</option><option value="internet" ${selected('type', 'internet')}>Internet</option><option value="interface" ${selected('type', 'interface')}>Network interface</option><option value="gateway" ${selected('type', 'gateway')}>Default gateway</option><option value="ping" ${selected('type', 'ping')}>ICMP ping</option><option value="tcp" ${selected('type', 'tcp')}>TCP port</option><option value="http" ${selected('type', 'http')}>HTTP/HTTPS</option><option value="system_service" ${selected('type', 'system_service')}>Local service</option><option value="process" ${selected('type', 'process')}>Local process</option></select></div>
+      <div class="field"><label for="history-type">Monitor type</label><select id="history-type" name="type"><option value="">All types</option><option value="internet" ${selected('type', 'internet')}>Internet</option><option value="interface" ${selected('type', 'interface')}>Network interface</option><option value="gateway" ${selected('type', 'gateway')}>Default gateway</option><option value="ping" ${selected('type', 'ping')}>ICMP ping</option><option value="tcp" ${selected('type', 'tcp')}>TCP port</option><option value="http" ${selected('type', 'http')}>HTTP/HTTPS</option><option value="system_service" ${selected('type', 'system_service')}>Local service</option><option value="process" ${selected('type', 'process')}>Local process</option><option value="disk" ${selected('type', 'disk')}>Disk storage</option><option value="memory" ${selected('type', 'memory')}>System RAM</option><option value="cpu" ${selected('type', 'cpu')}>CPU utilization</option><option value="command" ${selected('type', 'command')}>Custom script</option></select></div>
       <div class="field"><label for="history-outcome">Outcome</label><select id="history-outcome" name="outcome"><option value="all" ${selected('outcome', 'all')}>All outcomes</option><option value="success" ${selected('outcome', 'success')}>Successful checks</option><option value="failure" ${selected('outcome', 'failure')}>Failed checks</option></select></div>
       <div class="field"><label for="history-status">Recorded status</label><select id="history-status" name="status"><option value="">All statuses</option><option value="healthy" ${selected('status', 'healthy')}>Healthy</option><option value="warning" ${selected('status', 'warning')}>Warning</option><option value="down" ${selected('status', 'down')}>Down</option><option value="unknown" ${selected('status', 'unknown')}>Unknown</option></select></div>
       <div class="field"><label for="history-location">Location</label><input id="history-location" name="location" maxlength="100" value="${escapeHtml(filters.location || '')}" placeholder="e.g. Bengaluru office" /></div>
@@ -734,20 +826,21 @@ async function renderHistory(content) {
 
 async function renderUsers(content) {
   if (!isAdmin()) {
-    content.innerHTML = `<header class="page-header"><div><h2>Local users</h2><p>Viewer accounts can see monitoring status and history but cannot make changes.</p></div>${liveClockMarkup()}</header><article class="card"><div class="panel-body"><div class="empty">You are signed in as a Viewer. User management is available only to the Super Admin.</div></div></article>`;
+    const roleTitle = isOperator() ? 'Operator' : 'Viewer';
+    content.innerHTML = `<header class="page-header"><div><h2>Local users</h2><p>Accounts can see monitoring status and history.</p></div>${liveClockMarkup()}</header><article class="card"><div class="panel-body"><div class="empty">You are signed in as a ${roleTitle}. User management is available only to the Super Admin.</div></div></article>`;
     return;
   }
-  content.innerHTML = `<header class="page-header"><div><h2>Local users</h2><p>One Super Admin and a maximum of five Viewer accounts are stored only on this PC.</p></div><div class="header-tools">${liveClockMarkup()}<button class="button" id="add-viewer">+ Add Viewer</button></div></header><article class="card"><div class="table-wrap"><table><thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Last sign-in</th><th>Status</th><th>Actions</th></tr></thead><tbody id="user-table"><tr><td colspan="6" class="empty">Loading users…</td></tr></tbody></table></div></article>`;
+  content.innerHTML = `<header class="page-header"><div><h2>Local users</h2><p>One Super Admin and up to five Operator/Viewer accounts are stored locally on this PC.</p></div><div class="header-tools">${liveClockMarkup()}<button class="button" id="add-viewer">+ Add User</button></div></header><article class="card"><div class="table-wrap"><table><thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Last sign-in</th><th>Status</th><th>Actions</th></tr></thead><tbody id="user-table"><tr><td colspan="6" class="empty">Loading users…</td></tr></tbody></table></div></article>`;
   try {
     state.users = await request(() => remoteCare.listUsers(state.session.token));
     const body = document.getElementById('user-table');
     body.innerHTML = state.users.map((user) => `<tr>
       <td>${escapeHtml(user.displayName)}</td>
       <td>${escapeHtml(user.username)}</td>
-      <td>${escapeHtml(user.role === 'super_admin' ? 'Super Admin' : 'Viewer')}</td>
+      <td>${escapeHtml(user.role === 'super_admin' ? 'Super Admin' : (user.role === 'operator' ? 'Operator' : 'Viewer'))}</td>
       <td>${escapeHtml(user.lastLoginAt ? prettyTime(user.lastLoginAt) : 'Never')}</td>
       <td>${badge(user.active ? 'healthy' : 'down', user.active ? 'active' : 'disabled')}</td>
-      <td>${user.role === 'viewer' ? `<div class="actions" style="margin:0"><button class="button ghost small" data-edit-viewer="${user.id}">Edit</button><button class="button ghost small" data-password="${user.id}">Password</button><button class="button ${user.active ? 'danger' : 'secondary'} small" data-toggle="${user.id}" data-active="${user.active}">${user.active ? 'Disable' : 'Enable'}</button></div>` : `<div class="actions" style="margin:0"><button class="button ghost small" id="edit-admin-profile">Profile</button></div>`}</td>
+      <td>${user.role !== 'super_admin' ? `<div class="actions" style="margin:0"><button class="button ghost small" data-edit-viewer="${user.id}">Edit</button><button class="button ghost small" data-password="${user.id}">Password</button><button class="button ${user.active ? 'danger' : 'secondary'} small" data-toggle="${user.id}" data-active="${user.active}">${user.active ? 'Disable' : 'Enable'}</button></div>` : `<div class="actions" style="margin:0"><button class="button ghost small" id="edit-admin-profile">Profile</button></div>`}</td>
     </tr>`).join('');
     document.getElementById('add-viewer').addEventListener('click', openViewerDialog);
     document.getElementById('edit-admin-profile')?.addEventListener('click', openProfileDialog);
@@ -772,7 +865,7 @@ async function renderSettings(content) {
   const settings = state.settings;
   const checked = (name) => settings[name] ? 'checked' : '';
   content.innerHTML = `
-    <header class="page-header"><div><h2>Settings</h2><p>Choose how the monitor behaves in the background and which alerts appear on this device.</p></div>${liveClockMarkup()}</header>
+    <header class="page-header"><div><h2>Settings</h2><p>Configure background monitoring, audio alerts, webhooks, and cloud publishing.</p></div>${liveClockMarkup()}</header>
     <form id="settings-form" class="settings-form">
       <article class="card"><div class="panel-title"><h3>Background behavior</h3><span>System tray</span></div><div class="panel-body settings-list">
         <label class="setting-row"><span><strong>Always run from the system tray</strong><small>Minimizing or closing the dashboard always keeps monitoring active in the background. Quitting requires the Super Admin password.</small></span><input name="minimizeToTray" type="checkbox" checked disabled aria-label="Always enabled" /></label>
@@ -781,31 +874,145 @@ async function renderSettings(content) {
       <article class="card"><div class="panel-title"><h3>Alert notifications</h3><span>Desktop and in-app</span></div><div class="panel-body settings-list">
         <label class="setting-row"><span><strong>Failure and warning alerts</strong><small>Show a desktop popup whenever a monitor changes to warning or down, including while the dashboard is hidden.</small></span><input name="showFailureNotifications" type="checkbox" ${checked('showFailureNotifications')} /></label>
         <label class="setting-row"><span><strong>Healthy and recovery alerts</strong><small>Show a desktop popup whenever a monitor becomes healthy, including its first successful check.</small></span><input name="showRecoveryNotifications" type="checkbox" ${checked('showRecoveryNotifications')} /></label>
-        <label class="setting-row"><span><strong>Notification duration (seconds)</strong><small>Automatically close each new notification after this time. Default: 5 seconds; allowed: 1–300 seconds. Applies to desktop popups, tray reminders, and in-app toasts.</small></span><input name="notificationDurationSeconds" type="number" min="1" max="300" step="1" required value="${settings.notificationDurationSeconds}" /></label>
-        <div class="setting-row notification-test"><span><strong>Test desktop alert</strong><small>Show a test popup now. This bypasses the two alert toggles so you can verify system permissions and placement.</small></span><button class="button secondary small" id="test-notification" type="button">Show test alert</button></div>
+        <label class="setting-row"><span><strong>Notification duration (seconds)</strong><small>Automatically close each new notification after this time. Default: 5 seconds; allowed: 1–300 seconds.</small></span><input name="notificationDurationSeconds" type="number" min="1" max="300" step="1" required value="${settings.notificationDurationSeconds ?? 5}" /></label>
+        <div class="setting-row notification-test"><span><strong>Test desktop alert</strong><small>Show a test popup now to verify system permissions and placement.</small></span><button class="button secondary small" id="test-notification" type="button">Show test alert</button></div>
+      </div></article>
+      <article class="card"><div class="panel-title"><h3>Sound / Audio alerts</h3><span>Web Audio API synthesized chimes</span></div><div class="panel-body settings-list">
+        <label class="setting-row"><span><strong>Enable sound alerts</strong><small>Play an audible alert chime when a monitor fails or recovers.</small></span><input name="soundAlertsEnabled" type="checkbox" ${checked('soundAlertsEnabled')} /></label>
+        <div class="setting-row"><span><strong>Alert volume (<span id="sound-volume-label">${settings.soundVolume ?? 70}%</span>)</strong><small>Adjust volume level for audible alert chimes.</small></span><div style="display:flex;align-items:center;gap:10px"><input name="soundVolume" type="range" min="0" max="100" step="5" value="${settings.soundVolume ?? 70}" id="sound-volume-slider" style="width:130px" /><button class="button secondary small" type="button" id="test-sound">Test sound</button></div></div>
+      </div></article>
+      <article class="card"><div class="panel-title"><h3>Team webhooks</h3><span>Slack, Discord, Teams, Telegram, Generic</span></div><div class="panel-body settings-list">
+        <label class="setting-row"><span><strong>Enable team webhook</strong><small>Dispatch incident alerts to external chat platforms or webhook endpoints.</small></span><input name="webhookEnabled" type="checkbox" ${checked('webhookEnabled')} /></label>
+        <div class="field" style="margin-top:10px"><label>Webhook provider</label><select name="webhookType"><option value="generic" ${settings.webhookType === 'generic' ? 'selected' : ''}>Generic JSON (HTTP POST)</option><option value="slack" ${settings.webhookType === 'slack' ? 'selected' : ''}>Slack Incoming Webhook</option><option value="discord" ${settings.webhookType === 'discord' ? 'selected' : ''}>Discord Webhook</option><option value="teams" ${settings.webhookType === 'teams' ? 'selected' : ''}>Microsoft Teams Webhook</option><option value="telegram" ${settings.webhookType === 'telegram' ? 'selected' : ''}>Telegram Bot API</option></select></div>
+        <div class="field"><label>Destination URL</label><input name="webhookUrl" type="url" value="${escapeHtml(settings.webhookUrl || '')}" placeholder="https://hooks.slack.com/services/..." /><span class="helper">For Telegram: https://api.telegram.org/bot&lt;TOKEN&gt;/sendMessage?chat_id=&lt;CHAT_ID&gt;</span></div>
+        <div class="field"><label>Event filter</label><select name="webhookEvents"><option value="failures_only" ${settings.webhookEvents === 'failures_only' ? 'selected' : ''}>Only failures and warnings</option><option value="all" ${settings.webhookEvents === 'all' ? 'selected' : ''}>All state transitions (failures &amp; recoveries)</option></select></div>
+        <div class="setting-row notification-test"><span><strong>Verify webhook connection</strong><small>Dispatch a test payload now to confirm endpoint availability.</small></span><button class="button secondary small" id="test-webhook" type="button">Send test webhook</button></div>
+      </div></article>
+      <article class="card"><div class="panel-title"><h3>Cloud telemetry &amp; heartbeat</h3><span>Outbound sync engine</span></div><div class="panel-body settings-list">
+        <label class="setting-row"><span><strong>Enable cloud telemetry</strong><small>Publish outbound monitoring events and periodic device heartbeats over HTTPS.</small></span><input name="cloudSyncEnabled" type="checkbox" ${checked('cloudSyncEnabled')} /></label>
+        <div class="field" style="margin-top:10px"><label>Cloud ingest HTTPS URL</label><input name="cloudHttpsUrl" type="url" value="${escapeHtml(settings.cloudHttpsUrl || '')}" placeholder="https://care-cloud.example.com/api/v1/telemetry/batch" /></div>
+        <div class="field"><label>Bearer auth token</label><input name="cloudAuthToken" type="password" value="${escapeHtml(settings.cloudAuthToken || '')}" placeholder="Optional Bearer token" /></div>
+        <div class="field"><label>Periodic heartbeat interval (minutes)</label><input name="cloudHeartbeatMinutes" type="number" min="1" max="1440" value="${settings.cloudHeartbeatMinutes ?? 5}" required /></div>
+        <div class="setting-row notification-test"><span><strong>Sync pending events now</strong><small id="cloud-sync-status-text">Checking queue status…</small></span><button class="button secondary small" id="trigger-cloud-sync" type="button">Publish now</button></div>
+      </div></article>
+      <article class="card"><div class="panel-title"><h3>Backup &amp; Migration</h3><span>JSON import / export</span></div><div class="panel-body settings-list">
+        <div class="setting-row"><span><strong>Export monitor definitions</strong><small>Download your configured monitors as a JSON file for backup.</small></span><button class="button secondary small" id="settings-export-monitors" type="button">Export JSON</button></div>
+        <div class="setting-row"><span><strong>Import monitor definitions</strong><small>Load monitors from a JSON file. Duplicates will be safely handled.</small></span><button class="button secondary small" id="settings-import-monitors" type="button">Import JSON</button></div>
       </div></article>
       <article class="card"><div class="panel-title"><h3>Protected exit</h3><span>Super Admin only</span></div><div class="panel-body protected-exit"><div><strong>Quit Remote Care Monitor</strong><p class="helper">To stop local monitoring, confirm the current Super Admin password. Closing this dashboard only sends it back to the system tray.</p></div><button class="button danger" type="button" id="request-quit">Quit app…</button></div></article>
-      <div class="actions"><button class="button" type="submit">Save settings</button><span class="helper settings-help">Alert history remains available on the overview even when a display notification is turned off.</span></div>
+      <div class="actions"><button class="button" type="submit">Save settings</button><span class="helper settings-help">All monitoring settings and credentials are encrypted or stored locally.</span></div>
       <div class="error" id="settings-error"></div>
     </form>`;
+
   const form = document.getElementById('settings-form');
+  const error = document.getElementById('settings-error');
+
+  const updateCloudStatus = async () => {
+    const statusEl = document.getElementById('cloud-sync-status-text');
+    if (!statusEl) return;
+    try {
+      const status = await remoteCare.getCloudSyncStatus(state.session.token);
+      statusEl.textContent = `Pending events: ${status?.pendingCount ?? 0}${status?.lastAttemptAt ? ` · Last attempt: ${prettyTime(status.lastAttemptAt)}` : ''}`;
+    } catch {
+      statusEl.textContent = 'Queue status unavailable';
+    }
+  };
+  void updateCloudStatus();
+
+  document.getElementById('sound-volume-slider')?.addEventListener('input', (e) => {
+    const label = document.getElementById('sound-volume-label');
+    if (label) label.textContent = `${e.target.value}%`;
+  });
+
+  document.getElementById('test-sound')?.addEventListener('click', () => {
+    const slider = document.getElementById('sound-volume-slider');
+    if (slider) {
+      if (state.settings) state.settings.soundVolume = Number(slider.value);
+    }
+    playNotificationChime('down', true);
+  });
+
+  document.getElementById('test-webhook')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    error.textContent = '';
+    button.disabled = true;
+    try {
+      const res = await request(() => remoteCare.testWebhook(state.session.token));
+      flash(res?.message || 'Test webhook delivered successfully!', 'info');
+    } catch (err) {
+      error.textContent = err.message || 'Failed to dispatch test webhook.';
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  document.getElementById('trigger-cloud-sync')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    error.textContent = '';
+    button.disabled = true;
+    try {
+      const res = await request(() => remoteCare.triggerCloudSync(state.session.token));
+      flash(`Cloud sync triggered: ${res?.deliveredCount ?? 0} event(s) published.`, 'info');
+      await updateCloudStatus();
+    } catch (err) {
+      error.textContent = err.message || 'Cloud sync failed.';
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  document.getElementById('settings-export-monitors')?.addEventListener('click', async () => {
+    try {
+      const res = await request(() => remoteCare.exportMonitors(state.session.token));
+      if (!res.cancelled) flash(`Exported ${res.count} monitor(s) successfully.`, 'info');
+    } catch (err) {
+      flash(err.message, 'down');
+    }
+  });
+
+  document.getElementById('settings-import-monitors')?.addEventListener('click', async () => {
+    try {
+      const res = await request(() => remoteCare.importMonitors(state.session.token));
+      if (!res.cancelled) {
+        flash(`Import completed: ${res.importedCount ?? 0} imported, ${res.skippedCount ?? 0} skipped, ${res.overwrittenCount ?? 0} updated.`, 'info');
+        await refreshDashboard(true);
+      }
+    } catch (err) {
+      flash(err.message, 'down');
+    }
+  });
+
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
-    const error = document.getElementById('settings-error');
     error.textContent = '';
-    const next = Object.fromEntries(Object.keys(settings).map((name) => [name,
-      name === 'notificationDurationSeconds' ? form.elements[name].valueAsNumber : form.elements[name].checked
-    ]));
+    const next = {
+      minimizeToTray: true,
+      showTrayReminder: Boolean(form.elements.showTrayReminder?.checked),
+      showFailureNotifications: Boolean(form.elements.showFailureNotifications?.checked),
+      showRecoveryNotifications: Boolean(form.elements.showRecoveryNotifications?.checked),
+      notificationDurationSeconds: form.elements.notificationDurationSeconds ? form.elements.notificationDurationSeconds.valueAsNumber : 5,
+      soundAlertsEnabled: Boolean(form.elements.soundAlertsEnabled?.checked),
+      soundVolume: form.elements.soundVolume ? Number(form.elements.soundVolume.value) : 70,
+      webhookEnabled: Boolean(form.elements.webhookEnabled?.checked),
+      webhookType: form.elements.webhookType?.value || 'generic',
+      webhookUrl: form.elements.webhookUrl?.value?.trim() || '',
+      webhookEvents: form.elements.webhookEvents?.value || 'failures_only',
+      cloudSyncEnabled: Boolean(form.elements.cloudSyncEnabled?.checked),
+      cloudSyncProtocol: 'https',
+      cloudHttpsUrl: form.elements.cloudHttpsUrl?.value?.trim() || '',
+      cloudAuthToken: form.elements.cloudAuthToken?.value?.trim() || '',
+      cloudHeartbeatMinutes: form.elements.cloudHeartbeatMinutes ? form.elements.cloudHeartbeatMinutes.valueAsNumber : 5
+    };
     try {
       state.settings = await request(() => remoteCare.saveAppSettings(state.session.token, next));
-      flash('Settings saved.');
+      flash('Settings saved successfully.');
     } catch (exception) {
       error.textContent = exception.message || 'Unable to save settings.';
     }
   });
-  document.getElementById('test-notification').addEventListener('click', async (event) => {
+
+  document.getElementById('test-notification')?.addEventListener('click', async (event) => {
     const button = event.currentTarget;
-    const error = document.getElementById('settings-error');
     error.textContent = '';
     button.disabled = true;
     try {
@@ -817,7 +1024,8 @@ async function renderSettings(content) {
       button.disabled = false;
     }
   });
-  document.getElementById('request-quit').addEventListener('click', () => openQuitDialog('settings'));
+
+  document.getElementById('request-quit')?.addEventListener('click', () => openQuitDialog('settings'));
 }
 
 async function renderAbout(content) {
@@ -833,10 +1041,20 @@ async function renderAbout(content) {
 
 function monitorFields(type) {
   const visibility = {
-    host: ['ping', 'tcp'].includes(type), port: type === 'tcp', url: ['http', 'internet'].includes(type),
-    interface: type === 'interface', service: type === 'system_service', process: type === 'process', dns: type === 'internet'
+    host: ['ping', 'tcp'].includes(type),
+    port: type === 'tcp',
+    url: ['http', 'internet'].includes(type),
+    interface: type === 'interface',
+    service: type === 'system_service',
+    process: type === 'process',
+    dns: type === 'internet',
+    disk: type === 'disk',
+    threshold: ['disk', 'memory', 'cpu'].includes(type),
+    command: type === 'command'
   };
-  document.querySelectorAll('[data-monitor-field]').forEach((element) => element.classList.toggle('hidden', !visibility[element.dataset.monitorField]));
+  document.querySelectorAll('[data-monitor-field]').forEach((element) => {
+    element.classList.toggle('hidden', !visibility[element.dataset.monitorField]);
+  });
 }
 
 function interfaceOptions(current = 'auto') {
@@ -873,7 +1091,20 @@ function openMonitorDialog(target = null) {
     <div class="dialog-header"><h3>${target ? 'Edit monitor' : 'Add monitor'}</h3><button class="button ghost small" type="button" data-close>Close</button></div>
     <form id="monitor-form"><div class="dialog-body">
       <div class="two-col"><div class="field"><label>Name</label><input name="name" required maxlength="80" value="${value('name')}" placeholder="Production API" /></div><div class="field"><label>Location name</label><input name="locationName" required minlength="2" maxlength="100" value="${value('locationName', 'Local device')}" placeholder="e.g. Bengaluru office" /></div></div>
-      <div class="field"><label>Check type</label><select name="type"><option value="internet">Internet connection</option><option value="interface">Network interface</option><option value="gateway">Default gateway</option><option value="ping">ICMP ping</option><option value="tcp">TCP port</option><option value="http">HTTP/HTTPS endpoint</option><option value="system_service">Local system service</option><option value="process">Local process</option></select></div>
+      <div class="field"><label>Check type</label><select name="type">
+        <option value="internet">Internet connection</option>
+        <option value="interface">Network interface</option>
+        <option value="gateway">Default gateway</option>
+        <option value="ping">ICMP ping</option>
+        <option value="tcp">TCP port</option>
+        <option value="http">HTTP/HTTPS endpoint</option>
+        <option value="system_service">Local system service</option>
+        <option value="process">Local process</option>
+        <option value="disk">Disk storage usage</option>
+        <option value="memory">System RAM usage</option>
+        <option value="cpu">CPU utilization</option>
+        <option value="command">Custom script / command</option>
+      </select></div>
       <div class="field" data-monitor-field="host"><label>Host or IP address</label><input name="host" value="${value('host')}" placeholder="192.168.1.20 or api.example.com" /></div>
       <div class="field" data-monitor-field="port"><label>TCP port</label><input name="port" type="number" min="1" max="65535" value="${value('port')}" placeholder="1883" /></div>
       <div class="field" data-monitor-field="url"><label>HTTP/HTTPS URL</label><input name="url" type="url" value="${value('url')}" placeholder="https://api.example.com/health" /></div>
@@ -881,6 +1112,10 @@ function openMonitorDialog(target = null) {
       <div class="field" data-monitor-field="interface"><label>Network interface to monitor</label><select name="interfaceName">${interfaceOptions(target?.interfaceName || 'auto')}</select><span class="helper">Select “Wi-Fi / Wireless” or a specific adapter (e.g. en0) to alert immediately when Wi-Fi is disconnected.</span></div>
       <div class="field" data-monitor-field="service"><label>Service name</label><input name="serviceName" value="${value('serviceName')}" placeholder="mosquitto.service or Mosquitto" /><span class="helper">Linux/Raspberry Pi uses systemd; Windows uses the Windows Service name; macOS uses a launchd label.</span></div>
       <div class="field" data-monitor-field="process"><label>Process name</label><input name="processName" value="${value('processName')}" placeholder="node or python3" /></div>
+      <div class="field" data-monitor-field="disk"><label>Storage mount / folder path</label><input name="diskPath" value="${escapeHtml(metadata.path || (navigator.platform?.startsWith('Win') ? 'C:\\' : '/'))}" placeholder="/" /><span class="helper">Filesystem root or partition mount path to inspect.</span></div>
+      <div class="field" data-monitor-field="threshold"><label>Alert utilization threshold (%)</label><input name="thresholdPercent" type="number" min="1" max="100" value="${escapeHtml(metadata.thresholdPercent ?? '90')}" placeholder="90" /><span class="helper">Alert triggers when usage reaches or exceeds this percentage.</span></div>
+      <div class="field" data-monitor-field="command"><label>Shell command or script</label><textarea name="commandScript" rows="2" placeholder="e.g. ping -c 1 internal.db || exit 1">${escapeHtml(metadata.command || target?.host || '')}</textarea><span class="helper">Command run in system shell. Non-zero exit code or timeout flags an incident.</span></div>
+      <div class="two-col" data-monitor-field="command"><div class="field"><label>Expected exit code</label><input name="expectedExitCode" type="number" value="${escapeHtml(metadata.expectedExitCode ?? '0')}" placeholder="0" /></div><div class="field"><label>Expected output (regex/text)</label><input name="expectedOutput" value="${escapeHtml(metadata.expectedOutput || '')}" placeholder="Optional match pattern" /></div></div>
       <div class="two-col"><div class="field"><label>Check every (seconds)</label><input name="intervalSeconds" type="number" min="2" max="86400" value="${value('intervalSeconds', '15')}" required /></div><div class="field"><label>Timeout (milliseconds)</label><input name="timeoutMs" type="number" min="500" max="120000" value="${value('timeoutMs', '3000')}" required /></div></div>
       <div class="two-col"><div class="field"><label>Failures before alert</label><input name="failureThreshold" type="number" min="1" max="10" value="${value('failureThreshold', '2')}" required /></div><div class="field"><label>Successes before recovery</label><input name="recoveryThreshold" type="number" min="1" max="10" value="${value('recoveryThreshold', '1')}" required /></div></div>
       <div class="field"><label>Severity</label><select name="severity"><option value="critical">Critical</option><option value="warning">Warning</option><option value="info">Information</option></select></div>
@@ -911,7 +1146,15 @@ function openMonitorDialog(target = null) {
     const error = dialog.querySelector('#monitor-error');
     error.textContent = '';
     const values = Object.fromEntries(new FormData(form).entries());
-    const payload = { ...values, id: target?.id, enabled: form.elements.enabled.checked, metadata: { dnsHost: values.dnsHost } };
+    const meta = {
+      dnsHost: values.dnsHost,
+      path: values.diskPath,
+      thresholdPercent: values.thresholdPercent ? Number(values.thresholdPercent) : undefined,
+      command: values.commandScript,
+      expectedExitCode: values.expectedExitCode !== '' && values.expectedExitCode !== undefined ? Number(values.expectedExitCode) : undefined,
+      expectedOutput: values.expectedOutput
+    };
+    const payload = { ...values, id: target?.id, enabled: form.elements.enabled.checked, metadata: meta };
     try { await request(() => remoteCare.saveTarget(state.session.token, payload)); dialog.close(); await refreshDashboard(true); flash(`Monitor “${values.name}” saved.`); } catch (exception) { error.textContent = exception.message; }
   });
   dialog.showModal();
@@ -919,17 +1162,42 @@ function openMonitorDialog(target = null) {
 
 function openViewerDialog() {
   const dialog = document.createElement('dialog');
-  dialog.innerHTML = `<div class="dialog-header"><h3>Add Viewer account</h3><button class="button ghost small" data-close>Close</button></div><form><div class="dialog-body"><p class="helper">Viewer accounts can view the dashboard and history only. A maximum of five Viewer accounts is allowed.</p><div class="field"><label>Display name</label><input name="displayName" required maxlength="80" /></div><div class="field"><label>Username</label><input name="username" required minlength="3" maxlength="40" /></div><div class="field"><label>Password</label><input name="password" required type="password" minlength="10" /></div><div class="error"></div></div><div class="dialog-footer"><button class="button secondary" type="button" data-close>Cancel</button><button class="button" type="submit">Create Viewer</button></div></form>`;
-  document.body.append(dialog); dialog.querySelectorAll('[data-close]').forEach((button) => button.addEventListener('click', () => dialog.close())); dialog.addEventListener('close', () => dialog.remove());
-  dialog.querySelector('form').addEventListener('submit', async (event) => { event.preventDefault(); const form = event.currentTarget; const error = form.querySelector('.error'); try { await request(() => remoteCare.createViewer(state.session.token, Object.fromEntries(new FormData(form).entries()))); dialog.close(); await renderPage(); flash('Viewer account created.'); } catch (exception) { error.textContent = exception.message; } });
+  dialog.innerHTML = `
+    <div class="dialog-header"><h3>Add User account</h3><button class="button ghost small" data-close>Close</button></div>
+    <form><div class="dialog-body">
+      <p class="helper">Operator accounts can acknowledge incidents and run manual checks. Viewer accounts can view status and history only. Up to five non-admin accounts allowed.</p>
+      <div class="field"><label>Role</label><select name="role"><option value="viewer">Viewer (Read-only status &amp; history)</option><option value="operator">Operator (Run checks &amp; acknowledge incidents)</option></select></div>
+      <div class="field"><label>Display name</label><input name="displayName" required maxlength="80" /></div>
+      <div class="field"><label>Username</label><input name="username" required minlength="3" maxlength="40" /></div>
+      <div class="field"><label>Password</label><input name="password" required type="password" minlength="10" /></div>
+      <div class="error"></div>
+    </div><div class="dialog-footer"><button class="button secondary" type="button" data-close>Cancel</button><button class="button" type="submit">Create account</button></div></form>`;
+  document.body.append(dialog);
+  dialog.querySelectorAll('[data-close]').forEach((button) => button.addEventListener('click', () => dialog.close()));
+  dialog.addEventListener('close', () => dialog.remove());
+  dialog.querySelector('form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const error = form.querySelector('.error');
+    const values = Object.fromEntries(new FormData(form).entries());
+    try {
+      await request(() => remoteCare.createViewer(state.session.token, values));
+      dialog.close();
+      await renderPage();
+      flash(`${values.role === 'operator' ? 'Operator' : 'Viewer'} account created.`);
+    } catch (exception) {
+      error.textContent = exception.message;
+    }
+  });
   dialog.showModal();
 }
 
 function openEditUserDialog(user) {
   const dialog = document.createElement('dialog');
   dialog.innerHTML = `
-    <div class="dialog-header"><h3>Edit Viewer account</h3><button class="button ghost small" type="button" data-close>Close</button></div>
+    <div class="dialog-header"><h3>Edit ${user.role === 'operator' ? 'Operator' : 'Viewer'} account</h3><button class="button ghost small" type="button" data-close>Close</button></div>
     <form><div class="dialog-body">
+      <div class="field"><label for="edit-viewer-role">Role</label><select id="edit-viewer-role" name="role"><option value="viewer" ${user.role === 'viewer' ? 'selected' : ''}>Viewer (Read-only status &amp; history)</option><option value="operator" ${user.role === 'operator' ? 'selected' : ''}>Operator (Run checks &amp; acknowledge incidents)</option></select></div>
       <div class="field"><label for="edit-viewer-name">Display name</label><input id="edit-viewer-name" name="displayName" required maxlength="80" value="${escapeHtml(user.displayName)}" /></div>
       <div class="field"><label for="edit-viewer-user">Username</label><input id="edit-viewer-user" name="username" required minlength="3" maxlength="40" value="${escapeHtml(user.username)}" /></div>
       <label class="check-label" style="margin-top:12px"><input name="active" type="checkbox" ${user.active ? 'checked' : ''} /> Account active</label>
@@ -950,9 +1218,9 @@ function openEditUserDialog(user) {
       dialog.close();
       const content = document.getElementById('page-content');
       if (content) await renderUsers(content);
-      flash(`Viewer “${values.displayName}” updated.`);
+      flash(`Account “${values.displayName}” updated.`);
     } catch (exception) {
-      error.textContent = exception.message || 'Unable to update viewer.';
+      error.textContent = exception.message || 'Unable to update user.';
     }
   });
   dialog.showModal();
@@ -1183,12 +1451,14 @@ remoteCare.onUpdate((event) => {
       renderShell();
     }
   }
-  if (event?.type === 'notification') {
-    // The main process displays the popup even when this renderer is hidden.
-    playNotificationChime(event.event?.kind);
-  }
   scheduleRefresh();
 });
+
+if (typeof remoteCare.onSoundAlert === 'function') {
+  remoteCare.onSoundAlert((event) => {
+    playNotificationChime(event?.kind);
+  });
+}
 
 remoteCare.onAppControl((event) => {
   if (event?.type !== 'quit_requested') return;

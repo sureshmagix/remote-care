@@ -2,10 +2,11 @@ const EventEmitter = require('node:events');
 const { executeCheck } = require('./checks');
 
 class MonitorEngine extends EventEmitter {
-  constructor({ database, notify, check = executeCheck }) {
+  constructor({ database, notify, onEvent, check = executeCheck }) {
     super();
     this.database = database;
     this.notify = notify;
+    this.onEvent = onEvent;
     this.executeCheck = check;
     this.nextRunAt = new Map();
     this.runningTargets = new Set();
@@ -84,15 +85,22 @@ class MonitorEngine extends EventEmitter {
           body: event.message,
           details: { severity: event.target.severity, locationName: event.target.locationName, result }
         });
+        const eventData = {
+          kind: event.kind, title, body: event.message, target: event.target, result,
+          previousStatus: outcome.previousStatus, occurredAt: outcome.target.lastCheckedAt
+        };
         try {
-          await this.notify?.({
-            kind: event.kind, title, body: event.message, target: event.target, result,
-            previousStatus: outcome.previousStatus, occurredAt: outcome.target.lastCheckedAt
-          });
+          await this.notify?.(eventData);
         } catch (error) {
           // A desktop notification failure must not prevent dashboard updates or future checks.
           this.emit('notification-error', error);
         }
+        try {
+          await this.onEvent?.(eventData);
+        } catch (error) {
+          this.emit('event-error', error);
+        }
+        this.emit('transition', { event: eventData, outcome });
       }
       this.emit('update', { type: 'check_complete', targetId: target.id, outcome });
       return outcome;

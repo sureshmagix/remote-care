@@ -362,3 +362,54 @@ body.desktop-notification { min-width: 0; min-height: 0; background: #07131f; }
 @media (max-width: 1020px) { .app-shell { grid-template-columns: 1fr; }.sidebar { position: static; height: auto; padding: 13px; border-right: 0; border-bottom: 1px solid var(--line); }.sidebar .brand { display: none; }.nav { display: flex; overflow: auto; }.nav button { width: auto; white-space: nowrap; }.sidebar-footer { display: none; }.content { padding: 20px; }.stat-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }.section-grid { grid-template-columns: 1fr; }.history-filters { grid-template-columns: repeat(3, minmax(150px, 1fr)); } }
 @media (max-width: 620px) { .auth-shell { padding: 14px; }.auth-card { padding: 24px; }.content { padding: 16px; }.page-header { display: grid; }.header-tools { justify-content: flex-start; }.live-clock { text-align: left; }.stat-grid, .two-col, .info-grid { grid-template-columns: 1fr 1fr; }.section-grid { gap: 12px; }.stat { padding: 13px; }.stat .number { font-size: 23px; }.history-filters { grid-template-columns: 1fr; padding: 14px; }.history-filters .history-search { grid-column: auto; }.history-filter-actions { align-items: center; }.setting-row { gap: 14px; }.setting-row small { max-width: none; }.settings-help { width: 100%; }.protected-exit { align-items: flex-start; flex-direction: column; } #toast-region { top: 12px; right: 12px; width: calc(100vw - 24px); } }
 @media (prefers-reduced-motion: reduce) { .toast, .toast.leaving, .toast-progress { animation: none; } }
+
+/* Phase 2: Sparklines, Uptime SLA, and Operator Badge */
+.sparkline-chart {
+  display: inline-block;
+  vertical-align: middle;
+  width: 75px;
+  height: 20px;
+  color: var(--brand);
+  margin-right: 8px;
+}
+.sparkline-empty {
+  color: var(--muted);
+  font-size: 11px;
+}
+.uptime-badge {
+  background: #113444;
+  color: #5eead4;
+  border: 1px solid #1a566f;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 6px;
+  margin-left: 6px;
+}
+.badge.operator {
+  background: #253352;
+  color: #93c5fd;
+  border: 1px solid #3b82f6;
+}
+.btn-group {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.setting-panel-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 14px;
+}
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.status-pill.active {
+  color: var(--good);
+}

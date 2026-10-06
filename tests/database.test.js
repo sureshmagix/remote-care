@@ -50,7 +50,18 @@ test('app notification and tray settings use safe defaults and persist changes',
       showTrayReminder: true,
       showFailureNotifications: true,
       showRecoveryNotifications: true,
-      notificationDurationSeconds: 5
+      notificationDurationSeconds: 5,
+      cloudSyncEnabled: false,
+      cloudSyncProtocol: 'https',
+      cloudHttpsUrl: '',
+      cloudAuthToken: '',
+      cloudHeartbeatMinutes: 5,
+      webhookEnabled: false,
+      webhookUrl: '',
+      webhookType: 'generic',
+      webhookEvents: 'failures_only',
+      soundAlertsEnabled: false,
+      soundVolume: 70
     });
     const saved = database.updateAppSettings({
       minimizeToTray: true,
@@ -353,6 +364,122 @@ test('user password change and profile management validate input and enforce con
     const viewerLogin = database.getUserForLogin('viewer_renamed');
     const { verifyPassword } = require('../src/main/auth');
     assert.equal(verifyPassword('viewer-new-password', viewerLogin.passwordSalt, viewerLogin.passwordHash), true);
+  } finally {
+    database.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('operator role creation, role update, and account limits', () => {
+  const { database, directory } = temporaryDatabase();
+  try {
+    const admin = database.createInitialAdmin({ username: 'admin', displayName: 'Admin', password: 'admin-password-123' });
+    const op = database.createOperator({ username: 'operator1', displayName: 'Ops Engineer', password: 'ops-password-123' }, admin.id);
+    assert.equal(op.role, 'operator');
+    assert.equal(op.displayName, 'Ops Engineer');
+
+    const users = database.listUsers();
+    assert.equal(users.length, 2);
+    assert.equal(users.some((u) => u.role === 'operator'), true);
+
+    // Update role to viewer and back to operator
+    const demoted = database.updateViewer(op.id, { role: 'viewer' }, admin.id);
+    assert.equal(demoted.role, 'viewer');
+    const promoted = database.updateViewer(op.id, { role: 'operator' }, admin.id);
+    assert.equal(promoted.role, 'operator');
+  } finally {
+    database.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('outbound events queueing, fetching, delivery marking, and failure retries', () => {
+  const { database, directory } = temporaryDatabase();
+  try {
+    database.enqueueEvent('test.event', { msg: 'first' });
+    database.enqueueEvent('test.event', { msg: 'second' });
+    assert.equal(database.getPendingOutboundCount(), 2);
+
+    const pending = database.getPendingOutboundEvents(10);
+    assert.equal(pending.length, 2);
+    assert.equal(JSON.parse(pending[0].payload_json).msg, 'first');
+
+    // Mark first as delivered
+    database.markEventsDelivered([pending[0].id]);
+    assert.equal(database.getPendingOutboundCount(), 1);
+
+    // Mark second as failed
+    database.markEventFailed(pending[1].id, 'Connection refused');
+    const remaining = database.getPendingOutboundEvents(10);
+    assert.equal(remaining.length, 1);
+    assert.equal(remaining[0].attempts, 1);
+    assert.equal(remaining[0].last_error, 'Connection refused');
+  } finally {
+    database.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('monitor JSON export and import with duplicate strategies', () => {
+  const { database, directory } = temporaryDatabase();
+  try {
+    const admin = database.createInitialAdmin({ username: 'admin', displayName: 'Admin', password: 'admin-password-123' });
+    const m1 = database.saveTarget({
+      name: 'Alpha API', type: 'http', url: 'https://alpha.example.com/health',
+      intervalSeconds: 10, timeoutMs: 3000, failureThreshold: 2, recoveryThreshold: 1,
+      severity: 'critical', downMessage: 'Down', recoveryMessage: 'Up', enabled: true
+    }, admin.id);
+
+    const m2 = database.saveTarget({
+      name: 'Disk Root', type: 'disk', metadata: { path: '/', thresholdPercent: 85 },
+      intervalSeconds: 30, timeoutMs: 2000, failureThreshold: 1, recoveryThreshold: 1,
+      severity: 'warning', downMessage: 'Disk full', recoveryMessage: 'Disk ok', enabled: true
+    }, admin.id);
+
+    const exported = database.exportMonitorsJson();
+    assert.equal(exported.version, '2.0');
+    assert.equal(exported.monitors.length, 2);
+
+    // Import with skip
+    const skipRes = database.importMonitorsJson(exported, admin.id, { onDuplicate: 'skip' });
+    assert.equal(skipRes.skippedCount, 2);
+    assert.equal(skipRes.importedCount, 0);
+
+    // Import with overwrite
+    const overwriteRes = database.importMonitorsJson(exported, admin.id, { onDuplicate: 'overwrite' });
+    assert.equal(overwriteRes.overwrittenCount, 2);
+
+    // Import with rename
+    const renameRes = database.importMonitorsJson(exported, admin.id, { onDuplicate: 'rename' });
+    assert.equal(renameRes.importedCount, 2);
+    assert.equal(database.listTargets().length, 4);
+  } finally {
+    database.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('dashboard SLA calculation and sparklines are populated correctly', () => {
+  const { database, directory } = temporaryDatabase();
+  try {
+    const admin = database.createInitialAdmin({ username: 'admin', displayName: 'Admin', password: 'admin-password-123' });
+    const target = database.saveTarget({
+      name: 'SLA Test Target', type: 'tcp', host: '127.0.0.1', port: 9000,
+      intervalSeconds: 5, timeoutMs: 1000, failureThreshold: 1, recoveryThreshold: 1,
+      severity: 'warning', downMessage: 'Down', recoveryMessage: 'Up', enabled: true
+    }, admin.id);
+
+    // Record some check results
+    database.recordCheck(target.id, { ok: true, status: 'healthy', latencyMs: 25, message: 'OK' });
+    database.recordCheck(target.id, { ok: true, status: 'healthy', latencyMs: 30, message: 'OK' });
+    database.recordCheck(target.id, { ok: false, status: 'down', latencyMs: 100, message: 'Fail' });
+
+    const dashboard = database.getDashboard();
+    assert.equal(dashboard.targets.length, 1);
+    const dt = dashboard.targets[0];
+    assert.equal(typeof dt.uptimePercent, 'number');
+    assert.equal(Array.isArray(dt.sparkline), true);
+    assert.equal(dt.sparkline.length >= 2, true);
   } finally {
     database.close();
     fs.rmSync(directory, { recursive: true, force: true });
