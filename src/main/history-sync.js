@@ -98,7 +98,9 @@ class HistorySyncService extends EventEmitter {
         'User-Agent': 'RemoteCareMonitor-HistorySync/2.0'
       };
       if (authToken && String(authToken).trim()) {
-        headers['Authorization'] = `Bearer ${String(authToken).trim()}`;
+        const token = String(authToken).trim();
+        headers['Authorization'] = `Bearer ${token}`;
+        headers['x-api-key'] = token;
       }
 
       const req = transport.request(parsedUrl, {
@@ -110,7 +112,11 @@ class HistorySyncService extends EventEmitter {
         res.on('data', (chunk) => { body += chunk; });
         res.on('end', () => {
           if (res.statusCode >= 200 && res.statusCode < 300) {
-            resolve({ ok: true, statusCode: res.statusCode, body });
+            let responseData = null;
+            try {
+              responseData = JSON.parse(body);
+            } catch {}
+            resolve({ ok: true, statusCode: res.statusCode, body, responseData });
           } else {
             reject(new Error(`History sync server returned HTTP ${res.statusCode}: ${body.slice(0, 200)}`));
           }

@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const http = require('node:http');
 const { buildWebhookPayload } = require('../src/main/webhooks');
 const { HeartbeatService } = require('../src/main/heartbeat');
 const { CloudPublisher } = require('../src/main/cloud-publisher');
@@ -260,4 +261,338 @@ test('history sync service builds preview and sends batch updating cursor', asyn
   }
 });
 
+test('history sync service and cloud publisher build headers with x-api-key alongside Authorization Bearer', async () => {
+  const { database, directory } = temporaryDatabase();
+  try {
+    let capturedHistoryHeaders = null;
+    const historyService = new HistorySyncService({
+      database,
+      getSettings: () => ({ serverAuthToken: 'my-secret-key-123' })
+    });
+
+    const originalHttpRequest = http.request;
+    http.request = (url, options, callback) => {
+      capturedHistoryHeaders = options.headers;
+      const req = new (require('node:events').EventEmitter)();
+      req.write = () => {};
+      req.end = () => {
+        const res = new (require('node:events').EventEmitter)();
+        res.statusCode = 200;
+        callback(res);
+        res.emit('data', JSON.stringify({ ok: true }));
+        res.emit('end');
+      };
+      return req;
+    };
+
+    try {
+      await historyService.sendPayload('http://localhost:3000/api/history', 'my-secret-key-123', { history: [] });
+      assert.equal(capturedHistoryHeaders['x-api-key'], 'my-secret-key-123');
+      assert.equal(capturedHistoryHeaders['Authorization'], 'Bearer my-secret-key-123');
+
+      let capturedPublisherHeaders = null;
+      http.request = (url, options, callback) => {
+        capturedPublisherHeaders = options.headers;
+        const req = new (require('node:events').EventEmitter)();
+        req.write = () => {};
+        req.end = () => {
+          const res = new (require('node:events').EventEmitter)();
+          res.statusCode = 200;
+          callback(res);
+          res.emit('data', JSON.stringify({ ok: true }));
+          res.emit('end');
+        };
+        return req;
+      };
+
+      const publisher = new CloudPublisher({
+        database,
+        getSettings: () => ({ serverAuthToken: 'my-secret-key-123' })
+      });
+      await publisher.sendBatch('http://localhost:3000/api/sync', 'my-secret-key-123', { events: [] });
+      assert.equal(capturedPublisherHeaders['x-api-key'], 'my-secret-key-123');
+      assert.equal(capturedPublisherHeaders['Authorization'], 'Bearer my-secret-key-123');
+    } finally {
+      http.request = originalHttpRequest;
+    }
+  } finally {
+    database.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+function simulateRequest(server, { method, url, headers = {}, body = null }) {
+  return new Promise((resolve) => {
+    const { EventEmitter } = require('node:events');
+    const req = new EventEmitter();
+    req.method = method;
+    req.url = url;
+    req.headers = Object.fromEntries(
+      Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v])
+    );
+    req.destroy = () => {};
+
+    let resStatusCode = 200;
+    let resHeaders = {};
+    let resBody = '';
+
+    const res = {
+      writeHead(code, hdrs) {
+        resStatusCode = code;
+        resHeaders = hdrs || {};
+      },
+      end(data) {
+        if (data) resBody += data;
+        resolve({
+          status: resStatusCode,
+          headers: resHeaders,
+          body: resBody,
+          json: () => (resBody ? JSON.parse(resBody) : {})
+        });
+      }
+    };
+
+    const listener = server.listeners('request')[0];
+    listener(req, res);
+
+    if (body !== null && body !== undefined) {
+      const data = typeof body === 'string' ? body : JSON.stringify(body);
+      req.emit('data', Buffer.from(data));
+    }
+    req.emit('end');
+  });
+}
+
+test('POST /api/history and /api/diagnostic/history enforce deduplication, authenticate with x-api-key, and return expected response', async () => {
+  const { createTestServer } = require('../scripts/test-remote-server');
+  const secretKey = 'DIAGNOSTIC_SECRET_987';
+  const { server, receivedHistory } = createTestServer({ authToken: secretKey });
+
+  // 1. Unauthorized request without header fails with 401
+  const unauthRes = await simulateRequest(server, {
+    method: 'POST',
+    url: '/api/history',
+    headers: { 'Content-Type': 'application/json' },
+    body: { history: [] }
+  });
+  assert.equal(unauthRes.status, 401);
+
+  // 2. Initial entry with 2 items: Billing Cloud API (down), Local Gateway Router (healthy)
+  const payload1 = {
+    version: '2.0',
+    dispatchedAt: '2026-10-06T13:00:00.123Z',
+    clientHostname: 'store-pi-terminal-01',
+    targetIds: 'all',
+    entriesCount: 2,
+    history: [
+      {
+        id: 1042,
+        targetId: '1',
+        targetName: 'Billing Cloud API',
+        targetType: 'http',
+        locationName: 'Main Office',
+        checkedAt: '2026-10-06T12:56:15.000Z',
+        ok: false,
+        status: 'down',
+        message: 'HTTP 502 Bad Gateway from upstream service',
+        latencyMs: 1420,
+        details: { statusCode: 502, url: 'https://api.example.com/v1/billing/health' }
+      },
+      {
+        id: 1043,
+        targetId: '2',
+        targetName: 'Local Gateway Router',
+        targetType: 'gateway',
+        locationName: 'Main Office',
+        checkedAt: '2026-10-06T12:57:30.000Z',
+        ok: true,
+        status: 'healthy',
+        message: 'Local network gateway 192.168.1.1 is reachable.',
+        latencyMs: 4,
+        details: { gatewayIp: '192.168.1.1' }
+      }
+    ]
+  };
+
+  // First batch: both are initial entries -> 2 inserted, 0 skipped
+  const res1 = await simulateRequest(server, {
+    method: 'POST',
+    url: '/api/history',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': secretKey
+    },
+    body: payload1
+  });
+  assert.equal(res1.status, 200);
+  const json1 = res1.json();
+  assert.equal(json1.success, true);
+  assert.equal(json1.inserted_count, 2);
+  assert.equal(json1.skipped_count, 0);
+  assert.equal(json1.total_processed, 2);
+
+  // Second batch:
+  // Billing Cloud API recovered: status becomes 'healthy' (transition -> insert)
+  // Local Gateway Router: status remains 'healthy' (continuous identical status -> skip)
+  const payload2 = {
+    version: '2.0',
+    dispatchedAt: '2026-10-06T13:05:00.000Z',
+    clientHostname: 'store-pi-terminal-01',
+    targetIds: 'all',
+    entriesCount: 2,
+    history: [
+      {
+        id: 1044,
+        targetId: '1',
+        targetName: 'Billing Cloud API',
+        status: 'healthy',
+        ok: true,
+        message: 'Recovered'
+      },
+      {
+        id: 1045,
+        targetId: '2',
+        targetName: 'Local Gateway Router',
+        status: 'healthy', // continuous identical status!
+        ok: true,
+        message: 'Local network gateway reachable'
+      }
+    ]
+  };
+
+  // Send to alternate diagnostic path /api/diagnostic/history
+  const res2 = await simulateRequest(server, {
+    method: 'POST',
+    url: '/api/diagnostic/history',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${secretKey}` // Bearer auth works too
+    },
+    body: payload2
+  });
+  assert.equal(res2.status, 200);
+  const json2 = res2.json();
+  assert.equal(json2.success, true);
+  assert.equal(json2.inserted_count, 1);
+  assert.equal(json2.skipped_count, 1);
+  assert.equal(json2.total_processed, 2);
+  assert.equal(json2.message, 'Ingestion processed successfully. Inserted 1 state transition(s), skipped 1 duplicate status entry(ies).');
+  assert.equal(receivedHistory.length, 3); // 2 from first batch, 1 from second batch
+});
+
+test('POST /api/sync and /api/diagnostic/sync enforce telemetry deduplication, authenticate with x-api-key, and return expected response', async () => {
+  const { createTestServer } = require('../scripts/test-remote-server');
+  const secretKey = 'SYNC_SECRET_456';
+  const { server, receivedHeartbeats } = createTestServer({ authToken: secretKey });
+
+  // 1. Initial heartbeat (usedPercent = 49%) -> saved
+  const hb1 = {
+    version: '2.0',
+    dispatchedAt: '2026-10-06T13:00:00.000Z',
+    events: [
+      {
+        id: 1,
+        eventType: 'device.heartbeat',
+        createdAt: '2026-10-06T13:00:00.000Z',
+        payload: {
+          hostname: 'store-pi-terminal-01',
+          platform: 'linux',
+          arch: 'arm64',
+          release: '6.6.20+rpt-rpi-2712',
+          uptimeSeconds: 864200,
+          processUptimeSeconds: 7200,
+          memory: {
+            totalMb: 8192,
+            freeMb: 4200,
+            usedMb: 3992,
+            usedPercent: 49
+          },
+          loadAverage: [0.42, 0.35, 0.28],
+          cpuCores: 4,
+          monitorsSummary: {
+            total: 6,
+            healthy: 5,
+            warning: 1,
+            down: 0
+          },
+          activeIncidentsCount: 0,
+          timestamp: '2026-10-06T13:00:00.000Z'
+        }
+      }
+    ]
+  };
+
+  const res1 = await simulateRequest(server, {
+    method: 'POST',
+    url: '/api/sync',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': secretKey
+    },
+    body: hb1
+  });
+  assert.equal(res1.status, 200);
+  const json1 = res1.json();
+  assert.equal(json1.ok, true);
+  assert.equal(json1.received, 1);
+  assert.ok(json1.timestamp);
+  assert.equal(receivedHeartbeats.length, 1);
+
+  // 2. Identical repeated heartbeat (usedPercent = 49%, under 85%) -> skipped from DB/heartbeat storage
+  const res2 = await simulateRequest(server, {
+    method: 'POST',
+    url: '/api/sync',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': secretKey
+    },
+    body: hb1
+  });
+  assert.equal(res2.status, 200);
+  assert.equal(receivedHeartbeats.length, 1); // skipped duplicate, stays 1
+
+  // 3. Heartbeat with changed memory level (e.g. 52%) -> saved
+  const hb3 = JSON.parse(JSON.stringify(hb1));
+  hb3.events[0].payload.memory.usedPercent = 52;
+  hb3.events[0].payload.memory.usedMb = 4260;
+  const res3 = await simulateRequest(server, {
+    method: 'POST',
+    url: '/api/diagnostic/sync',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': secretKey
+    },
+    body: hb3
+  });
+  assert.equal(res3.status, 200);
+  assert.equal(receivedHeartbeats.length, 2); // saved
+
+  // 4. Repeated heartbeat that crosses warning threshold (usedPercent = 88% >= 85%) -> saved
+  const hb4 = JSON.parse(JSON.stringify(hb1));
+  hb4.events[0].payload.memory.usedPercent = 88;
+  const res4a = await simulateRequest(server, {
+    method: 'POST',
+    url: '/api/sync',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': secretKey
+    },
+    body: hb4
+  });
+  assert.equal(res4a.status, 200);
+  assert.equal(receivedHeartbeats.length, 3);
+
+  // Even if repeated at 88%, because usedPercent >= 85% it crosses warning threshold -> saved
+  const res4b = await simulateRequest(server, {
+    method: 'POST',
+    url: '/api/sync',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': secretKey
+    },
+    body: hb4
+  });
+  assert.equal(res4b.status, 200);
+  assert.equal(receivedHeartbeats.length, 4);
+});
 

@@ -5,7 +5,9 @@
  * Features:
  * - Zero external npm dependencies (uses native node:http)
  * - HTTP Target Check endpoint (/health, /fail, /slow)
- * - Remote Care Cloud Sync endpoint (/api/sync)
+ * - Remote Care Cloud Sync endpoint (/api/sync, /api/diagnostic/sync)
+ * - Result Changes History endpoint (/api/history, /api/diagnostic/history)
+ * - Deduplication for state transitions and device telemetry/storage
  * - Webhook Receiver endpoint (/webhook)
  * - Live Web Dashboard on / to view received telemetry and toggle simulated outages
  * 
@@ -18,14 +20,6 @@ const { URL } = require('node:url');
 
 const PORT = Number.parseInt(process.env.PORT || process.argv[2] || 3001, 10);
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
-
-// In-memory state for testing
-let isSimulatingFailure = false;
-let simulatedDelayMs = 0;
-const receivedHeartbeats = [];
-const receivedEvents = [];
-const receivedWebhooks = [];
-const receivedHistory = [];
 const MAX_LOGS = 50;
 
 function parseBody(req) {
@@ -60,6 +54,15 @@ function sendJson(res, statusCode, data) {
   res.end(body);
 }
 
+function isAuthorized(req, expectedToken) {
+  if (!expectedToken) return true;
+  const apiKey = req.headers['x-api-key'];
+  if (apiKey && String(apiKey).trim() === expectedToken) return true;
+  const authHeader = req.headers['authorization'] || '';
+  if (authHeader === `Bearer ${expectedToken}`) return true;
+  return false;
+}
+
 function getLocalIps() {
   const os = require('node:os');
   const ifaces = os.networkInterfaces();
@@ -74,13 +77,21 @@ function getLocalIps() {
   return ips;
 }
 
-function renderHtmlDashboard(reqHost) {
+function renderHtmlDashboard({
+  reqHost,
+  port,
+  authToken,
+  isSimulatingFailure,
+  receivedHeartbeats,
+  receivedEvents,
+  receivedHistory,
+  receivedWebhooks
+}) {
   const latestHeartbeat = receivedHeartbeats[0] || null;
   const localIps = getLocalIps();
   const lanIp = localIps[0]?.address || '127.0.0.1';
-  const displayHost = reqHost || `localhost:${PORT}`;
-  const baseUrl = `http://${displayHost}`;
-  const lanBaseUrl = `http://${lanIp}:${PORT}`;
+  const displayHost = reqHost || `localhost:${port}`;
+  const lanBaseUrl = `http://${lanIp}:${port}`;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -155,68 +166,71 @@ function renderHtmlDashboard(reqHost) {
     <div class="header">
       <div>
         <h1>Remote Care — Test Remote Server</h1>
-        <div style="color: var(--muted); font-size: 13px;">
-          Listening Port: <strong>${PORT}</strong> |
-          LAN IP: <strong>${lanIp}</strong> |
-          Auth Token: <strong>${AUTH_TOKEN ? AUTH_TOKEN : 'None (Open)'}</strong>
-        </div>
+        <p style="color: var(--muted); margin: 0;">Multi-Endpoint Diagnostic Server for Cloud Sync, History of Changes, and Webhooks</p>
       </div>
       <div>
-        <form method="POST" action="/api/toggle-simulation" style="display: inline;">
-          <button type="submit" class="btn ${isSimulatingFailure ? 'btn-success' : 'btn-danger'}">
-            ${isSimulatingFailure ? '✓ Restore Normal Service (200 OK)' : '⚡ Simulate Outage (Return 500 Error)'}
-          </button>
-        </form>
+        ${authToken ? `<span class="badge badge-info" style="margin-right: 8px;">Auth: ${authToken}</span>` : '<span class="badge badge-ok" style="margin-right: 8px;">Auth: None (Open)</span>'}
+        ${isSimulatingFailure ? '<span class="badge badge-fail">Outage Simulated (500)</span>' : '<span class="badge badge-ok">Normal Operation (200)</span>'}
       </div>
     </div>
 
-    <!-- Instructions Banner -->
     <div class="instruction-box">
-      <strong>Client Configuration Guide:</strong> In the Remote Care desktop app, configure the dedicated tabs using the URLs below:
-      <ul style="margin: 6px 0 0; padding-left: 20px;">
-        <li>In <strong>☁ Server</strong> tab: Enter Server Base URL as <code>${baseUrl}</code> <em>(or <code>${lanBaseUrl}</code> if on different computers)</em>.</li>
-        <li>In <strong>⚑ Webhooks</strong> tab: Enter Destination Webhook URL as <code>${baseUrl}/webhook</code>.</li>
-        <li>In <strong>◉ Monitors</strong> tab: Add HTTP check pointing to <code>${baseUrl}/health</code>.</li>
-      </ul>
+      <strong>Quick Setup Guide:</strong> In your Remote Care Monitor desktop app, go to <strong>⚙ Settings</strong> &gt; <strong>☁ Server</strong> and enter:
+      <br><strong>Server Base URL:</strong> <code>http://localhost:${port}</code> (or <code>${lanBaseUrl}</code> if connecting from Raspberry Pi or another machine on LAN).
+      <br><strong>Headers Supported:</strong> <code>x-api-key: YOUR_KEY</code> or <code>Authorization: Bearer YOUR_KEY</code>.
+      <br>Endpoints <code>/api/history</code> (or <code>/api/diagnostic/history</code>) and <code>/api/sync</code> (or <code>/api/diagnostic/sync</code>) automatically apply deduplication rules.
     </div>
 
-    <!-- Grid 1: Status & Quick Controls -->
+    <!-- Grid 1: Controls & Status -->
     <div class="grid">
       <div class="card">
-        <h3>Server Outage Simulator</h3>
-        <p style="color: var(--muted); font-size: 13px; margin-bottom: 12px;">Controls the HTTP response returned by the <code>/health</code> target endpoint:</p>
-        <div style="margin-bottom: 14px;">
-          <span class="badge ${isSimulatingFailure ? 'badge-fail' : 'badge-ok'}">
-            ${isSimulatingFailure ? 'SIMULATING OUTAGE (HTTP 500 ERROR)' : 'HEALTHY (HTTP 200 OK)'}
-          </span>
+        <h3>Simulated Target Outage Control</h3>
+        <p style="color: var(--muted); font-size: 13px;">Toggle the status of <code>/health</code> to test if Remote Care detects down events and sends desktop alerts or webhooks.</p>
+        <div style="display: flex; gap: 10px; align-items: center; margin-top: 14px;">
+          <form method="POST" action="/api/toggle-simulation" style="margin: 0;">
+            <button type="submit" class="btn ${isSimulatingFailure ? 'btn-success' : 'btn-danger'}">
+              ${isSimulatingFailure ? '✓ Recover Service (Return 200 OK)' : '⚠ Trigger Simulated Outage (Return 500)'}
+            </button>
+          </form>
+          <span style="font-size: 13px; color: var(--muted);">Current <code>/health</code> status: <strong>${isSimulatingFailure ? '500 ERROR' : '200 HEALTHY'}</strong></span>
         </div>
-        <form method="POST" action="/api/toggle-simulation">
-          <button type="submit" class="btn ${isSimulatingFailure ? 'btn-success' : 'btn-danger'}" style="width: 100%;">
-            ${isSimulatingFailure ? 'Restore Service (Make Healthy)' : 'Trigger Server Outage Now'}
-          </button>
-        </form>
       </div>
 
       <div class="card">
-        <h3>Sync & Telemetry Metrics</h3>
-        <div class="meta-item"><span class="meta-label">Received Cloud Sync Batches:</span> <strong>${receivedEvents.length}</strong></div>
-        <div class="meta-item"><span class="meta-label">Received Device Heartbeats:</span> <strong>${receivedHeartbeats.length}</strong></div>
-        <div class="meta-item"><span class="meta-label">Received History Sync Changes:</span> <strong>${receivedHistory.length}</strong></div>
-        <div class="meta-item"><span class="meta-label">Received Webhook Dispatches:</span> <strong>${receivedWebhooks.length}</strong></div>
-        <div class="meta-item"><span class="meta-label">Auth Token Required:</span> <span>${AUTH_TOKEN ? 'Yes (Bearer token)' : 'No (Open)'}</span></div>
+        <h3>Server & Ingest Status Summary</h3>
+        <div class="meta-item">
+          <span class="meta-label">Port / PID:</span>
+          <span>Port ${port} (PID ${process.pid})</span>
+        </div>
+        <div class="meta-item">
+          <span class="meta-label">Uptime:</span>
+          <span>${Math.round(process.uptime())}s</span>
+        </div>
+        <div class="meta-item">
+          <span class="meta-label">Heartbeats Ingested:</span>
+          <strong style="color: var(--accent);">${receivedHeartbeats.length}</strong>
+        </div>
+        <div class="meta-item">
+          <span class="meta-label">History Transitions Stored:</span>
+          <strong style="color: var(--accent);">${receivedHistory.length}</strong>
+        </div>
+        <div class="meta-item">
+          <span class="meta-label">Webhooks Received:</span>
+          <strong style="color: var(--accent);">${receivedWebhooks.length}</strong>
+        </div>
       </div>
     </div>
 
-    <!-- Complete Endpoints Table -->
+    <!-- URLs Table -->
     <div class="card" style="margin-bottom: 24px;">
-      <h3>All Server URLs & Configuration Endpoints</h3>
+      <h3>Available Server Endpoints</h3>
       <table class="url-table">
         <thead>
           <tr>
-            <th>Client Section</th>
+            <th>Purpose</th>
             <th>Method</th>
-            <th>Endpoint URL</th>
-            <th>Local URL</th>
+            <th>Path</th>
+            <th>Local URL (Same PC)</th>
             <th>LAN URL (Multi-Machine)</th>
             <th>Action</th>
           </tr>
@@ -226,31 +240,31 @@ function renderHtmlDashboard(reqHost) {
             <td><strong>☁ Server Tab</strong><br><small style="color:var(--muted)">Base URL (Auto-derives sync, history & health)</small></td>
             <td><span class="tag tag-get">BASE</span></td>
             <td><code>/</code></td>
-            <td><code>http://localhost:${PORT}</code></td>
+            <td><code>http://localhost:${port}</code></td>
             <td><code>${lanBaseUrl}</code></td>
-            <td><button class="copy-btn" onclick="navigator.clipboard.writeText('http://localhost:${PORT}')">Copy</button></td>
+            <td><button class="copy-btn" onclick="navigator.clipboard.writeText('http://localhost:${port}')">Copy</button></td>
           </tr>
           <tr>
-            <td><strong>☁ Server Tab</strong><br><small style="color:var(--muted)">Telemetry Sync Ingest Endpoint</small></td>
+            <td><strong>☁ Server Tab</strong><br><small style="color:var(--muted)">Telemetry & Heartbeat Ingest (/api/sync or /api/diagnostic/sync)</small></td>
             <td><span class="tag tag-post">POST</span></td>
             <td><code>/api/sync</code></td>
-            <td><code>http://localhost:${PORT}/api/sync</code></td>
+            <td><code>http://localhost:${port}/api/sync</code></td>
             <td><code>${lanBaseUrl}/api/sync</code></td>
-            <td><button class="copy-btn" onclick="navigator.clipboard.writeText('http://localhost:${PORT}/api/sync')">Copy</button></td>
+            <td><button class="copy-btn" onclick="navigator.clipboard.writeText('http://localhost:${port}/api/sync')">Copy</button></td>
           </tr>
           <tr>
-            <td><strong>☁ Server Tab</strong><br><small style="color:var(--accent)">Result Changes History Ingest</small></td>
+            <td><strong>☁ Server Tab</strong><br><small style="color:var(--accent)">Result Changes History Ingest (/api/history or /api/diagnostic/history)</small></td>
             <td><span class="tag tag-post">POST</span></td>
             <td><code>/api/history</code></td>
-            <td><code>http://localhost:${PORT}/api/history</code></td>
+            <td><code>http://localhost:${port}/api/history</code></td>
             <td><code>${lanBaseUrl}/api/history</code></td>
-            <td><button class="copy-btn" onclick="navigator.clipboard.writeText('http://localhost:${PORT}/api/history')">Copy</button></td>
+            <td><button class="copy-btn" onclick="navigator.clipboard.writeText('http://localhost:${port}/api/history')">Copy</button></td>
           </tr>
           <tr>
             <td><strong>☁ Server Tab</strong><br><small style="color:var(--muted)">Separate Health Check URL</small></td>
             <td><span class="tag tag-get">GET</span></td>
             <td><code>/health</code></td>
-            <td><code>http://localhost:${PORT}/health</code></td>
+            <td><code>http://localhost:${port}/health</code></td>
             <td><code>${lanBaseUrl}/health</code></td>
             <td><a href="/health" target="_blank" style="color:#38bdf8;font-size:11px;text-decoration:none;">Test ↗</a></td>
           </tr>
@@ -258,31 +272,31 @@ function renderHtmlDashboard(reqHost) {
             <td><strong>⚑ Webhooks Tab</strong><br><small style="color:var(--muted)">Alert Webhook Receiver</small></td>
             <td><span class="tag tag-post">POST</span></td>
             <td><code>/webhook</code></td>
-            <td><code>http://localhost:${PORT}/webhook</code></td>
+            <td><code>http://localhost:${port}/webhook</code></td>
             <td><code>${lanBaseUrl}/webhook</code></td>
-            <td><button class="copy-btn" onclick="navigator.clipboard.writeText('http://localhost:${PORT}/webhook')">Copy</button></td>
+            <td><button class="copy-btn" onclick="navigator.clipboard.writeText('http://localhost:${port}/webhook')">Copy</button></td>
           </tr>
           <tr>
             <td><strong>◉ Monitors View</strong><br><small style="color:var(--muted)">Simulated Outage Target</small></td>
             <td><span class="tag tag-get">GET</span></td>
             <td><code>/health</code></td>
-            <td><code>http://localhost:${PORT}/health</code></td>
+            <td><code>http://localhost:${port}/health</code></td>
             <td><code>${lanBaseUrl}/health</code></td>
-            <td><a href="/health" target="_blank" style="color:#38bdf8;font-size:11px;text-decoration:none;">Open ↗</a></td>
+            <td><a href="/health" target="_blank" style="color:#38bdf8;font-size:11px;text-decoration:none;">Test ↗</a></td>
           </tr>
           <tr>
-            <td><strong>◉ Monitors View</strong><br><small style="color:var(--muted)">Guaranteed 500 Failure Target</small></td>
+            <td><strong>◉ Monitors View</strong><br><small style="color:var(--muted)">Permanent Failure Target (Always 500)</small></td>
             <td><span class="tag tag-get">GET</span></td>
             <td><code>/fail</code></td>
-            <td><code>http://localhost:${PORT}/fail</code></td>
+            <td><code>http://localhost:${port}/fail</code></td>
             <td><code>${lanBaseUrl}/fail</code></td>
-            <td><a href="/fail" target="_blank" style="color:#ef4444;font-size:11px;text-decoration:none;">Trigger ↗</a></td>
+            <td><a href="/fail" target="_blank" style="color:#ef4444;font-size:11px;text-decoration:none;">Fail ↗</a></td>
           </tr>
           <tr>
             <td><strong>◉ Monitors View</strong><br><small style="color:var(--muted)">Latency & Timeout Test Target</small></td>
             <td><span class="tag tag-get">GET</span></td>
             <td><code>/slow?delay=4000</code></td>
-            <td><code>http://localhost:${PORT}/slow?delay=4000</code></td>
+            <td><code>http://localhost:${port}/slow?delay=4000</code></td>
             <td><code>${lanBaseUrl}/slow?delay=4000</code></td>
             <td><a href="/slow?delay=4000" target="_blank" style="color:#f59e0b;font-size:11px;text-decoration:none;">Delay ↗</a></td>
           </tr>
@@ -310,7 +324,7 @@ function renderHtmlDashboard(reqHost) {
       <div class="card">
         <h3>History of Result Changes Ingest Log</h3>
         ${receivedHistory.length > 0 ? `
-          <p style="color: var(--success); font-size: 13px; margin-bottom: 8px;">✓ ${receivedHistory.length} recorded change(s) received from client</p>
+          <p style="color: var(--success); font-size: 13px; margin-bottom: 8px;">✓ ${receivedHistory.length} state transition(s) recorded from client</p>
           <div style="max-height: 250px; overflow-y: auto; margin-bottom: 12px; border: 1px solid var(--border); border-radius: 6px;">
             <table class="url-table" style="font-size: 12px;">
               <thead>
@@ -356,216 +370,295 @@ function renderHtmlDashboard(reqHost) {
 </html>`;
 }
 
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  const pathname = url.pathname;
-  const method = req.method;
+function createTestServer({ port = PORT, authToken = AUTH_TOKEN } = {}) {
+  let isSimulatingFailure = false;
+  let simulatedDelayMs = 0;
+  const receivedHeartbeats = [];
+  const receivedEvents = [];
+  const receivedWebhooks = [];
+  const receivedHistory = [];
+  const targetStatusMap = new Map();
+  const lastHeartbeatMetricsMap = new Map();
 
-  // Logging
-  const logPrefix = `[${new Date().toISOString()}] ${method} ${pathname}`;
+  const serverInstance = http.createServer(async (req, res) => {
+    const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    const pathname = url.pathname;
+    const method = req.method;
 
-  // CORS preflight
-  if (method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization'
-    });
-    return res.end();
-  }
+    const logPrefix = `[${new Date().toISOString()}] ${method} ${pathname}`;
 
-  // 1. Dashboard UI
-  if (method === 'GET' && pathname === '/') {
-    const html = renderHtmlDashboard(req.headers.host);
-    res.writeHead(200, {
-      'Content-Type': 'text/html; charset=utf-8',
-      'Content-Length': Buffer.byteLength(html)
-    });
-    return res.end(html);
-  }
-
-  // 2. Outage Simulation Toggle
-  if (method === 'POST' && (pathname === '/api/toggle-simulation' || pathname === '/api/simulate')) {
-    isSimulatingFailure = !isSimulatingFailure;
-    console.log(`${logPrefix} -> Simulated failure toggled to: ${isSimulatingFailure}`);
-    // If coming from form submit, redirect back to /
-    if (req.headers['content-type']?.includes('form')) {
-      res.writeHead(302, { Location: '/' });
+    // CORS preflight
+    if (method === 'OPTIONS') {
+      res.writeHead(204, {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key'
+      });
       return res.end();
     }
-    return sendJson(res, 200, { ok: true, isSimulatingFailure });
-  }
 
-  // 3. HTTP Target Monitor Health Check
-  if (method === 'GET' && (pathname === '/health' || pathname === '/api/health')) {
-    if (isSimulatingFailure) {
-      console.log(`${logPrefix} -> 500 (Simulated Outage)`);
-      return sendJson(res, 500, { status: 'error', message: 'Simulated service failure' });
-    }
-    if (simulatedDelayMs > 0) {
-      await new Promise(r => setTimeout(r, simulatedDelayMs));
-    }
-    return sendJson(res, 200, { status: 'healthy', uptime: process.uptime(), timestamp: new Date().toISOString() });
-  }
-
-  // 4. Force failure endpoint for negative testing
-  if (method === 'GET' && pathname === '/fail') {
-    console.log(`${logPrefix} -> 500 Force Failure`);
-    return sendJson(res, 500, { status: 'error', error: 'Induced failure for testing' });
-  }
-
-  // 5. Slow response endpoint for testing latency & timeout
-  if (method === 'GET' && pathname === '/slow') {
-    const delay = Number.parseInt(url.searchParams.get('delay') || '4000', 10);
-    console.log(`${logPrefix} -> Delaying response by ${delay}ms`);
-    setTimeout(() => {
-      sendJson(res, 200, { status: 'healthy', delayedMs: delay });
-    }, delay);
-    return;
-  }
-
-  // 6. Cloud Publisher Sync Receiver
-  if (method === 'POST' && (pathname === '/api/sync' || pathname === '/api/v1/sync' || pathname === '/events')) {
-    // Check Authorization header if token configured
-    if (AUTH_TOKEN) {
-      const authHeader = req.headers['authorization'] || '';
-      const expected = `Bearer ${AUTH_TOKEN}`;
-      if (authHeader !== expected) {
-        console.log(`${logPrefix} -> 401 Unauthorized (Invalid or missing Bearer token)`);
-        return sendJson(res, 401, { error: 'Unauthorized: invalid bearer token' });
-      }
-    }
-
-    try {
-      const payload = await parseBody(req);
-      const events = Array.isArray(payload.events) ? payload.events : [];
-      console.log(`${logPrefix} -> Received Cloud Sync Batch: ${events.length} event(s)`);
-
-      for (const ev of events) {
-        const item = {
-          id: ev.id,
-          eventType: ev.eventType,
-          payload: ev.payload,
-          createdAt: ev.createdAt,
-          receivedAt: new Date().toISOString()
-        };
-        receivedEvents.unshift(item);
-        if (receivedEvents.length > MAX_LOGS) receivedEvents.pop();
-
-        // If it's a device telemetry heartbeat
-        if (ev.eventType === 'device.heartbeat' && ev.payload) {
-          receivedHeartbeats.unshift({ ...ev.payload, receivedAt: new Date().toISOString() });
-          if (receivedHeartbeats.length > MAX_LOGS) receivedHeartbeats.pop();
-          console.log(`   [Heartbeat] Host: ${ev.payload.hostname} | Memory: ${ev.payload.memory?.usedPercent}% | Monitors: Healthy ${ev.payload.monitorsSummary?.healthy || 0}`);
-        } else {
-          console.log(`   [Event] Type: ${ev.eventType}`);
-        }
-      }
-
-      return sendJson(res, 200, { ok: true, received: events.length, timestamp: new Date().toISOString() });
-    } catch (err) {
-      console.error(`${logPrefix} -> Error parsing sync body:`, err.message);
-      return sendJson(res, 400, { error: err.message });
-    }
-  }
-
-  // 7. Result Changes History Sync Receiver
-  if (method === 'POST' && (pathname === '/api/history' || pathname === '/api/v1/history')) {
-    if (AUTH_TOKEN) {
-      const authHeader = req.headers['authorization'] || '';
-      const expected = `Bearer ${AUTH_TOKEN}`;
-      if (authHeader !== expected) {
-        console.log(`${logPrefix} -> 401 Unauthorized (Invalid or missing Bearer token)`);
-        return sendJson(res, 401, { error: 'Unauthorized: invalid bearer token' });
-      }
-    }
-
-    try {
-      const payload = await parseBody(req);
-      const historyList = Array.isArray(payload.history) ? payload.history : [];
-      console.log(`${logPrefix} -> Received History Sync Batch: ${historyList.length} change(s) from ${payload.clientHostname || 'client'}`);
-
-      for (const item of historyList) {
-        const record = {
-          ...item,
-          receivedAt: new Date().toISOString()
-        };
-        receivedHistory.unshift(record);
-        if (receivedHistory.length > MAX_LOGS) receivedHistory.pop();
-        console.log(`   [History Change] ${item.targetName || 'Monitor #' + item.targetId} -> ${item.status?.toUpperCase()} (${item.latencyMs !== null ? item.latencyMs + 'ms' : '—'}) [${item.message || ''}]`);
-      }
-
-      return sendJson(res, 200, {
-        ok: true,
-        received: historyList.length,
-        totalStored: receivedHistory.length,
-        timestamp: new Date().toISOString()
+    // 1. Dashboard UI
+    if (method === 'GET' && pathname === '/') {
+      const html = renderHtmlDashboard({
+        reqHost: req.headers.host,
+        port,
+        authToken,
+        isSimulatingFailure,
+        receivedHeartbeats,
+        receivedEvents,
+        receivedHistory,
+        receivedWebhooks
       });
-    } catch (err) {
-      console.error(`${logPrefix} -> Error parsing history body:`, err.message);
-      return sendJson(res, 400, { error: err.message });
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Content-Length': Buffer.byteLength(html)
+      });
+      return res.end(html);
     }
-  }
 
-  // 8. Webhook Receiver
-  if (method === 'POST' && (pathname === '/webhook' || pathname === '/api/webhook')) {
-    try {
-      const payload = await parseBody(req);
-      const webhookEntry = {
-        receivedAt: new Date().toISOString(),
-        payload
-      };
-      receivedWebhooks.unshift(webhookEntry);
-      if (receivedWebhooks.length > MAX_LOGS) receivedWebhooks.pop();
-
-      console.log(`${logPrefix} -> Received Webhook Alert:`);
-      console.log('   ', JSON.stringify(payload));
-      return sendJson(res, 200, { ok: true, status: 'webhook received' });
-    } catch (err) {
-      console.error(`${logPrefix} -> Error parsing webhook body:`, err.message);
-      return sendJson(res, 400, { error: err.message });
+    // 2. Outage Simulation Toggle
+    if (method === 'POST' && (pathname === '/api/toggle-simulation' || pathname === '/api/simulate')) {
+      isSimulatingFailure = !isSimulatingFailure;
+      console.log(`${logPrefix} -> Simulated failure toggled to: ${isSimulatingFailure}`);
+      if (req.headers['content-type']?.includes('form')) {
+        res.writeHead(302, { Location: '/' });
+        return res.end();
+      }
+      return sendJson(res, 200, { ok: true, isSimulatingFailure });
     }
-  }
 
-  // 9. Query received data via API
-  if (method === 'GET' && pathname === '/api/data') {
-    return sendJson(res, 200, {
-      isSimulatingFailure,
-      heartbeats: receivedHeartbeats,
-      events: receivedEvents,
-      history: receivedHistory,
-      webhooks: receivedWebhooks
-    });
-  }
+    // 3. HTTP Target Monitor Health Check
+    if (method === 'GET' && (pathname === '/health' || pathname === '/api/health')) {
+      if (isSimulatingFailure) {
+        console.log(`${logPrefix} -> 500 (Simulated Outage)`);
+        return sendJson(res, 500, { status: 'error', message: 'Simulated service failure' });
+      }
+      if (simulatedDelayMs > 0) {
+        await new Promise(r => setTimeout(r, simulatedDelayMs));
+      }
+      return sendJson(res, 200, { status: 'healthy', uptime: process.uptime(), timestamp: new Date().toISOString() });
+    }
 
-  // 404 Fallback
-  sendJson(res, 404, { error: 'Not found', pathname });
-});
+    // 4. Force failure endpoint for negative testing
+    if (method === 'GET' && pathname === '/fail') {
+      console.log(`${logPrefix} -> 500 Force Failure`);
+      return sendJson(res, 500, { status: 'error', error: 'Induced failure for testing' });
+    }
 
-server.listen(PORT, '0.0.0.0', () => {
-  const localIps = getLocalIps();
-  const lanIp = localIps[0]?.address || '127.0.0.1';
+    // 5. Slow response endpoint for testing latency & timeout
+    if (method === 'GET' && pathname === '/slow') {
+      const delay = Number.parseInt(url.searchParams.get('delay') || '4000', 10);
+      console.log(`${logPrefix} -> Delaying response by ${delay}ms`);
+      setTimeout(() => {
+        sendJson(res, 200, { status: 'healthy', delayedMs: delay });
+      }, delay);
+      return;
+    }
 
-  console.log('================================================================');
-  console.log('  Remote Care Monitor — Test Remote Server v2.0');
-  console.log('================================================================');
-  console.log(`  Local Web Dashboard: http://localhost:${PORT}/`);
-  console.log(`  LAN Web Dashboard:   http://${lanIp}:${PORT}/`);
-  console.log(`  Auth Token:          ${AUTH_TOKEN ? AUTH_TOKEN : 'None (Open)'}`);
-  console.log('----------------------------------------------------------------');
-  console.log('  CLIENT CONFIGURATION GUIDE:');
-  console.log('  1. "☁ Server" Tab:');
-  console.log(`     - Server Base URL:      http://localhost:${PORT}`);
-  console.log(`       (For other machines:  http://${lanIp}:${PORT})`);
-  console.log(`     - Derived Sync URL:     http://localhost:${PORT}/api/sync`);
-  console.log(`     - Derived History URL:  http://localhost:${PORT}/api/history`);
-  console.log(`     - Health Check URL:     http://localhost:${PORT}/health`);
-  console.log('  2. "⚑ Webhooks" Tab:');
-  console.log(`     - Webhook URL:          http://localhost:${PORT}/webhook`);
-  console.log(`       (For other machines:  http://${lanIp}:${PORT}/webhook)`);
-  console.log('  3. "◉ Monitors" Tab:');
-  console.log(`     - Health Target URL:    http://localhost:${PORT}/health`);
-  console.log(`     - Fail Target URL:      http://localhost:${PORT}/fail`);
-  console.log(`     - Slow Target URL:      http://localhost:${PORT}/slow?delay=4000`);
-  console.log('================================================================');
-});
+    // 6. Cloud Publisher / Telemetry Sync Receiver (POST /api/sync or /api/diagnostic/sync)
+    if (method === 'POST' && (pathname === '/api/sync' || pathname === '/api/diagnostic/sync' || pathname === '/api/v1/sync' || pathname === '/events')) {
+      if (authToken && !isAuthorized(req, authToken)) {
+        console.log(`${logPrefix} -> 401 Unauthorized (Invalid or missing x-api-key / Bearer token)`);
+        return sendJson(res, 401, { error: 'Unauthorized: invalid or missing x-api-key or Bearer token' });
+      }
+
+      try {
+        const payload = await parseBody(req);
+        const events = Array.isArray(payload.events) ? payload.events : [];
+        console.log(`${logPrefix} -> Received Telemetry Sync Batch: ${events.length} event(s)`);
+
+        for (const ev of events) {
+          const item = {
+            id: ev.id,
+            eventType: ev.eventType,
+            payload: ev.payload,
+            createdAt: ev.createdAt,
+            receivedAt: new Date().toISOString()
+          };
+          receivedEvents.unshift(item);
+          if (receivedEvents.length > MAX_LOGS) receivedEvents.pop();
+
+          // If it's a device telemetry heartbeat
+          if (ev.eventType === 'device.heartbeat' && ev.payload) {
+            const hb = ev.payload;
+            const hostname = hb.hostname || 'default';
+            // Extract memory/storage metrics
+            const memUsedPercent = hb.memory?.usedPercent ?? null;
+            const memUsedMb = hb.memory?.usedMb ?? null;
+            const storageUsedPercent = hb.storage?.usedPercent ?? hb.disk?.usedPercent ?? null;
+
+            // Deduplication Rule: Extracts memory/storage metrics. Saves to DB only when storage levels change
+            // or cross warning thresholds (usedPercent >= 85%), skipping identical repeated heartbeats.
+            const isWarning = (memUsedPercent !== null && memUsedPercent >= 85) ||
+                              (storageUsedPercent !== null && storageUsedPercent >= 85);
+            const prev = lastHeartbeatMetricsMap.get(hostname);
+            const levelsChanged = !prev ||
+              prev.memUsedPercent !== memUsedPercent ||
+              prev.storageUsedPercent !== storageUsedPercent ||
+              (prev.memUsedMb !== null && memUsedMb !== null && Math.abs(prev.memUsedMb - memUsedMb) >= 1);
+
+            if (isWarning || levelsChanged) {
+              lastHeartbeatMetricsMap.set(hostname, { memUsedPercent, memUsedMb, storageUsedPercent });
+              receivedHeartbeats.unshift({ ...hb, receivedAt: new Date().toISOString() });
+              if (receivedHeartbeats.length > MAX_LOGS) receivedHeartbeats.pop();
+              console.log(`   [Heartbeat Saved] Host: ${hb.hostname} | Memory: ${memUsedPercent}% | Warning: ${isWarning}`);
+            } else {
+              console.log(`   [Heartbeat Skipped - Duplicate] Host: ${hb.hostname} | Identical metrics (Memory: ${memUsedPercent}%)`);
+            }
+          } else {
+            console.log(`   [Event] Type: ${ev.eventType}`);
+          }
+        }
+
+        return sendJson(res, 200, {
+          ok: true,
+          received: events.length,
+          timestamp: new Date().toISOString()
+        });
+      } catch (err) {
+        console.error(`${logPrefix} -> Error parsing sync body:`, err.message);
+        return sendJson(res, 400, { error: err.message });
+      }
+    }
+
+    // 7. Result Changes History Sync Receiver (POST /api/history or /api/diagnostic/history)
+    if (method === 'POST' && (pathname === '/api/history' || pathname === '/api/diagnostic/history' || pathname === '/api/v1/history')) {
+      if (authToken && !isAuthorized(req, authToken)) {
+        console.log(`${logPrefix} -> 401 Unauthorized (Invalid or missing x-api-key / Bearer token)`);
+        return sendJson(res, 401, { error: 'Unauthorized: invalid or missing x-api-key or Bearer token' });
+      }
+
+      try {
+        const payload = await parseBody(req);
+        const historyList = Array.isArray(payload.history) ? payload.history : [];
+        console.log(`${logPrefix} -> Received History Sync Batch: ${historyList.length} change(s) from ${payload.clientHostname || 'client'}`);
+
+        // Deduplication Rule: Automatically skips saving duplicate records if the status remains
+        // continuously identical. Saves to DB only on state changes or initial entry.
+        let insertedCount = 0;
+        let skippedCount = 0;
+
+        for (const item of historyList) {
+          const clientHost = payload.clientHostname || 'default';
+          const targetKey = `${clientHost}:${item.targetId ?? item.targetName}`;
+          const prevStatus = targetStatusMap.get(targetKey);
+          const isDuplicate = prevStatus !== undefined && prevStatus === item.status;
+
+          if (isDuplicate) {
+            skippedCount++;
+            console.log(`   [History Skipped - Duplicate Status] ${item.targetName || 'Monitor #' + item.targetId} continuously identical status "${item.status}"`);
+          } else {
+            insertedCount++;
+            targetStatusMap.set(targetKey, item.status);
+            const record = {
+              ...item,
+              receivedAt: new Date().toISOString()
+            };
+            receivedHistory.unshift(record);
+            if (receivedHistory.length > MAX_LOGS) receivedHistory.pop();
+            console.log(`   [History Saved - ${prevStatus === undefined ? 'Initial' : 'Transition'}] ${item.targetName || 'Monitor #' + item.targetId} -> ${item.status?.toUpperCase()} (${item.latencyMs !== null && item.latencyMs !== undefined ? item.latencyMs + 'ms' : '—'}) [${item.message || ''}]`);
+          }
+        }
+
+        return sendJson(res, 200, {
+          success: true,
+          message: `Ingestion processed successfully. Inserted ${insertedCount} state transition(s), skipped ${skippedCount} duplicate status entry(ies).`,
+          inserted_count: insertedCount,
+          skipped_count: skippedCount,
+          total_processed: historyList.length
+        });
+      } catch (err) {
+        console.error(`${logPrefix} -> Error parsing history body:`, err.message);
+        return sendJson(res, 400, { error: err.message });
+      }
+    }
+
+    // 8. Webhook Receiver
+    if (method === 'POST' && (pathname === '/webhook' || pathname === '/api/webhook')) {
+      try {
+        const payload = await parseBody(req);
+        const webhookEntry = {
+          receivedAt: new Date().toISOString(),
+          payload
+        };
+        receivedWebhooks.unshift(webhookEntry);
+        if (receivedWebhooks.length > MAX_LOGS) receivedWebhooks.pop();
+
+        console.log(`${logPrefix} -> Received Webhook Alert:`);
+        console.log('   ', JSON.stringify(payload));
+        return sendJson(res, 200, { ok: true, status: 'webhook received' });
+      } catch (err) {
+        console.error(`${logPrefix} -> Error parsing webhook body:`, err.message);
+        return sendJson(res, 400, { error: err.message });
+      }
+    }
+
+    // 9. Query received data via API
+    if (method === 'GET' && pathname === '/api/data') {
+      return sendJson(res, 200, {
+        isSimulatingFailure,
+        heartbeats: receivedHeartbeats,
+        events: receivedEvents,
+        history: receivedHistory,
+        webhooks: receivedWebhooks
+      });
+    }
+
+    // 404 Fallback
+    sendJson(res, 404, { error: 'Not found', pathname });
+  });
+
+  return {
+    server: serverInstance,
+    targetStatusMap,
+    lastHeartbeatMetricsMap,
+    receivedHeartbeats,
+    receivedEvents,
+    receivedHistory,
+    receivedWebhooks,
+    setSimulatingFailure: (val) => { isSimulatingFailure = val; },
+    setSimulatedDelay: (ms) => { simulatedDelayMs = ms; }
+  };
+}
+
+const defaultApp = createTestServer({ port: PORT, authToken: AUTH_TOKEN });
+const server = defaultApp.server;
+
+if (require.main === module) {
+  server.listen(PORT, '0.0.0.0', () => {
+    const localIps = getLocalIps();
+    const lanIp = localIps[0]?.address || '127.0.0.1';
+
+    console.log('================================================================');
+    console.log('  Remote Care Monitor — Test Remote Server v2.0');
+    console.log('================================================================');
+    console.log(`  Local Web Dashboard: http://localhost:${PORT}/`);
+    console.log(`  LAN Web Dashboard:   http://${lanIp}:${PORT}/`);
+    console.log(`  Auth Token:          ${AUTH_TOKEN ? AUTH_TOKEN : 'None (Open)'}`);
+    console.log('----------------------------------------------------------------');
+    console.log('  CLIENT CONFIGURATION GUIDE:');
+    console.log('  1. "☁ Server" Tab:');
+    console.log(`     - Server Base URL:      http://localhost:${PORT}`);
+    console.log(`       (For other machines:  http://${lanIp}:${PORT})`);
+    console.log(`     - Derived Sync URL:     http://localhost:${PORT}/api/sync`);
+    console.log(`     - Diagnostic Sync URL:  http://localhost:${PORT}/api/diagnostic/sync`);
+    console.log(`     - Derived History URL:  http://localhost:${PORT}/api/history`);
+    console.log(`     - Diagnostic Hist URL:  http://localhost:${PORT}/api/diagnostic/history`);
+    console.log(`     - Health Check URL:     http://localhost:${PORT}/health`);
+    console.log('  2. "⚑ Webhooks" Tab:');
+    console.log(`     - Webhook URL:          http://localhost:${PORT}/webhook`);
+    console.log(`       (For other machines:  http://${lanIp}:${PORT}/webhook)`);
+    console.log('  3. "◉ Monitors" Tab:');
+    console.log(`     - Health Target URL:    http://localhost:${PORT}/health`);
+    console.log(`     - Fail Target URL:      http://localhost:${PORT}/fail`);
+    console.log(`     - Slow Target URL:      http://localhost:${PORT}/slow?delay=4000`);
+    console.log('================================================================');
+  });
+}
+
+module.exports = {
+  createServer: createTestServer,
+  createTestServer,
+  server,
+  isAuthorized
+};

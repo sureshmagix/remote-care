@@ -1013,9 +1013,9 @@ async function renderServer(content) {
             <span class="helper">Enter only the base URL of your remote care server. API endpoints like <code>/api/sync</code>, <code>/api/history</code>, and <code>/health</code> are derived automatically.</span>
           </div>
           <div class="field">
-            <label>Server Bearer / Auth Token</label>
-            <input name="serverAuthToken" type="password" value="${escapeHtml(settings.serverAuthToken || settings.cloudAuthToken || '')}" placeholder="Optional Bearer token" />
-            <span class="helper">Supplied as Authorization: Bearer &lt;token&gt; with outbound server requests.</span>
+            <label>Server API Key / Auth Token</label>
+            <input name="serverAuthToken" type="password" value="${escapeHtml(settings.serverAuthToken || settings.cloudAuthToken || '')}" placeholder="Optional Bearer token or x-api-key" />
+            <span class="helper">Supplied via <code>x-api-key</code> and <code>Authorization: Bearer &lt;token&gt;</code> headers with outbound server requests.</span>
           </div>
           <div class="field">
             <label>Sync Interval (seconds)</label>
@@ -1035,7 +1035,7 @@ async function renderServer(content) {
           <div class="field" style="margin-top:10px">
             <label>History Sync URL</label>
             <input name="historySyncUrl" type="url" value="${escapeHtml(settings.historySyncUrl || '')}" placeholder="${escapeHtml(derivedHistory || 'http://localhost:3000/api/history')}" id="history-sync-url-input" />
-            <span class="helper">Dedicated endpoint for result changes history. Defaults to <code>&lt;Base URL&gt;/api/history</code> if left blank.</span>
+            <span class="helper">Dedicated endpoint for result changes history. Defaults to <code>&lt;Base URL&gt;/api/history</code> (or <code>/api/diagnostic/history</code>) if left blank.</span>
           </div>
           <div class="field">
             <label>History Sync Delay / Interval (minutes)</label>

@@ -1,0 +1,226 @@
+================================================================================
+REMOTE CARE MONITOR — PHASE 2 TERMINAL POST APIs SUMMARY OF UPDATES
+================================================================================
+Document Version: 2.0
+Date: October 8, 2026
+Application: Remote Care Monitor (Phase 2)
+Repository: WII-TOOLS/remote-care
+
+--------------------------------------------------------------------------------
+EXECUTIVE SUMMARY
+--------------------------------------------------------------------------------
+Phase 2 of the Remote Care Monitor application has been updated with the
+complete specification, client dispatching logic, test server ingestion,
+and automated test coverage for both Terminal POST APIs:
+
+1. POST /api/history (or /api/diagnostic/history)
+   Logged history of monitor result changes with state transition deduplication.
+
+2. POST /api/sync (or /api/diagnostic/sync)
+   Periodic device telemetry and heartbeat with memory/storage metrics
+   deduplication.
+
+Both endpoints support authentication via:
+  x-api-key: YOUR_DIAGNOSTIC_SECRET_KEY
+  (or Authorization: Bearer <TOKEN>)
+
+--------------------------------------------------------------------------------
+1. TERMINAL API 1: POST /api/history
+--------------------------------------------------------------------------------
+Purpose:
+  Used by remote terminals to report monitor state changes (e.g. healthy -> down,
+  or down -> healthy).
+
+Deduplication Rule:
+  Automatically skips saving duplicate records if the status remains
+  continuously identical. Saves to DB only on state changes or initial entry.
+
+HTTP Request Details:
+  Method: POST
+  URL Paths: /api/history (or /api/diagnostic/history)
+  Headers:
+    Content-Type: application/json
+    x-api-key: YOUR_DIAGNOSTIC_SECRET_KEY (or Authorization: Bearer <TOKEN>)
+    User-Agent: RemoteCareMonitor-HistorySync/2.0
+
+Sample JSON Request Payload:
+{
+  "version": "2.0",
+  "dispatchedAt": "2026-10-06T13:00:00.123Z",
+  "clientHostname": "store-pi-terminal-01",
+  "targetIds": "all",
+  "entriesCount": 2,
+  "history": [
+    {
+      "id": 1042,
+      "targetId": "1",
+      "targetName": "Billing Cloud API",
+      "targetType": "http",
+      "locationName": "Main Office",
+      "checkedAt": "2026-10-06T12:56:15.000Z",
+      "ok": false,
+      "status": "down",
+      "message": "HTTP 502 Bad Gateway from upstream service",
+      "latencyMs": 1420,
+      "details": {
+        "statusCode": 502,
+        "url": "https://api.example.com/v1/billing/health"
+      }
+    },
+    {
+      "id": 1043,
+      "targetId": "2",
+      "targetName": "Local Gateway Router",
+      "targetType": "gateway",
+      "locationName": "Main Office",
+      "checkedAt": "2026-10-06T12:57:30.000Z",
+      "ok": true,
+      "status": "healthy",
+      "message": "Local network gateway 192.168.1.1 is reachable.",
+      "latencyMs": 4,
+      "details": {
+        "gatewayIp": "192.168.1.1"
+      }
+    }
+  ]
+}
+
+Expected Response (200 OK):
+{
+  "success": true,
+  "message": "Ingestion processed successfully. Inserted 1 state transition(s), skipped 1 duplicate status entry(ies).",
+  "inserted_count": 1,
+  "skipped_count": 1,
+  "total_processed": 2
+}
+
+--------------------------------------------------------------------------------
+2. TERMINAL API 2: POST /api/sync
+--------------------------------------------------------------------------------
+Purpose:
+  Dispatched periodically (e.g. every 5 minutes) to send full device health,
+  CPU, memory, uptime, and monitor summaries.
+
+Deduplication Rule:
+  Extracts memory/storage metrics. Saves to DB only when storage levels change
+  or cross warning thresholds (usedPercent >= 85%), skipping identical
+  repeated heartbeats.
+
+HTTP Request Details:
+  Method: POST
+  URL Paths: /api/sync (or /api/diagnostic/sync)
+  Headers:
+    Content-Type: application/json
+    x-api-key: YOUR_DIAGNOSTIC_SECRET_KEY (or Authorization: Bearer <TOKEN>)
+    User-Agent: RemoteCareMonitor-CloudSync/2.0
+
+Sample JSON Request Payload:
+{
+  "version": "2.0",
+  "dispatchedAt": "2026-10-06T13:00:00.000Z",
+  "events": [
+    {
+      "id": 1,
+      "eventType": "device.heartbeat",
+      "createdAt": "2026-10-06T13:00:00.000Z",
+      "payload": {
+        "hostname": "store-pi-terminal-01",
+        "platform": "linux",
+        "arch": "arm64",
+        "release": "6.6.20+rpt-rpi-2712",
+        "uptimeSeconds": 864200,
+        "processUptimeSeconds": 7200,
+        "memory": {
+          "totalMb": 8192,
+          "freeMb": 4200,
+          "usedMb": 3992,
+          "usedPercent": 49
+        },
+        "loadAverage": [0.42, 0.35, 0.28],
+        "cpuCores": 4,
+        "monitorsSummary": {
+          "total": 6,
+          "healthy": 5,
+          "warning": 1,
+          "down": 0
+        },
+        "activeIncidentsCount": 0,
+        "timestamp": "2026-10-06T13:00:00.000Z"
+      }
+    }
+  ]
+}
+
+Expected Response (200 OK):
+{
+  "ok": true,
+  "received": 1,
+  "timestamp": "2026-10-06T13:00:00.100Z"
+}
+
+--------------------------------------------------------------------------------
+3. CLIENT & SERVER IMPLEMENTATION DETAILS
+--------------------------------------------------------------------------------
+Client Services:
+  - HistorySyncService (src/main/history-sync.js):
+    Automatically injects x-api-key header alongside Authorization: Bearer <token>.
+    Parses returned response JSON data.
+
+  - CloudPublisher (src/main/cloud-publisher.js):
+    Automatically injects x-api-key header alongside Authorization: Bearer <token>.
+    Parses returned response JSON data.
+
+  - Renderer Settings UI (src/renderer/app.js):
+    Updated Server settings tab descriptions, placeholders, and helper texts
+    to document x-api-key authentication and alternate /api/diagnostic/* endpoints.
+
+Test Remote Server (scripts/test-remote-server.js):
+  - Ingests /api/history and /api/diagnostic/history (plus /api/v1/history).
+  - Ingests /api/sync and /api/diagnostic/sync (plus /api/v1/sync and /events).
+  - isAuthorized helper verifies x-api-key or Bearer token against AUTH_TOKEN.
+  - State transition deduplication tracks per-target status map.
+  - Telemetry deduplication tracks per-host metrics with >= 85% threshold check.
+  - Exports createTestServer factory for programmatic and automated testing.
+
+--------------------------------------------------------------------------------
+4. VERIFICATION & TEST RESULTS
+--------------------------------------------------------------------------------
+Automated test suite in tests/phase2.test.js covers:
+  - Headers construction with x-api-key and Authorization: Bearer.
+  - /api/history deduplication (initial entry insert, duplicate status skip,
+    state transition insert).
+  - /api/sync deduplication (initial heartbeat save, identical skip, change save,
+    >= 85% threshold exception save).
+  - Alternate diagnostic routes (/api/diagnostic/history, /api/diagnostic/sync).
+  - Complete project test run: 47 of 47 tests passing (0 failures).
+
+--------------------------------------------------------------------------------
+5. MODIFIED FILES MATRIX
+--------------------------------------------------------------------------------
+  1. src/main/history-sync.js
+     Added x-api-key header and response data parsing.
+
+  2. src/main/cloud-publisher.js
+     Added x-api-key header and response data parsing.
+
+  3. src/renderer/app.js
+     Updated Server settings UI labels, placeholders, and helper text.
+
+  4. scripts/test-remote-server.js
+     Implemented deduplication rules, diagnostic routes, dual auth, and factory.
+
+  5. history-payload-sample.json
+     Aligned sample payload to exact 2-item terminal format.
+
+  6. SERVER_API_INTEGRATION_SPEC.txt
+     Updated complete integration specification with Python and Node.js examples.
+
+  7. remote-care-server.postman_collection.json
+     Added apiKey variable, x-api-key headers, and diagnostic requests.
+
+  8. tests/phase2.test.js
+     Added automated tests for headers, deduplication rules, and responses.
+
+================================================================================
+END OF DOCUMENT
+================================================================================
