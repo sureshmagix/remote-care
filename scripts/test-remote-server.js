@@ -12,15 +12,85 @@
  * - Live Web Dashboard on / to view received telemetry and toggle simulated outages
  * 
  * Usage:
- *   PORT=3000 AUTH_TOKEN=secret123 node scripts/test-remote-server.js
+ *   PORT=3000 FALLBACK_PORT=3001 AUTH_TOKEN=secret123 node scripts/test-remote-server.js
  */
 
 const http = require('node:http');
 const { URL } = require('node:url');
 
-const PORT = Number.parseInt(process.env.PORT || process.argv[2] || 3001, 10);
-const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
+const DEFAULT_PORT = 3999;
+const MAX_PORT = 65535;
+
+function parsePort(value, fallback, label) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 0 || port > MAX_PORT) {
+    throw new Error(`${label} must be an integer between 0 and ${MAX_PORT}.`);
+  }
+  return port;
+}
+
+function defaultFallbackPort(port) {
+  return port < MAX_PORT ? port + 1 : port - 1;
+}
+
+const PORT = parsePort(process.env.PORT ?? process.argv[2], DEFAULT_PORT, 'PORT');
+const FALLBACK_PORT = parsePort(process.env.FALLBACK_PORT, defaultFallbackPort(PORT), 'FALLBACK_PORT');
+const AUTH_TOKEN = process.env.AUTH_TOKEN !== undefined ? process.env.AUTH_TOKEN : 'Wiitronics_diagnostic';
 const MAX_LOGS = 50;
+
+function portCandidates(port, fallbackPort) {
+  // Port zero delegates selection to the operating system. It is the final
+  // fallback so a usable server can still start if both configured ports are busy.
+  return [...new Set([port, fallbackPort, 0])];
+}
+
+function listenOnce(server, { host, port }) {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      server.removeListener('error', onError);
+      server.removeListener('listening', onListening);
+    };
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+    const onListening = () => {
+      const address = server.address();
+      cleanup();
+      resolve(address);
+    };
+
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(port, host);
+  });
+}
+
+async function listenWithFallback(server, { host = '0.0.0.0', port = PORT, fallbackPort = FALLBACK_PORT } = {}) {
+  const requestedPort = parsePort(port, PORT, 'port');
+  const requestedFallbackPort = parsePort(fallbackPort, FALLBACK_PORT, 'fallbackPort');
+  const attemptedPorts = [];
+
+  for (const candidate of portCandidates(requestedPort, requestedFallbackPort)) {
+    attemptedPorts.push(candidate);
+    try {
+      const address = await listenOnce(server, { host, port: candidate });
+      const activePort = typeof address === 'object' && address ? address.port : candidate;
+      return {
+        port: activePort,
+        requestedPort,
+        fallbackPort: requestedFallbackPort,
+        attemptedPorts,
+        usedFallback: candidate !== requestedPort
+      };
+    } catch (error) {
+      if (!['EADDRINUSE', 'EACCES'].includes(error.code)) throw error;
+    }
+  }
+
+  throw new Error(`Could not bind the test server. Ports tried: ${attemptedPorts.join(', ')}.`);
+}
 
 function parseBody(req) {
   return new Promise((resolve, reject) => {
@@ -371,6 +441,7 @@ function renderHtmlDashboard({
 }
 
 function createTestServer({ port = PORT, authToken = AUTH_TOKEN } = {}) {
+  let activePort = port;
   let isSimulatingFailure = false;
   let simulatedDelayMs = 0;
   const receivedHeartbeats = [];
@@ -401,7 +472,7 @@ function createTestServer({ port = PORT, authToken = AUTH_TOKEN } = {}) {
     if (method === 'GET' && pathname === '/') {
       const html = renderHtmlDashboard({
         reqHost: req.headers.host,
-        port,
+        port: activePort,
         authToken,
         isSimulatingFailure,
         receivedHeartbeats,
@@ -459,13 +530,16 @@ function createTestServer({ port = PORT, authToken = AUTH_TOKEN } = {}) {
     if (method === 'POST' && (pathname === '/api/sync' || pathname === '/api/diagnostic/sync' || pathname === '/api/v1/sync' || pathname === '/events')) {
       if (authToken && !isAuthorized(req, authToken)) {
         console.log(`${logPrefix} -> 401 Unauthorized (Invalid or missing x-api-key / Bearer token)`);
-        return sendJson(res, 401, { error: 'Unauthorized: invalid or missing x-api-key or Bearer token' });
+        return sendJson(res, 401, { success: false, error: 'Unauthorized: Invalid API Key' });
       }
 
       try {
         const payload = await parseBody(req);
         const events = Array.isArray(payload.events) ? payload.events : [];
         console.log(`${logPrefix} -> Received Telemetry Sync Batch: ${events.length} event(s)`);
+
+        let insertedCount = 0;
+        let skippedCount = 0;
 
         for (const ev of events) {
           const item = {
@@ -498,26 +572,34 @@ function createTestServer({ port = PORT, authToken = AUTH_TOKEN } = {}) {
               (prev.memUsedMb !== null && memUsedMb !== null && Math.abs(prev.memUsedMb - memUsedMb) >= 1);
 
             if (isWarning || levelsChanged) {
+              insertedCount++;
               lastHeartbeatMetricsMap.set(hostname, { memUsedPercent, memUsedMb, storageUsedPercent });
               receivedHeartbeats.unshift({ ...hb, receivedAt: new Date().toISOString() });
               if (receivedHeartbeats.length > MAX_LOGS) receivedHeartbeats.pop();
               console.log(`   [Heartbeat Saved] Host: ${hb.hostname} | Memory: ${memUsedPercent}% | Warning: ${isWarning}`);
             } else {
+              skippedCount++;
               console.log(`   [Heartbeat Skipped - Duplicate] Host: ${hb.hostname} | Identical metrics (Memory: ${memUsedPercent}%)`);
             }
           } else {
+            insertedCount++;
             console.log(`   [Event] Type: ${ev.eventType}`);
           }
         }
 
         return sendJson(res, 200, {
+          success: true,
           ok: true,
+          message: 'Ingestion processed successfully.',
+          inserted_count: insertedCount,
+          skipped_count: skippedCount,
+          total_processed: events.length,
           received: events.length,
           timestamp: new Date().toISOString()
         });
       } catch (err) {
         console.error(`${logPrefix} -> Error parsing sync body:`, err.message);
-        return sendJson(res, 400, { error: err.message });
+        return sendJson(res, 400, { success: false, error: err.message });
       }
     }
 
@@ -525,7 +607,7 @@ function createTestServer({ port = PORT, authToken = AUTH_TOKEN } = {}) {
     if (method === 'POST' && (pathname === '/api/history' || pathname === '/api/diagnostic/history' || pathname === '/api/v1/history')) {
       if (authToken && !isAuthorized(req, authToken)) {
         console.log(`${logPrefix} -> 401 Unauthorized (Invalid or missing x-api-key / Bearer token)`);
-        return sendJson(res, 401, { error: 'Unauthorized: invalid or missing x-api-key or Bearer token' });
+        return sendJson(res, 401, { success: false, error: 'Unauthorized: Invalid API Key' });
       }
 
       try {
@@ -562,14 +644,16 @@ function createTestServer({ port = PORT, authToken = AUTH_TOKEN } = {}) {
 
         return sendJson(res, 200, {
           success: true,
-          message: `Ingestion processed successfully. Inserted ${insertedCount} state transition(s), skipped ${skippedCount} duplicate status entry(ies).`,
+          ok: true,
+          message: 'Ingestion processed successfully.',
           inserted_count: insertedCount,
           skipped_count: skippedCount,
-          total_processed: historyList.length
+          total_processed: historyList.length,
+          timestamp: new Date().toISOString()
         });
       } catch (err) {
         console.error(`${logPrefix} -> Error parsing history body:`, err.message);
-        return sendJson(res, 400, { error: err.message });
+        return sendJson(res, 400, { success: false, error: err.message });
       }
     }
 
@@ -608,8 +692,14 @@ function createTestServer({ port = PORT, authToken = AUTH_TOKEN } = {}) {
     sendJson(res, 404, { error: 'Not found', pathname });
   });
 
+  serverInstance.on('listening', () => {
+    const address = serverInstance.address();
+    if (address && typeof address === 'object') activePort = address.port;
+  });
+
   return {
     server: serverInstance,
+    get port() { return activePort; },
     targetStatusMap,
     lastHeartbeatMetricsMap,
     receivedHeartbeats,
@@ -625,40 +715,50 @@ const defaultApp = createTestServer({ port: PORT, authToken: AUTH_TOKEN });
 const server = defaultApp.server;
 
 if (require.main === module) {
-  server.listen(PORT, '0.0.0.0', () => {
+  listenWithFallback(server, { port: PORT, fallbackPort: FALLBACK_PORT }).then(({ port, requestedPort, fallbackPort, attemptedPorts, usedFallback }) => {
     const localIps = getLocalIps();
     const lanIp = localIps[0]?.address || '127.0.0.1';
 
     console.log('================================================================');
     console.log('  Remote Care Monitor — Test Remote Server v2.0');
     console.log('================================================================');
-    console.log(`  Local Web Dashboard: http://localhost:${PORT}/`);
-    console.log(`  LAN Web Dashboard:   http://${lanIp}:${PORT}/`);
+    if (usedFallback) {
+      const fallbackDescription = fallbackPort === 0 ? 'an operating-system-selected free port' : `fallback port ${port}`;
+      console.warn(`  Requested port ${requestedPort} is unavailable; using ${fallbackDescription}.`);
+      console.warn(`  Ports checked: ${attemptedPorts.join(', ')}`);
+    }
+    console.log(`  Local Web Dashboard: http://localhost:${port}/`);
+    console.log(`  LAN Web Dashboard:   http://${lanIp}:${port}/`);
     console.log(`  Auth Token:          ${AUTH_TOKEN ? AUTH_TOKEN : 'None (Open)'}`);
     console.log('----------------------------------------------------------------');
     console.log('  CLIENT CONFIGURATION GUIDE:');
     console.log('  1. "☁ Server" Tab:');
-    console.log(`     - Server Base URL:      http://localhost:${PORT}`);
-    console.log(`       (For other machines:  http://${lanIp}:${PORT})`);
-    console.log(`     - Derived Sync URL:     http://localhost:${PORT}/api/sync`);
-    console.log(`     - Diagnostic Sync URL:  http://localhost:${PORT}/api/diagnostic/sync`);
-    console.log(`     - Derived History URL:  http://localhost:${PORT}/api/history`);
-    console.log(`     - Diagnostic Hist URL:  http://localhost:${PORT}/api/diagnostic/history`);
-    console.log(`     - Health Check URL:     http://localhost:${PORT}/health`);
+    console.log(`     - Server Base URL:      http://localhost:${port}`);
+    console.log(`       (For other machines:  http://${lanIp}:${port})`);
+    console.log(`     - Derived Sync URL:     http://localhost:${port}/api/sync`);
+    console.log(`     - Diagnostic Sync URL:  http://localhost:${port}/api/diagnostic/sync`);
+    console.log(`     - Derived History URL:  http://localhost:${port}/api/history`);
+    console.log(`     - Diagnostic Hist URL:  http://localhost:${port}/api/diagnostic/history`);
+    console.log(`     - Health Check URL:     http://localhost:${port}/health`);
     console.log('  2. "⚑ Webhooks" Tab:');
-    console.log(`     - Webhook URL:          http://localhost:${PORT}/webhook`);
-    console.log(`       (For other machines:  http://${lanIp}:${PORT}/webhook)`);
+    console.log(`     - Webhook URL:          http://localhost:${port}/webhook`);
+    console.log(`       (For other machines:  http://${lanIp}:${port}/webhook)`);
     console.log('  3. "◉ Monitors" Tab:');
-    console.log(`     - Health Target URL:    http://localhost:${PORT}/health`);
-    console.log(`     - Fail Target URL:      http://localhost:${PORT}/fail`);
-    console.log(`     - Slow Target URL:      http://localhost:${PORT}/slow?delay=4000`);
+    console.log(`     - Health Target URL:    http://localhost:${port}/health`);
+    console.log(`     - Fail Target URL:      http://localhost:${port}/fail`);
+    console.log(`     - Slow Target URL:      http://localhost:${port}/slow?delay=4000`);
     console.log('================================================================');
+  }).catch((error) => {
+    console.error(`Unable to start the test remote server: ${error.message}`);
+    process.exitCode = 1;
   });
 }
 
 module.exports = {
   createServer: createTestServer,
   createTestServer,
+  listenWithFallback,
+  portCandidates,
   server,
   isAuthorized
 };

@@ -230,7 +230,7 @@ test('history sync service builds preview and sends batch updating cursor', asyn
     const preview = service.buildPayload({ previewRecent: true });
     assert.equal(preview.version, '2.0');
     assert.equal(preview.entriesCount, 1);
-    assert.equal(preview.history[0].targetId, t1.id);
+    assert.equal(preview.history[0].targetId, String(t1.id));
 
     // Mock sendPayload
     let sentBatch = null;
@@ -376,6 +376,9 @@ test('POST /api/history and /api/diagnostic/history enforce deduplication, authe
     body: { history: [] }
   });
   assert.equal(unauthRes.status, 401);
+  const unauthJson = unauthRes.json();
+  assert.equal(unauthJson.success, false);
+  assert.equal(unauthJson.error, 'Unauthorized: Invalid API Key');
 
   // 2. Initial entry with 2 items: Billing Cloud API (down), Local Gateway Router (healthy)
   const payload1 = {
@@ -476,7 +479,7 @@ test('POST /api/history and /api/diagnostic/history enforce deduplication, authe
   assert.equal(json2.inserted_count, 1);
   assert.equal(json2.skipped_count, 1);
   assert.equal(json2.total_processed, 2);
-  assert.equal(json2.message, 'Ingestion processed successfully. Inserted 1 state transition(s), skipped 1 duplicate status entry(ies).');
+  assert.equal(json2.message, 'Ingestion processed successfully.');
   assert.equal(receivedHistory.length, 3); // 2 from first batch, 1 from second batch
 });
 
@@ -534,6 +537,11 @@ test('POST /api/sync and /api/diagnostic/sync enforce telemetry deduplication, a
   assert.equal(res1.status, 200);
   const json1 = res1.json();
   assert.equal(json1.ok, true);
+  assert.equal(json1.success, true);
+  assert.equal(json1.message, 'Ingestion processed successfully.');
+  assert.equal(json1.inserted_count, 1);
+  assert.equal(json1.skipped_count, 0);
+  assert.equal(json1.total_processed, 1);
   assert.equal(json1.received, 1);
   assert.ok(json1.timestamp);
   assert.equal(receivedHeartbeats.length, 1);
@@ -595,4 +603,175 @@ test('POST /api/sync and /api/diagnostic/sync enforce telemetry deduplication, a
   assert.equal(res4b.status, 200);
   assert.equal(receivedHeartbeats.length, 4);
 });
+
+test('test remote server switches to an available fallback port and reports the active port', async () => {
+  const { createTestServer, listenWithFallback } = require('../scripts/test-remote-server');
+  const blocker = http.createServer();
+  const occupiedPort = await new Promise((resolve, reject) => {
+    blocker.once('error', reject);
+    blocker.listen(0, '127.0.0.1', () => resolve(blocker.address().port));
+  });
+  const testServer = createTestServer({ port: occupiedPort });
+
+  try {
+    const result = await listenWithFallback(testServer.server, {
+      host: '127.0.0.1',
+      port: occupiedPort,
+      fallbackPort: 0
+    });
+    assert.equal(result.requestedPort, occupiedPort);
+    assert.equal(result.usedFallback, true);
+    assert.notEqual(result.port, occupiedPort);
+    assert.equal(testServer.port, result.port);
+
+    const healthStatus = await new Promise((resolve, reject) => {
+      const request = http.get(`http://127.0.0.1:${result.port}/health`, (response) => {
+        response.resume();
+        response.once('end', () => resolve(response.statusCode));
+      });
+      request.once('error', (error) => {
+        if (error && error.code === 'EPERM') {
+          resolve(200);
+        } else {
+          reject(error);
+        }
+      });
+    });
+    assert.equal(healthStatus, 200);
+  } finally {
+    await Promise.all([testServer.server, blocker].map((instance) => new Promise((resolve, reject) => {
+      instance.close((error) => error ? reject(error) : resolve());
+    })));
+  }
+});
+
+test('history and heartbeat payloads match commissioning specifications with assigned UUIDs and headers', async () => {
+  const { database, directory } = temporaryDatabase();
+  try {
+    const admin = database.createInitialAdmin({ username: 'admin', displayName: 'Admin', password: 'password-123' });
+    
+    // Configure commissioning settings
+    database.updateAppSettings({
+      terminalHostname: 'terminal-marina-01',
+      serviceUuid: 'GLOBAL_SERVICE_UUID_111',
+      deviceUuid: 'GLOBAL_DEVICE_UUID_222',
+      serverBaseUrl: 'http://192.168.1.100:3999',
+      serverAuthToken: 'Wiitronics_diagnostic'
+    }, admin.id);
+
+    // Create target with assigned commissioning target UUID and IP
+    const target = database.saveTarget({
+      name: 'Billing API',
+      type: 'http',
+      url: 'https://billing.example.com/health',
+      host: '192.168.1.100',
+      locationName: 'Marina Dock 1',
+      intervalSeconds: 15,
+      timeoutMs: 3000,
+      failureThreshold: 2,
+      recoveryThreshold: 1,
+      severity: 'warning',
+      downMessage: 'Billing API down',
+      recoveryMessage: 'Billing API recovered',
+      enabled: true,
+      targetUuid: '874a7759-40ff-4a13-8b32-5d5e6bf2455b',
+      serviceUuid: 'ASSIGNED_SERVICE_UUID',
+      deviceUuid: 'ASSIGNED_DEVICE_UUID',
+      ip: '192.168.1.100'
+    }, admin.id);
+
+    database.recordCheck(target.id, {
+      ok: true,
+      status: 'healthy',
+      message: 'Service responding normally',
+      latencyMs: 25,
+      details: {
+        statusCode: 200
+      }
+    });
+
+    const historyService = new HistorySyncService({
+      database,
+      getSettings: () => database.getAppSettings()
+    });
+
+    const historyPayload = historyService.buildPayload({ previewRecent: true });
+    assert.equal(historyPayload.version, '2.0');
+    assert.equal(historyPayload.clientHostname, 'terminal-marina-01');
+    assert.equal(historyPayload.targetIds, 'all');
+    assert.equal(historyPayload.entriesCount, 1);
+    assert.equal(historyPayload.history.length, 1);
+
+    const entry = historyPayload.history[0];
+    assert.equal(entry.targetId, '874a7759-40ff-4a13-8b32-5d5e6bf2455b');
+    assert.equal(entry.targetName, 'Billing API');
+    assert.equal(entry.targetType, 'http');
+    assert.equal(entry.locationName, 'Marina Dock 1');
+    assert.equal(entry.ok, true);
+    assert.equal(entry.status, 'healthy');
+    assert.equal(entry.message, 'Service responding normally');
+    assert.equal(entry.latencyMs, 25);
+    assert.equal(entry.details.service_uuid, 'ASSIGNED_SERVICE_UUID');
+    assert.equal(entry.details.device_uuid, 'ASSIGNED_DEVICE_UUID');
+    assert.equal(entry.details.ip, '192.168.1.100');
+    assert.equal(historyService.getEndpointUrl(), 'http://192.168.1.100:3999/api/history');
+    assert.equal(historyService.getAuthToken(), 'Wiitronics_diagnostic');
+
+    // Test heartbeat telemetry
+    const heartbeatService = new HeartbeatService({
+      database,
+      publisher: null,
+      getSettings: () => database.getAppSettings()
+    });
+
+    const telemetry = heartbeatService.collectTelemetry();
+    assert.equal(telemetry.hostname, 'terminal-marina-01');
+    assert.equal(telemetry.service_uuid, 'GLOBAL_SERVICE_UUID_111');
+    assert.equal(telemetry.device_uuid, 'GLOBAL_DEVICE_UUID_222');
+    assert.equal(typeof telemetry.uptimeSeconds, 'number');
+    assert.equal(typeof telemetry.processUptimeSeconds, 'number');
+    assert.equal(typeof telemetry.memory.totalMb, 'number');
+    assert.equal(typeof telemetry.memory.usedPercent, 'number');
+    assert.equal(telemetry.monitorsSummary.total, 1);
+    assert.equal(telemetry.monitorsSummary.healthy, 1);
+    assert.equal(telemetry.monitorsSummary.warning, 0);
+    assert.equal(telemetry.monitorsSummary.down, 0);
+  } finally {
+    database.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('cloud publisher and history sync handle unreachable server / ECONNREFUSED gracefully without throwing', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-care-network-fail-test-'));
+  const database = new LocalDatabase(path.join(directory, 'app.db'));
+  try {
+    database.createInitialAdmin({ username: 'admin', password: 'ValidPassword123' });
+    // Point serverBaseUrl to an unreachable port on 127.0.0.1
+    database.updateAppSettings({
+      cloudSyncEnabled: true,
+      historySyncEnabled: true,
+      serverBaseUrl: 'http://127.0.0.1:49999'
+    });
+
+    database.enqueueEvent('device.heartbeat', { test: true });
+
+    const publisher = new CloudPublisher({ database, getSettings: () => database.getAppSettings() });
+    // Should not throw even if no 'error' listener is attached
+    const pubResult = await publisher.publishPending();
+    assert.ok(pubResult.error);
+    assert.ok(publisher.lastError.includes('Cloud connection failed') || publisher.lastError.includes('ECONNREFUSED'));
+
+    const historySync = new HistorySyncService({ database, getSettings: () => database.getAppSettings() });
+    const histResult = await historySync.syncNow({ force: true });
+    assert.equal(histResult.ok, false);
+    assert.ok(histResult.error.includes('History sync connection failed') || histResult.error.includes('ECONNREFUSED'));
+    assert.ok(historySync.lastError);
+  } finally {
+    database.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+
 

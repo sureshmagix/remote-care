@@ -33,23 +33,38 @@ class HeartbeatService {
     const settings = this.getSettings();
     const selection = settings?.telemetrySelection || 'all';
 
+    const hostname = settings?.terminalHostname?.trim() || settings?.clientHostname?.trim() || os.hostname();
+    const service_uuid = settings?.serviceUuid?.trim() || settings?.service_uuid?.trim() || 'ASSIGNED_SERVICE_UUID';
+    const device_uuid = settings?.deviceUuid?.trim() || settings?.device_uuid?.trim() || 'ASSIGNED_DEVICE_UUID';
+
+    const totalMonitors = dashboard?.summary?.total ?? 0;
+    const healthyMonitors = dashboard?.summary?.healthy ?? 0;
+    const warningMonitors = dashboard?.summary?.warning ?? 0;
+    const downMonitors = dashboard?.summary?.down ?? 0;
+
     const fullTelemetry = {
-      hostname: os.hostname(),
+      hostname,
       platform: process.platform,
       arch: process.arch,
-      release: os.release(),
-      uptimeSeconds: os.uptime(),
+      uptimeSeconds: Math.round(os.uptime()),
       processUptimeSeconds: Math.round(process.uptime()),
       memory: {
         totalMb: Math.round(totalMem / (1024 * 1024)),
         freeMb: Math.round(freeMem / (1024 * 1024)),
         usedMb: Math.round(usedMem / (1024 * 1024)),
-        usedPercent: Math.round((usedMem / totalMem) * 100)
+        usedPercent: Number(((usedMem / totalMem) * 100).toFixed(1))
       },
       loadAverage: os.loadavg(),
       cpuCores: os.cpus().length,
-      monitorsSummary: dashboard?.summary || { total: 0, healthy: 0, warning: 0, down: 0 },
+      monitorsSummary: {
+        total: totalMonitors,
+        healthy: healthyMonitors,
+        warning: warningMonitors,
+        down: downMonitors
+      },
       activeIncidentsCount: dashboard?.activeIncidents?.length || 0,
+      service_uuid,
+      device_uuid,
       timestamp: new Date().toISOString()
     };
 
@@ -61,6 +76,8 @@ class HeartbeatService {
         memory: fullTelemetry.memory,
         loadAverage: fullTelemetry.loadAverage,
         cpuCores: fullTelemetry.cpuCores,
+        service_uuid: fullTelemetry.service_uuid,
+        device_uuid: fullTelemetry.device_uuid,
         timestamp: fullTelemetry.timestamp
       };
     }
@@ -70,6 +87,8 @@ class HeartbeatService {
         hostname: fullTelemetry.hostname,
         monitorsSummary: fullTelemetry.monitorsSummary,
         activeIncidentsCount: fullTelemetry.activeIncidentsCount,
+        service_uuid: fullTelemetry.service_uuid,
+        device_uuid: fullTelemetry.device_uuid,
         timestamp: fullTelemetry.timestamp
       };
     }
@@ -78,6 +97,8 @@ class HeartbeatService {
       return {
         hostname: fullTelemetry.hostname,
         status: fullTelemetry.monitorsSummary.down > 0 ? 'down' : 'healthy',
+        service_uuid: fullTelemetry.service_uuid,
+        device_uuid: fullTelemetry.device_uuid,
         timestamp: fullTelemetry.timestamp
       };
     }
@@ -89,7 +110,7 @@ class HeartbeatService {
     try {
       const telemetry = this.collectTelemetry();
       this.database.enqueueEvent('device.heartbeat', telemetry);
-      this.publisher?.trigger();
+      this.publisher?.trigger()?.catch?.(() => {});
       return telemetry;
     } catch (err) {
       // Non-fatal error; log or emit

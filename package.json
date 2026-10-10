@@ -1,6 +1,6 @@
 {
   "name": "remote-care-monitor",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Cross-platform network, target, system resource, and headless server monitor.",
   "homepage": "https://archidtech.in",
   "desktopName": "remote-care-monitor",
@@ -20,28 +20,33 @@
     "test:notifications-ui": "electron scripts/check-notifications.js",
     "lint": "node --check src/main/app.js && node --check src/main/autostart.js && node --check src/main/database.js && node --check src/main/monitor-engine.js && node --check src/main/checks.js && node --check src/main/notification-center.js && node --check src/main/notification-preload.js && node --check src/main/webhooks.js && node --check src/main/cloud-publisher.js && node --check src/main/heartbeat.js && node --check src/daemon/index.js && node --check src/renderer/notification.js && node --check src/renderer/app.js",
     "pack": "electron-builder --dir",
-    "dist": "electron-builder"
+    "dist": "electron-builder",
+    "build:win": "node scripts/build-win.js"
   },
   "build": {
     "appId": "in.archidtech.remotecare",
     "productName": "Remote Care Monitor",
     "icon": "assets/icon.png",
+    "npmRebuild": false,
     "directories": {
       "output": "release"
     },
     "files": [
       "src/**/*",
-      "assets/icon.png",
+      "assets/**/*",
+      "prebuilds/**/*",
       "package.json",
       "README.md"
     ],
     "asar": true,
     "asarUnpack": [
-      "assets/icon.png",
+      "assets/**/*",
+      "prebuilds/**/*",
       "node_modules/better-sqlite3/**/*"
     ],
     "win": {
-      "target": ["nsis", "portable"]
+      "target": ["nsis", "portable"],
+      "icon": "assets/icon.ico"
     },
     "linux": {
       "target": ["AppImage", "deb"],

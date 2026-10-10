@@ -13,6 +13,82 @@ const { CloudPublisher } = require('./cloud-publisher');
 const { HeartbeatService } = require('./heartbeat');
 const { HistorySyncService } = require('./history-sync');
 
+function reportFatalError(stage, error) {
+  const timestamp = new Date().toISOString();
+  const errorMessage = error?.stack || error?.message || String(error);
+  const logHeader = `[${timestamp}] CRITICAL APPLICATION ERROR (${stage})\n`;
+  const sysInfo = [
+    `Platform: ${process.platform} (${process.arch})`,
+    `Node: ${process.version}`,
+    `Electron: ${process.versions?.electron || 'unknown'}`,
+    `App Version: ${app.isPackaged ? app.getVersion() : 'dev'}`,
+    `Resources Path: ${process.resourcesPath || 'n/a'}`,
+    `Executable: ${process.execPath}`
+  ].join('\n');
+  const fullLog = `${logHeader}${sysInfo}\n\nError details:\n${errorMessage}\n${'='.repeat(60)}\n\n`;
+
+  console.error(fullLog);
+
+  const logDirs = [];
+  try {
+    const userData = app.getPath('userData');
+    if (userData) logDirs.push(userData);
+  } catch (_) {}
+  if (process.env.APPDATA) {
+    logDirs.push(path.join(process.env.APPDATA, 'Remote Care Monitor'));
+  }
+  if (process.env.USERPROFILE) {
+    logDirs.push(path.join(process.env.USERPROFILE, '.remote-care'));
+  }
+  logDirs.push(process.cwd());
+
+  let writtenPath = null;
+  for (const dir of logDirs) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      const targetLog = path.join(dir, 'remote-care-crash.log');
+      fs.appendFileSync(targetLog, fullLog, 'utf8');
+      writtenPath = targetLog;
+      break;
+    } catch (_) {}
+  }
+
+  try {
+    dialog.showErrorBox(
+      'Remote Care Monitor — Startup Failure',
+      `The application encountered a critical error during "${stage}":\n\n` +
+      `${error?.message || error}\n\n` +
+      `Diagnostic details have been logged to:\n${writtenPath || 'remote-care-crash.log'}`
+    );
+  } catch (dialogErr) {
+    console.error('Failed to display native error dialog:', dialogErr);
+  }
+}
+
+process.on('uncaughtException', (error) => {
+  reportFatalError('uncaughtException', error);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+  const msg = reason?.message || String(reason || '');
+  if (
+    msg.includes('Cloud connection failed') ||
+    msg.includes('History sync connection failed') ||
+    msg.includes('ECONNREFUSED') ||
+    msg.includes('ETIMEDOUT') ||
+    msg.includes('ENOTFOUND') ||
+    msg.includes('EAI_AGAIN') ||
+    msg.includes('Cloud server returned HTTP') ||
+    msg.includes('History sync server returned HTTP')
+  ) {
+    console.warn('[Process] Non-fatal network connection error in background sync:', msg);
+    return;
+  }
+  reportFatalError('unhandledRejection', reason);
+  process.exit(1);
+});
+
 app.setName('Remote Care Monitor');
 if (process.platform === 'win32') {
   app.setAppUserModelId('in.archidtech.remotecare');
@@ -86,7 +162,36 @@ function monthlyReportCsv(report) {
   return `\ufeff${lines.join('\r\n')}\r\n`;
 }
 
+function resolveAppIconPath() {
+  const isWin = process.platform === 'win32';
+  const iconNames = isWin ? ['icon.ico', 'icon.png'] : ['icon.png', 'icon.ico'];
+  const candidateDirs = [
+    path.resolve(__dirname, '../../assets'),
+    path.resolve(__dirname, '../assets'),
+    path.resolve(__dirname, 'assets'),
+    process.resourcesPath ? path.join(process.resourcesPath, 'assets') : null,
+    process.resourcesPath ? path.join(process.resourcesPath, 'app.asar.unpacked', 'assets') : null
+  ].filter(Boolean);
+
+  for (const dir of candidateDirs) {
+    for (const name of iconNames) {
+      const p = path.join(dir, name);
+      if (fs.existsSync(p)) return p;
+    }
+  }
+  return null;
+}
+
 function createTrayIcon() {
+  const iconPath = resolveAppIconPath();
+  if (iconPath) {
+    try {
+      const img = nativeImage.createFromPath(iconPath);
+      if (!img.isEmpty()) {
+        return img.resize({ width: 16, height: 16 });
+      }
+    } catch (_) {}
+  }
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
     <rect width="64" height="64" rx="14" fill="#0e7490"/>
     <path d="M14 35c9-13 27-13 36 0M20 42c6-8 18-8 24 0M29 49a3 3 0 1 0 6 0 3 3 0 0 0-6 0" fill="none" stroke="white" stroke-width="4" stroke-linecap="round"/>
@@ -161,7 +266,7 @@ function notify(event) {
   }
 
   // Phase 2: Trigger immediate cloud sync
-  cloudPublisher?.trigger();
+  cloudPublisher?.trigger()?.catch?.(() => {});
 }
 
 function showBackgroundToast() {
@@ -201,7 +306,8 @@ function completeShutdown() {
 
 function createWindow() {
   if (mainWindow && !mainWindow.isDestroyed()) return mainWindow;
-  mainWindow = new BrowserWindow({
+  const iconPath = resolveAppIconPath();
+  const windowOptions = {
     width: 1280,
     height: 800,
     minWidth: 980,
@@ -218,7 +324,11 @@ function createWindow() {
       backgroundThrottling: false,
       devTools: !app.isPackaged
     }
-  });
+  };
+  if (iconPath) {
+    windowOptions.icon = iconPath;
+  }
+  mainWindow = new BrowserWindow(windowOptions);
   if (process.platform !== 'darwin') {
     mainWindow.removeMenu();
   }
@@ -264,6 +374,35 @@ function requireSession(token, allowedRoles = null) {
   return session;
 }
 
+function initializeCloudServices() {
+  if (cloudPublisher) {
+    cloudPublisher.stop();
+    cloudPublisher.removeAllListeners();
+  }
+  if (heartbeatService) {
+    heartbeatService.stop();
+  }
+  if (historySyncService) {
+    historySyncService.stop();
+    historySyncService.removeAllListeners();
+  }
+
+  cloudPublisher = new CloudPublisher({ database, getSettings: () => database.getAppSettings() });
+  cloudPublisher.on('error', (err) => {
+    console.warn('[CloudPublisher] Network sync error:', err?.message || err);
+  });
+  cloudPublisher.start();
+
+  heartbeatService = new HeartbeatService({ database, publisher: cloudPublisher, getSettings: () => database.getAppSettings() });
+  heartbeatService.start();
+
+  historySyncService = new HistorySyncService({ database, getSettings: () => database.getAppSettings() });
+  historySyncService.on('error', (err) => {
+    console.warn('[HistorySyncService] Network history sync error:', err?.message || err);
+  });
+  historySyncService.start();
+}
+
 function registerIpc() {
   ipcMain.handle('setup-state', () => database.getSetupState());
 
@@ -272,12 +411,7 @@ function registerIpc() {
     database.createDefaultTargets();
     monitor.refreshSchedule(true);
     monitor.start();
-    cloudPublisher = new CloudPublisher({ database, getSettings: () => database.getAppSettings() });
-    cloudPublisher.start();
-    heartbeatService = new HeartbeatService({ database, publisher: cloudPublisher, getSettings: () => database.getAppSettings() });
-    heartbeatService.start();
-    historySyncService = new HistorySyncService({ database, getSettings: () => database.getAppSettings() });
-    historySyncService.start();
+    initializeCloudServices();
     const session = sessions.issue(user);
     database.markLogin(user.id);
     database.audit(user.id, 'login', 'session', session.token, {});
@@ -640,15 +774,13 @@ app.whenReady().then(() => {
   if (database.hasSuperAdmin()) {
     database.createDefaultTargets();
     monitor.start();
-    cloudPublisher = new CloudPublisher({ database, getSettings: () => database.getAppSettings() });
-    cloudPublisher.start();
-    heartbeatService = new HeartbeatService({ database, publisher: cloudPublisher, getSettings: () => database.getAppSettings() });
-    heartbeatService.start();
-    historySyncService = new HistorySyncService({ database, getSettings: () => database.getAppSettings() });
-    historySyncService.start();
+    initializeCloudServices();
   }
   createWindow();
   if (!startedAtLogin || !database.hasSuperAdmin()) showWindow();
+}).catch((error) => {
+  reportFatalError('app.whenReady', error);
+  app.quit();
 });
 
 app.on('second-instance', () => showWindow());

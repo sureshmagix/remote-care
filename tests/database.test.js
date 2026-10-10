@@ -70,7 +70,10 @@ test('app notification and tray settings use safe defaults and persist changes',
       historySyncEnabled: false,
       historySyncUrl: '',
       historySyncIntervalMinutes: 5,
-      historySyncTargetIds: ''
+      historySyncTargetIds: '',
+      terminalHostname: '',
+      serviceUuid: '',
+      deviceUuid: ''
     });
     const saved = database.updateAppSettings({
       minimizeToTray: true,

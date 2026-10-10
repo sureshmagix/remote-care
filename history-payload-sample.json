@@ -1,39 +1,25 @@
 {
   "version": "2.0",
-  "dispatchedAt": "2026-10-06T13:00:00.123Z",
-  "clientHostname": "store-pi-terminal-01",
+  "dispatchedAt": "2026-10-10T12:00:00.000Z",
+  "clientHostname": "YOUR_TERMINAL_HOSTNAME",
   "targetIds": "all",
-  "entriesCount": 2,
+  "entriesCount": 1,
   "history": [
     {
-      "id": 1042,
-      "targetId": "1",
-      "targetName": "Billing Cloud API",
+      "id": 1,
+      "targetId": "ASSIGNED_DEVICE_OR_SERVICE_UUID",
+      "targetName": "YOUR_SERVICE_OR_DEVICE_NAME",
       "targetType": "http",
-      "locationName": "Main Office",
-      "checkedAt": "2026-10-06T12:56:15.000Z",
-      "ok": false,
-      "status": "down",
-      "message": "HTTP 502 Bad Gateway from upstream service",
-      "latencyMs": 1420,
-      "details": {
-        "statusCode": 502,
-        "url": "https://api.example.com/v1/billing/health"
-      }
-    },
-    {
-      "id": 1043,
-      "targetId": "2",
-      "targetName": "Local Gateway Router",
-      "targetType": "gateway",
-      "locationName": "Main Office",
-      "checkedAt": "2026-10-06T12:57:30.000Z",
+      "locationName": "YOUR_LOCATION_NAME",
+      "checkedAt": "2026-10-10T12:00:00.000Z",
       "ok": true,
       "status": "healthy",
-      "message": "Local network gateway 192.168.1.1 is reachable.",
-      "latencyMs": 4,
+      "message": "Service responding normally",
+      "latencyMs": 25,
       "details": {
-        "gatewayIp": "192.168.1.1"
+        "service_uuid": "ASSIGNED_SERVICE_UUID",
+        "device_uuid": "ASSIGNED_DEVICE_UUID",
+        "ip": "192.168.1.100"
       }
     }
   ]

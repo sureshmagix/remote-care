@@ -1009,18 +1009,37 @@ async function renderServer(content) {
           </label>
           <div class="field" style="margin-top:10px">
             <label>Server Base URL</label>
-            <input name="serverBaseUrl" type="url" value="${escapeHtml(settings.serverBaseUrl || '')}" placeholder="http://192.168.1.50:3000 or https://care-cloud.example.com" id="server-base-url-input" />
-            <span class="helper">Enter only the base URL of your remote care server. API endpoints like <code>/api/sync</code>, <code>/api/history</code>, and <code>/health</code> are derived automatically.</span>
+            <input name="serverBaseUrl" type="url" value="${escapeHtml(settings.serverBaseUrl || '')}" placeholder="http://192.168.1.100:3999" id="server-base-url-input" />
+            <span class="helper">Enter only the base URL of your remote care server (e.g. <code>http://&lt;YOUR_SERVER_IP&gt;:3999</code>). Endpoints <code>/api/sync</code>, <code>/api/history</code>, and <code>/health</code> are derived automatically.</span>
           </div>
           <div class="field">
-            <label>Server API Key / Auth Token</label>
-            <input name="serverAuthToken" type="password" value="${escapeHtml(settings.serverAuthToken || settings.cloudAuthToken || '')}" placeholder="Optional Bearer token or x-api-key" />
-            <span class="helper">Supplied via <code>x-api-key</code> and <code>Authorization: Bearer &lt;token&gt;</code> headers with outbound server requests.</span>
+            <label>Server API Key (x-api-key)</label>
+            <input name="serverAuthToken" type="password" value="${escapeHtml(settings.serverAuthToken || settings.cloudAuthToken || '')}" placeholder="Wiitronics_diagnostic" />
+            <span class="helper">Supplied via <code>x-api-key: Wiitronics_diagnostic</code> (or configured secret key) and <code>Authorization: Bearer &lt;token&gt;</code>.</span>
           </div>
-          <div class="field">
-            <label>Sync Interval (seconds)</label>
-            <input name="serverSyncIntervalSeconds" type="number" min="2" max="3600" step="1" value="${settings.serverSyncIntervalSeconds ?? 15}" required />
-            <span class="helper">How frequently pending outbound event batches are flushed to the server.</span>
+          <div class="two-col">
+            <div class="field">
+              <label>Terminal Hostname (clientHostname)</label>
+              <input name="terminalHostname" type="text" value="${escapeHtml(settings.terminalHostname || '')}" placeholder="terminal-marina-01" />
+              <span class="helper">Unique hostname of this terminal. Defaults to system hostname if blank.</span>
+            </div>
+            <div class="field">
+              <label>Sync Interval (seconds)</label>
+              <input name="serverSyncIntervalSeconds" type="number" min="2" max="3600" step="1" value="${settings.serverSyncIntervalSeconds ?? 15}" required />
+              <span class="helper">Frequency outbound events are flushed to server.</span>
+            </div>
+          </div>
+          <div class="two-col">
+            <div class="field">
+              <label>Commissioned Service UUID</label>
+              <input name="serviceUuid" type="text" value="${escapeHtml(settings.serviceUuid || '')}" placeholder="ASSIGNED_SERVICE_UUID" />
+              <span class="helper">Assigned Service UUID during commissioning.</span>
+            </div>
+            <div class="field">
+              <label>Commissioned Device UUID</label>
+              <input name="deviceUuid" type="text" value="${escapeHtml(settings.deviceUuid || '')}" placeholder="ASSIGNED_DEVICE_UUID" />
+              <span class="helper">Assigned Device UUID during commissioning.</span>
+            </div>
           </div>
         </div>
       </article>
@@ -1034,8 +1053,8 @@ async function renderServer(content) {
           </label>
           <div class="field" style="margin-top:10px">
             <label>History Sync URL</label>
-            <input name="historySyncUrl" type="url" value="${escapeHtml(settings.historySyncUrl || '')}" placeholder="${escapeHtml(derivedHistory || 'http://localhost:3000/api/history')}" id="history-sync-url-input" />
-            <span class="helper">Dedicated endpoint for result changes history. Defaults to <code>&lt;Base URL&gt;/api/history</code> (or <code>/api/diagnostic/history</code>) if left blank.</span>
+            <input name="historySyncUrl" type="url" value="${escapeHtml(settings.historySyncUrl || '')}" placeholder="${escapeHtml(derivedHistory || 'http://localhost:3999/api/history')}" id="history-sync-url-input" />
+            <span class="helper">Dedicated endpoint for result changes history (<code>POST /api/history</code>). Defaults to <code>&lt;Base URL&gt;/api/history</code> if left blank.</span>
           </div>
           <div class="field">
             <label>History Sync Delay / Interval (minutes)</label>
@@ -1186,8 +1205,8 @@ async function renderServer(content) {
       if (healthInput) healthInput.placeholder = `${b}/health`;
       if (historyInput) historyInput.placeholder = `${b}/api/history`;
     } else {
-      if (healthInput) healthInput.placeholder = 'http://localhost:3000/health';
-      if (historyInput) historyInput.placeholder = 'http://localhost:3000/api/history';
+      if (healthInput) healthInput.placeholder = 'http://localhost:3999/health';
+      if (historyInput) historyInput.placeholder = 'http://localhost:3999/api/history';
     }
   });
 
@@ -1313,6 +1332,9 @@ async function renderServer(content) {
     const healthUrl = form.elements.serverHealthUrl?.value?.trim() || '';
     const historyUrl = form.elements.historySyncUrl?.value?.trim() || '';
     const authToken = form.elements.serverAuthToken?.value?.trim() || '';
+    const terminalHostname = form.elements.terminalHostname?.value?.trim() || '';
+    const serviceUuid = form.elements.serviceUuid?.value?.trim() || '';
+    const deviceUuid = form.elements.deviceUuid?.value?.trim() || '';
     const selectedTargetIds = getSelectedTargetIds();
 
     const next = {
@@ -1326,6 +1348,9 @@ async function renderServer(content) {
       historySyncTargetIds: selectedTargetIds,
       serverAuthToken: authToken,
       cloudAuthToken: authToken,
+      terminalHostname,
+      serviceUuid,
+      deviceUuid,
       // For backwards compatibility: if cloudHttpsUrl is not customized, derive it
       cloudHttpsUrl: baseUrl ? `${baseUrl.replace(/\/+$/, '')}/api/sync` : state.settings.cloudHttpsUrl,
       telemetrySelection: form.elements.telemetrySelection?.value || 'all',
@@ -1448,8 +1473,8 @@ async function renderAbout(content) {
 
 function monitorFields(type) {
   const visibility = {
-    host: ['ping', 'tcp'].includes(type),
-    port: type === 'tcp',
+    host: ['ping', 'icmp', 'tcp', 'rtsp'].includes(type),
+    port: ['tcp', 'rtsp'].includes(type),
     url: ['http', 'internet'].includes(type),
     interface: type === 'interface',
     service: type === 'system_service',
@@ -1499,21 +1524,31 @@ function openMonitorDialog(target = null) {
     <form id="monitor-form"><div class="dialog-body">
       <div class="two-col"><div class="field"><label>Name</label><input name="name" required maxlength="80" value="${value('name')}" placeholder="Production API" /></div><div class="field"><label>Location name</label><input name="locationName" required minlength="2" maxlength="100" value="${value('locationName', 'Local device')}" placeholder="e.g. Bengaluru office" /></div></div>
       <div class="field"><label>Check type</label><select name="type">
+        <option value="http">HTTP/HTTPS endpoint</option>
+        <option value="icmp">ICMP ping</option>
+        <option value="gateway">Default gateway</option>
+        <option value="rtsp">RTSP stream</option>
+        <option value="disk">Disk storage usage</option>
+        <option value="ping">Ping (ICMP)</option>
+        <option value="tcp">TCP port</option>
         <option value="internet">Internet connection</option>
         <option value="interface">Network interface</option>
-        <option value="gateway">Default gateway</option>
-        <option value="ping">ICMP ping</option>
-        <option value="tcp">TCP port</option>
-        <option value="http">HTTP/HTTPS endpoint</option>
         <option value="system_service">Local system service</option>
         <option value="process">Local process</option>
-        <option value="disk">Disk storage usage</option>
         <option value="memory">System RAM usage</option>
         <option value="cpu">CPU utilization</option>
         <option value="command">Custom script / command</option>
       </select></div>
+      <div class="two-col">
+        <div class="field"><label>Commissioned Target UUID</label><input name="targetUuid" value="${escapeHtml(metadata.targetUuid || target?.targetUuid || '')}" placeholder="ASSIGNED_DEVICE_OR_SERVICE_UUID" /><span class="helper">UUID assigned during commissioning.</span></div>
+        <div class="field"><label>Reported IP Address</label><input name="targetIp" value="${escapeHtml(metadata.ip || '')}" placeholder="192.168.1.100" /><span class="helper">IP included in history details.</span></div>
+      </div>
+      <div class="two-col">
+        <div class="field"><label>Commissioned Service UUID</label><input name="serviceUuid" value="${escapeHtml(metadata.serviceUuid || target?.serviceUuid || '')}" placeholder="Optional (inherits default)" /></div>
+        <div class="field"><label>Commissioned Device UUID</label><input name="deviceUuid" value="${escapeHtml(metadata.deviceUuid || target?.deviceUuid || '')}" placeholder="Optional (inherits default)" /></div>
+      </div>
       <div class="field" data-monitor-field="host"><label>Host or IP address</label><input name="host" value="${value('host')}" placeholder="192.168.1.20 or api.example.com" /></div>
-      <div class="field" data-monitor-field="port"><label>TCP port</label><input name="port" type="number" min="1" max="65535" value="${value('port')}" placeholder="1883" /></div>
+      <div class="field" data-monitor-field="port"><label>Port (TCP / RTSP)</label><input name="port" type="number" min="1" max="65535" value="${value('port')}" placeholder="554 or 1883" /></div>
       <div class="field" data-monitor-field="url"><label>HTTP/HTTPS URL</label><input name="url" type="url" value="${value('url')}" placeholder="https://api.example.com/health" /></div>
       <div class="field" data-monitor-field="dns"><label>DNS hostname to resolve</label><input name="dnsHost" value="${escapeHtml(metadata.dnsHost || '')}" placeholder="cloudflare.com" /><span class="helper">Used before the Internet HTTPS check to distinguish DNS failure.</span></div>
       <div class="field" data-monitor-field="interface"><label>Network interface to monitor</label><select name="interfaceName">${interfaceOptions(target?.interfaceName || 'auto')}</select><span class="helper">Select “Wi-Fi / Wireless” or a specific adapter (e.g. en0) to alert immediately when Wi-Fi is disconnected.</span></div>
@@ -1554,6 +1589,10 @@ function openMonitorDialog(target = null) {
     error.textContent = '';
     const values = Object.fromEntries(new FormData(form).entries());
     const meta = {
+      targetUuid: values.targetUuid?.trim() || undefined,
+      serviceUuid: values.serviceUuid?.trim() || undefined,
+      deviceUuid: values.deviceUuid?.trim() || undefined,
+      ip: values.targetIp?.trim() || undefined,
       dnsHost: values.dnsHost,
       path: values.diskPath,
       thresholdPercent: values.thresholdPercent ? Number(values.thresholdPercent) : undefined,

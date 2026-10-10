@@ -551,8 +551,10 @@ async function executeCheck(target) {
       case 'internet': return await checkInternet(target);
       case 'interface': return await checkInterface(target);
       case 'gateway': return await checkGateway(target);
-      case 'ping': return await checkPing(target.host, target.timeoutMs);
+      case 'ping':
+      case 'icmp': return await checkPing(target.host, target.timeoutMs);
       case 'tcp': return await checkTcp(target.host, target.port, target.timeoutMs);
+      case 'rtsp': return await checkTcp(target.host, target.port || 554, target.timeoutMs);
       case 'http': return await checkHttp(target.url, target.timeoutMs);
       case 'system_service': return await checkSystemService(target.serviceName, target.timeoutMs);
       case 'process': return await checkProcess(target.processName, target.timeoutMs);

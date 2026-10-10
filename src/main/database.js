@@ -4,7 +4,7 @@ const Database = require('better-sqlite3');
 const { passwordRecord, validateUsername, verifyPassword } = require('./auth');
 
 const ROLES = Object.freeze({ SUPER_ADMIN: 'super_admin', OPERATOR: 'operator', VIEWER: 'viewer' });
-const CHECK_TYPES = new Set(['internet', 'interface', 'gateway', 'ping', 'tcp', 'http', 'system_service', 'process', 'disk', 'memory', 'cpu', 'command']);
+const CHECK_TYPES = new Set(['internet', 'interface', 'gateway', 'ping', 'icmp', 'tcp', 'http', 'rtsp', 'system_service', 'process', 'disk', 'memory', 'cpu', 'command']);
 const STATUSES = new Set(['unknown', 'healthy', 'warning', 'down', 'disabled']);
 const HISTORY_STATUSES = new Set(['unknown', 'healthy', 'warning', 'down']);
 const HISTORY_OUTCOMES = new Set(['all', 'success', 'failure']);
@@ -41,7 +41,10 @@ const DEFAULT_APP_SETTINGS = Object.freeze({
   historySyncEnabled: false,
   historySyncUrl: '',
   historySyncIntervalMinutes: 5,
-  historySyncTargetIds: ''
+  historySyncTargetIds: '',
+  terminalHostname: '',
+  serviceUuid: '',
+  deviceUuid: ''
 });
 const APP_SETTING_KEYS = Object.freeze({
   minimizeToTray: 'minimize_to_tray',
@@ -68,7 +71,10 @@ const APP_SETTING_KEYS = Object.freeze({
   historySyncEnabled: 'history_sync_enabled',
   historySyncUrl: 'history_sync_url',
   historySyncIntervalMinutes: 'history_sync_interval_minutes',
-  historySyncTargetIds: 'history_sync_target_ids'
+  historySyncTargetIds: 'history_sync_target_ids',
+  terminalHostname: 'terminal_hostname',
+  serviceUuid: 'service_uuid',
+  deviceUuid: 'device_uuid'
 });
 
 function now() {
@@ -143,8 +149,12 @@ function mapUserWithAuth(row) {
 
 function mapTarget(row) {
   if (!row) return null;
+  const metadata = parseJson(row.metadata_json);
   return {
     id: row.id,
+    targetUuid: metadata.targetUuid || metadata.uuid || null,
+    serviceUuid: metadata.serviceUuid || null,
+    deviceUuid: metadata.deviceUuid || null,
     name: row.name,
     locationName: row.location_name || DEFAULT_LOCATION_NAME,
     type: row.type,
@@ -168,7 +178,7 @@ function mapTarget(row) {
     lastCheckedAt: row.last_checked_at,
     lastLatencyMs: row.last_latency_ms,
     incidentStartedAt: row.incident_started_at,
-    metadata: parseJson(row.metadata_json),
+    metadata,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -196,7 +206,7 @@ function validateTarget(input) {
   const processName = String(input.processName || '').trim();
   const port = input.port === '' || input.port === null || input.port === undefined ? null : toPositiveInteger(input.port, null, 1, 65535);
 
-  if (['ping', 'tcp'].includes(type) && !host) throw new Error('Host or IP address is required for this monitor.');
+  if (['ping', 'icmp', 'tcp', 'rtsp'].includes(type) && !host) throw new Error('Host or IP address is required for this monitor.');
   if (type === 'tcp' && !port) throw new Error('A TCP port is required.');
   if (['http', 'internet'].includes(type)) {
     if (!url) throw new Error('A HTTP or HTTPS URL is required.');
@@ -214,6 +224,18 @@ function validateTarget(input) {
   }
 
   const metadata = input.metadata && typeof input.metadata === 'object' ? { ...input.metadata } : {};
+  if (input.targetUuid || input.uuid) {
+    metadata.targetUuid = String(input.targetUuid || input.uuid).trim();
+  }
+  if (input.serviceUuid || input.service_uuid) {
+    metadata.serviceUuid = String(input.serviceUuid || input.service_uuid).trim();
+  }
+  if (input.deviceUuid || input.device_uuid) {
+    metadata.deviceUuid = String(input.deviceUuid || input.device_uuid).trim();
+  }
+  if (input.ip) {
+    metadata.ip = String(input.ip).trim();
+  }
   if (['disk', 'memory', 'cpu'].includes(type)) {
     const rawThreshold = metadata.thresholdPercent ?? input.thresholdPercent ?? 90;
     metadata.thresholdPercent = toPositiveInteger(rawThreshold, 90, 1, 100);
@@ -313,10 +335,74 @@ function mapHistoryResult(row) {
   };
 }
 
+function resolveSqliteBinding() {
+  const platformArch = `${process.platform}-${process.arch}`;
+  const candidates = [];
+
+  // Packaged Electron paths
+  if (process.resourcesPath) {
+    candidates.push(
+      path.join(process.resourcesPath, 'app.asar.unpacked', 'prebuilds', platformArch, 'better_sqlite3.node'),
+      path.join(process.resourcesPath, 'app.asar.unpacked', 'node_modules', 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node'),
+      path.join(process.resourcesPath, 'prebuilds', platformArch, 'better_sqlite3.node')
+    );
+  }
+
+  // Development and project paths
+  candidates.push(
+    path.resolve(__dirname, '../../prebuilds', platformArch, 'better_sqlite3.node'),
+    path.resolve(__dirname, '../prebuilds', platformArch, 'better_sqlite3.node'),
+    path.resolve(process.cwd(), 'prebuilds', platformArch, 'better_sqlite3.node'),
+    path.resolve(__dirname, '../../node_modules/better-sqlite3/build/Release/better_sqlite3.node'),
+    path.resolve(__dirname, '../../node_modules/better-sqlite3/prebuilds', platformArch, 'better_sqlite3.node')
+  );
+
+  const attempted = [];
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      try {
+        const testDb = new Database(':memory:', { nativeBinding: candidate });
+        testDb.close();
+        return candidate;
+      } catch (err) {
+        attempted.push({ path: candidate, error: err.message });
+      }
+    }
+  }
+
+  // Fallback to default better-sqlite3 bindings resolution
+  try {
+    const testDb = new Database(':memory:');
+    testDb.close();
+    return null;
+  } catch (err) {
+    attempted.push({ path: 'default (bindings package)', error: err.message });
+  }
+
+  const failureDetails = attempted.map((a) => ` - [${a.path}]: ${a.error}`).join('\n');
+  throw new Error(
+    `Failed to load SQLite native database engine for ${process.platform} (${process.arch}).\n` +
+    `The native module "better_sqlite3.node" could not be initialized.\n` +
+    `Attempted locations:\n${failureDetails}\n` +
+    `Please verify that the proper native binary for ${process.platform}-${process.arch} is present.`
+  );
+}
+
+let cachedNativeBinding = undefined;
+function getSqliteBinding() {
+  if (cachedNativeBinding === undefined) {
+    cachedNativeBinding = resolveSqliteBinding();
+  }
+  return cachedNativeBinding;
+}
+
 class LocalDatabase {
   constructor(filePath) {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    this.db = new Database(filePath);
+    const binding = getSqliteBinding();
+    const options = binding ? { nativeBinding: binding } : {};
+    this.db = new Database(filePath, options);
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('foreign_keys = ON');
     this.migrate();
@@ -945,6 +1031,7 @@ class LocalDatabase {
   getHistoryChanges({ targetIds = null, sinceId = null, limit = 100, reverse = false } = {}) {
     let query = `
       SELECT r.id, r.target_id, t.name AS target_name, t.type AS target_type,
+             t.host AS target_host, t.metadata_json AS target_metadata_json,
              r.location_name, r.checked_at, r.ok, r.status, r.message, r.latency_ms,
              r.details_json, r.result_signature
       FROM check_results r
@@ -970,41 +1057,62 @@ class LocalDatabase {
 
     const safeLimit = Number.isInteger(Number(limit)) && Number(limit) > 0 ? Math.min(Number(limit), 500) : 100;
 
-    if (reverse) {
-      query += ` ORDER BY r.id DESC LIMIT ?`;
-      params.push(safeLimit);
-      const rows = this.db.prepare(query).all(...params);
-      return rows.reverse().map((row) => ({
+    const settings = this.getAppSettings();
+    const globalServiceUuid = settings?.serviceUuid?.trim() || 'ASSIGNED_SERVICE_UUID';
+    const globalDeviceUuid = settings?.deviceUuid?.trim() || 'ASSIGNED_DEVICE_UUID';
+
+    const mapHistoryRow = (row) => {
+      const targetMeta = parseJson(row.target_metadata_json, {});
+      const parsedDetails = parseJson(row.details_json, {});
+
+      let targetType = row.target_type;
+      if (targetType === 'ping') targetType = 'icmp';
+
+      const targetId = targetMeta.targetUuid || targetMeta.uuid ? String(targetMeta.targetUuid || targetMeta.uuid) : row.target_id;
+      const serviceUuid = targetMeta.serviceUuid || targetMeta.service_uuid || parsedDetails.service_uuid || globalServiceUuid;
+      const deviceUuid = targetMeta.deviceUuid || targetMeta.device_uuid || parsedDetails.device_uuid || globalDeviceUuid;
+
+      let ip = parsedDetails.ip || targetMeta.ip;
+      if (!ip && row.target_host && !row.target_host.includes('/') && !row.target_host.includes(':')) {
+        ip = row.target_host;
+      }
+      if (!ip && parsedDetails.gatewayIp) {
+        ip = parsedDetails.gatewayIp;
+      }
+
+      const details = {
+        ...parsedDetails,
+        service_uuid: serviceUuid,
+        device_uuid: deviceUuid,
+        ...(ip ? { ip } : {})
+      };
+
+      return {
         id: row.id,
-        targetId: row.target_id,
+        targetId,
         targetName: row.target_name,
-        targetType: row.target_type,
-        locationName: row.location_name,
+        targetType,
+        locationName: row.location_name || DEFAULT_LOCATION_NAME,
         checkedAt: row.checked_at,
         ok: Boolean(row.ok),
         status: row.status,
         message: row.message,
-        latencyMs: row.latency_ms,
-        details: parseJson(row.details_json, {})
-      }));
+        latencyMs: typeof row.latency_ms === 'number' ? Math.round(row.latency_ms) : (row.latency_ms ? Number(row.latency_ms) : 0),
+        details
+      };
+    };
+
+    if (reverse) {
+      query += ` ORDER BY r.id DESC LIMIT ?`;
+      params.push(safeLimit);
+      const rows = this.db.prepare(query).all(...params);
+      return rows.reverse().map(mapHistoryRow);
     }
 
     query += ` ORDER BY r.id ASC LIMIT ?`;
     params.push(safeLimit);
     const rows = this.db.prepare(query).all(...params);
-    return rows.map((row) => ({
-      id: row.id,
-      targetId: row.target_id,
-      targetName: row.target_name,
-      targetType: row.target_type,
-      locationName: row.location_name,
-      checkedAt: row.checked_at,
-      ok: Boolean(row.ok),
-      status: row.status,
-      message: row.message,
-      latencyMs: row.latency_ms,
-      details: parseJson(row.details_json, {})
-    }));
+    return rows.map(mapHistoryRow);
   }
 
   setHistorySyncCursor(lastId, lastSyncAt) {
