@@ -38,6 +38,17 @@ contextBridge.exposeInMainWorld('remoteCare', {
   getHistorySyncStatus: (token) => invoke('history-sync-status', { token }),
   exportMonitors: (token, targetIds) => invoke('targets-export', { token, targetIds }),
   importMonitors: (token, options) => invoke('targets-import', { token, options }),
+  getRunningProcesses: (token) => invoke('running-processes', { token }),
+  getSystemServices: (token) => invoke('system-services', { token }),
+  getDockerContainers: (token) => invoke('docker-containers', { token }),
+  getRemoteSyncStatus: (token) => invoke('remote-sync-status', { token }),
+  triggerRemoteSync: (token) => invoke('remote-sync-trigger', { token }),
+  factoryResetWipe: (token, password) => invoke('factory-reset-wipe', { token, password }),
+  onRemoteSyncUpdate: (listener) => {
+    const wrapped = (_event, payload) => listener(payload);
+    ipcRenderer.on('remote-sync-update', wrapped);
+    return () => ipcRenderer.removeListener('remote-sync-update', wrapped);
+  },
   onUpdate: (listener) => {
     const wrapped = (_event, payload) => listener(payload);
     ipcRenderer.on('monitor-update', wrapped);

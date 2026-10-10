@@ -71,6 +71,7 @@ test('app notification and tray settings use safe defaults and persist changes',
       historySyncUrl: '',
       historySyncIntervalMinutes: 5,
       historySyncTargetIds: '',
+      historySyncTargetTypes: 'all',
       terminalHostname: '',
       serviceUuid: '',
       deviceUuid: ''

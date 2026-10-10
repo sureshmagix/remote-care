@@ -545,6 +545,164 @@ async function checkCommand(target) {
   };
 }
 
+async function checkDocker(target) {
+  const container = (target.serviceName || target.processName || target.host || target.name || '').trim();
+  const timeoutMs = target.timeoutMs || 5000;
+  const startedAt = process.hrtime.bigint();
+
+  // If a specific container identifier is provided (and isn't the generic word 'docker' or 'daemon')
+  if (container && !['docker', 'daemon', 'engine', 'local'].includes(container.toLowerCase())) {
+    const inspectRes = await runCommand('docker', ['inspect', '--format', '{{json .State}}', container], timeoutMs);
+    const latencyMs = elapsed(startedAt);
+
+    if (inspectRes.timedOut) {
+      return { ok: false, latencyMs, message: `Docker inspect for container "${container}" timed out.`, details: { container } };
+    }
+    if (inspectRes.exitCode !== 0 || !inspectRes.stdout.trim()) {
+      const err = inspectRes.stderr || inspectRes.error || `Docker container "${container}" not found or stopped.`;
+      return { ok: false, latencyMs, message: err.trim().slice(0, 300), details: { container, exitCode: inspectRes.exitCode } };
+    }
+
+    try {
+      const state = JSON.parse(inspectRes.stdout.trim());
+      const isRunning = Boolean(state.Running);
+      const isPaused = Boolean(state.Paused);
+      const status = String(state.Status || (isRunning ? 'running' : 'stopped')).toLowerCase();
+      const health = state.Health?.Status ? String(state.Health.Status).toLowerCase() : null;
+
+      if (isRunning && !isPaused && (!health || health === 'healthy')) {
+        return {
+          ok: true,
+          latencyMs,
+          message: `Docker container "${container}" is running${health ? ` (${health})` : ''}.`,
+          details: { container, status, running: true, health, startedAt: state.StartedAt }
+        };
+      }
+
+      if (isRunning && health === 'unhealthy') {
+        return {
+          ok: false,
+          latencyMs,
+          message: `Docker container "${container}" is running but reported unhealthy.`,
+          details: { container, status, running: true, health }
+        };
+      }
+
+      return {
+        ok: false,
+        latencyMs,
+        message: `Docker container "${container}" is ${status} (exit code ${state.ExitCode ?? 'N/A'}).`,
+        details: { container, status, exitCode: state.ExitCode, error: state.Error }
+      };
+    } catch {
+      return {
+        ok: inspectRes.exitCode === 0,
+        latencyMs,
+        message: `Docker container check completed for "${container}".`,
+        details: { container }
+      };
+    }
+  }
+
+  // General Docker daemon availability check
+  const infoRes = await runCommand('docker', ['info', '--format', '{{.ServerVersion}}'], timeoutMs);
+  const latencyMs = elapsed(startedAt);
+  if (infoRes.exitCode === 0) {
+    const version = infoRes.stdout.trim();
+    return {
+      ok: true,
+      latencyMs,
+      message: `Docker daemon is responsive${version ? ` (v${version})` : ''}.`,
+      details: { version }
+    };
+  }
+  return {
+    ok: false,
+    latencyMs,
+    message: infoRes.error || infoRes.stderr?.trim() || 'Docker daemon is not running or unreachable.',
+    details: { exitCode: infoRes.exitCode }
+  };
+}
+
+async function getRunningProcesses() {
+  try {
+    if (process.platform === 'win32') {
+      const res = await runCommand('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Get-Process | Select-Object -ExpandProperty ProcessName -Unique | Sort-Object'], 6000);
+      if (res.exitCode === 0 && res.stdout.trim()) {
+        return res.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+      }
+      const taskRes = await runCommand('tasklist.exe', ['/FO', 'CSV', '/NH'], 5000);
+      const names = new Set();
+      for (const line of taskRes.stdout.split(/\r?\n/)) {
+        const match = line.match(/^"([^"]+)"/);
+        if (match) names.add(match[1].replace(/\.exe$/i, ''));
+      }
+      return Array.from(names).sort((a, b) => a.localeCompare(b));
+    } else {
+      // macOS / Linux
+      const res = await runCommand('ps', ['-A', '-o', 'comm='], 5000);
+      if (res.exitCode === 0 && res.stdout.trim()) {
+        const set = new Set();
+        for (const raw of res.stdout.split('\n')) {
+          const base = path.basename(raw.trim());
+          if (base && !base.startsWith('[') && !base.startsWith('(')) {
+            set.add(base);
+          }
+        }
+        return Array.from(set).sort((a, b) => a.localeCompare(b));
+      }
+    }
+  } catch {}
+  return [];
+}
+
+async function getSystemServices() {
+  try {
+    if (process.platform === 'win32') {
+      const script = 'Get-Service | Select-Object -Property Name, DisplayName, Status | ConvertTo-Json -Compress';
+      const res = await runCommand('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], 6000);
+      if (res.exitCode === 0 && res.stdout.trim()) {
+        const parsed = JSON.parse(res.stdout);
+        const arr = Array.isArray(parsed) ? parsed : [parsed];
+        return arr.map((s) => ({ name: s.Name, displayName: s.DisplayName, status: s.Status }));
+      }
+    } else if (process.platform === 'linux') {
+      const res = await runCommand('systemctl', ['list-units', '--type=service', '--no-legend', '--no-pager'], 5000);
+      if (res.exitCode === 0) {
+        return res.stdout.split('\n').map((line) => {
+          const parts = line.trim().split(/\s+/);
+          const name = parts[0]?.replace(/\.service$/, '');
+          return name ? { name, displayName: name, status: parts[2] || 'active' } : null;
+        }).filter(Boolean);
+      }
+    } else if (process.platform === 'darwin') {
+      const res = await runCommand('launchctl', ['list'], 5000);
+      if (res.exitCode === 0) {
+        return res.stdout.split('\n').slice(1).map((line) => {
+          const parts = line.trim().split(/\s+/);
+          const name = parts[2];
+          return name ? { name, displayName: name, status: parts[1] === '0' ? 'active' : 'idle' } : null;
+        }).filter(Boolean);
+      }
+    }
+  } catch {}
+  return [];
+}
+
+async function getDockerContainers() {
+  try {
+    const res = await runCommand('docker', ['ps', '-a', '--format', '{{.Names}}\t{{.Status}}\t{{.Image}}'], 4000);
+    if (res.exitCode === 0 && res.stdout.trim()) {
+      return res.stdout.split('\n').map((line) => {
+        const parts = line.split('\t');
+        if (!parts[0]) return null;
+        return { name: parts[0].trim(), status: parts[1]?.trim() || '', image: parts[2]?.trim() || '' };
+      }).filter(Boolean);
+    }
+  } catch {}
+  return [];
+}
+
 async function executeCheck(target) {
   try {
     switch (target.type) {
@@ -558,6 +716,7 @@ async function executeCheck(target) {
       case 'http': return await checkHttp(target.url, target.timeoutMs);
       case 'system_service': return await checkSystemService(target.serviceName, target.timeoutMs);
       case 'process': return await checkProcess(target.processName, target.timeoutMs);
+      case 'docker': return await checkDocker(target);
       case 'disk': return await checkDisk(target);
       case 'memory': return await checkMemory(target);
       case 'cpu': return await checkCpu(target);
@@ -579,8 +738,12 @@ module.exports = {
   checkHttp,
   checkSystemService,
   checkProcess,
+  checkDocker,
   checkDisk,
   checkMemory,
   checkCpu,
-  checkCommand
+  checkCommand,
+  getRunningProcesses,
+  getSystemServices,
+  getDockerContainers
 };

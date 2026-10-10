@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
 const net = require('node:net');
-const { checkTcp, checkHttp, runCommand, checkDisk, checkMemory, checkCpu, checkCommand, checkSystemService } = require('../src/main/checks');
+const { checkTcp, checkHttp, runCommand, checkDisk, checkMemory, checkCpu, checkCommand, checkSystemService, checkDocker, getRunningProcesses, getSystemServices, getDockerContainers } = require('../src/main/checks');
 
 function listen(server) {
   return new Promise((resolve, reject) => {
@@ -97,3 +97,19 @@ test('custom script / command check executes shell command and checks exit code 
   assert.equal(failedOutput.ok, false);
   assert.match(failedOutput.message, /did not match/);
 });
+
+test('docker monitor checks daemon or container state gracefully', async () => {
+  const result = await checkDocker({ metadata: { container: 'nonexistent-container-xyz' }, timeoutMs: 2000 });
+  assert.equal(typeof result.ok, 'boolean');
+  assert.equal(typeof result.message, 'string');
+});
+
+test('process and service discovery return arrays', async () => {
+  const processes = await getRunningProcesses();
+  assert.equal(Array.isArray(processes), true);
+  const services = await getSystemServices();
+  assert.equal(Array.isArray(services), true);
+  const containers = await getDockerContainers();
+  assert.equal(Array.isArray(containers), true);
+});
+

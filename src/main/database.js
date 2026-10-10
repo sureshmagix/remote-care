@@ -4,7 +4,7 @@ const Database = require('better-sqlite3');
 const { passwordRecord, validateUsername, verifyPassword } = require('./auth');
 
 const ROLES = Object.freeze({ SUPER_ADMIN: 'super_admin', OPERATOR: 'operator', VIEWER: 'viewer' });
-const CHECK_TYPES = new Set(['internet', 'interface', 'gateway', 'ping', 'icmp', 'tcp', 'http', 'rtsp', 'system_service', 'process', 'disk', 'memory', 'cpu', 'command']);
+const CHECK_TYPES = new Set(['internet', 'interface', 'gateway', 'ping', 'icmp', 'tcp', 'http', 'rtsp', 'system_service', 'process', 'docker', 'disk', 'memory', 'cpu', 'command']);
 const STATUSES = new Set(['unknown', 'healthy', 'warning', 'down', 'disabled']);
 const HISTORY_STATUSES = new Set(['unknown', 'healthy', 'warning', 'down']);
 const HISTORY_OUTCOMES = new Set(['all', 'success', 'failure']);
@@ -14,7 +14,10 @@ const VOLATILE_RESULT_DETAIL_KEYS = new Set([
   'output', 'stdout', 'stderr', 'stack', 'trace',
   'latencyms', 'durationms', 'elapsedms',
   'timestamp', 'checkedat', 'startedat', 'endedat',
-  'pid', 'processid'
+  'pid', 'processid',
+  'cpupercent', 'loadpercent', 'usagepercent', 'freemb', 'usedmb', 'totalmb',
+  'freepercent', 'usedpercent', 'freegb', 'usedgb', 'totalgb',
+  'readbytes', 'writebytes', 'packets', 'rx', 'tx', 'delta'
 ]);
 const DEFAULT_APP_SETTINGS = Object.freeze({
   minimizeToTray: true,
@@ -42,6 +45,7 @@ const DEFAULT_APP_SETTINGS = Object.freeze({
   historySyncUrl: '',
   historySyncIntervalMinutes: 5,
   historySyncTargetIds: '',
+  historySyncTargetTypes: 'all',
   terminalHostname: '',
   serviceUuid: '',
   deviceUuid: ''
@@ -72,6 +76,7 @@ const APP_SETTING_KEYS = Object.freeze({
   historySyncUrl: 'history_sync_url',
   historySyncIntervalMinutes: 'history_sync_interval_minutes',
   historySyncTargetIds: 'history_sync_target_ids',
+  historySyncTargetTypes: 'history_sync_target_types',
   terminalHostname: 'terminal_hostname',
   serviceUuid: 'service_uuid',
   deviceUuid: 'device_uuid'
@@ -108,13 +113,18 @@ function stableResultDetails(value) {
 
 function resultSignature(result, status) {
   // Response timing and raw command output naturally vary between checks;
-  // including them would defeat change-only history storage. Keep stable
-  // result details such as HTTP status, error code, selected gateway, or
-  // interface state so a real diagnostic change remains auditable.
+  // including them would defeat change-only history storage. Normalize numbers
+  // and keep stable result details such as HTTP status, error code, selected gateway,
+  // or container/interface state so only true diagnostic changes are recorded.
+  const normalizedMessage = String(result.message || '')
+    .replace(/\b\d+(?:\.\d+)?\s*ms\b/gi, '<latency>')
+    .replace(/\b\d+(?:\.\d+)?\s*%/g, '<percent>')
+    .replace(/\b\d+(?:\.\d+)?\s*(?:mb|gb|kb|b)\b/gi, '<bytes>');
+
   return `${RESULT_SIGNATURE_PREFIX}${JSON.stringify({
     ok: Boolean(result.ok),
     status,
-    message: String(result.message || '').replace(/\b\d+(?:\.\d+)?\s*ms\b/gi, '<latency>'),
+    message: normalizedMessage,
     details: stableResultDetails(result.details || {})
   })}`;
 }
@@ -202,7 +212,7 @@ function validateTarget(input) {
   };
   const host = String(input.host || '').trim();
   const url = String(input.url || '').trim();
-  const serviceName = String(input.serviceName || '').trim();
+  const serviceName = String(input.serviceName || input.containerName || '').trim();
   const processName = String(input.processName || '').trim();
   const port = input.port === '' || input.port === null || input.port === undefined ? null : toPositiveInteger(input.port, null, 1, 65535);
 
@@ -1028,7 +1038,7 @@ class LocalDatabase {
     return { filters: normalized, results: rows.map(mapHistoryResult) };
   }
 
-  getHistoryChanges({ targetIds = null, sinceId = null, limit = 100, reverse = false } = {}) {
+  getHistoryChanges({ targetIds = null, targetTypes = null, sinceId = null, limit = 100, reverse = false } = {}) {
     let query = `
       SELECT r.id, r.target_id, t.name AS target_name, t.type AS target_type,
              t.host AS target_host, t.metadata_json AS target_metadata_json,
@@ -1049,6 +1059,12 @@ class LocalDatabase {
       const placeholders = targetIds.map(() => '?').join(',');
       clauses.push(`r.target_id IN (${placeholders})`);
       params.push(...targetIds.map(Number));
+    }
+
+    if (Array.isArray(targetTypes) && targetTypes.length > 0) {
+      const placeholders = targetTypes.map(() => '?').join(',');
+      clauses.push(`t.type IN (${placeholders})`);
+      params.push(...targetTypes.map(String));
     }
 
     if (clauses.length > 0) {

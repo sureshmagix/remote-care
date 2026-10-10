@@ -13,6 +13,8 @@ class CloudPublisher extends EventEmitter {
     this.lastSyncAt = null;
     this.lastError = null;
     this.deliveredCount = 0;
+    this.lastPayload = null;
+    this.lastResponse = null;
   }
 
   start(intervalMs = 15_000) {
@@ -77,17 +79,20 @@ class CloudPublisher extends EventEmitter {
       };
 
       const authToken = this.getAuthToken();
+      this.lastPayload = payload;
       const result = await this.sendBatch(endpoint, authToken, payload);
+      this.lastResponse = result?.responseData || result;
       const deliveredIds = pending.map((p) => p.id);
       this.database.markEventsDelivered(deliveredIds);
       this.deliveredCount += deliveredIds.length;
       this.lastSyncAt = new Date().toISOString();
       this.lastError = null;
 
-      this.emit('batch_delivered', { count: deliveredIds.length, timestamp: this.lastSyncAt });
+      this.emit('batch_delivered', { count: deliveredIds.length, timestamp: this.lastSyncAt, result });
       return { publishedCount: deliveredIds.length, result };
     } catch (error) {
       this.lastError = error.message;
+      this.lastResponse = null;
       if (this.listenerCount('error') > 0) {
         try {
           this.emit('error', error);
@@ -176,10 +181,13 @@ class CloudPublisher extends EventEmitter {
       enabled: Boolean(settings?.cloudSyncEnabled),
       protocol,
       endpoint: endpoint || null,
+      isPublishing: this.isPublishing,
       lastSyncAt: this.lastSyncAt,
       lastError: this.lastError,
       deliveredCount: this.deliveredCount,
-      pendingCount
+      pendingCount,
+      lastPayload: this.lastPayload,
+      lastResponse: this.lastResponse
     };
   }
 }

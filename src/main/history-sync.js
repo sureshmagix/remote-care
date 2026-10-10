@@ -15,6 +15,7 @@ class HistorySyncService extends EventEmitter {
     this.lastError = null;
     this.lastSentCount = 0;
     this.lastPayload = null;
+    this.lastResponse = null;
   }
 
   getEndpointUrl() {
@@ -42,6 +43,15 @@ class HistorySyncService extends EventEmitter {
     return items.length > 0 ? items : null;
   }
 
+  getTargetTypes() {
+    const settings = this.getSettings();
+    const raw = settings?.historySyncTargetTypes;
+    if (!raw || raw === 'all' || !String(raw).trim()) return null;
+    if (Array.isArray(raw)) return raw.map((s) => String(s).trim().toLowerCase()).filter(Boolean);
+    const items = String(raw).split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+    return items.length > 0 ? items : null;
+  }
+
   getIntervalMinutes() {
     const settings = this.getSettings();
     return Math.max(1, Math.min(1440, Number.parseInt(settings?.historySyncIntervalMinutes ?? 5, 10)));
@@ -52,8 +62,9 @@ class HistorySyncService extends EventEmitter {
     return Boolean(settings?.historySyncEnabled);
   }
 
-  buildPayload({ previewRecent = false, limit = 50, targetIds = undefined } = {}) {
+  buildPayload({ previewRecent = false, limit = 50, targetIds = undefined, targetTypes = undefined } = {}) {
     const resolvedTargets = targetIds !== undefined ? targetIds : this.getTargetIds();
+    const resolvedTypes = targetTypes !== undefined ? targetTypes : this.getTargetTypes();
     const cursor = this.database.getHistorySyncCursor();
     const settings = this.getSettings();
     const clientHostname = settings?.terminalHostname?.trim() || settings?.clientHostname?.trim() || os.hostname();
@@ -62,12 +73,14 @@ class HistorySyncService extends EventEmitter {
     if (previewRecent) {
       entries = this.database.getHistoryChanges({
         targetIds: resolvedTargets,
+        targetTypes: resolvedTypes,
         limit,
         reverse: true
       });
     } else {
       entries = this.database.getHistoryChanges({
         targetIds: resolvedTargets,
+        targetTypes: resolvedTypes,
         sinceId: cursor.lastId,
         limit: 100
       });
@@ -78,6 +91,7 @@ class HistorySyncService extends EventEmitter {
       dispatchedAt: new Date().toISOString(),
       clientHostname,
       targetIds: resolvedTargets === null ? 'all' : resolvedTargets,
+      targetTypes: resolvedTypes === null ? 'all' : resolvedTypes,
       entriesCount: entries.length,
       history: entries.map((entry) => ({
         ...entry,
@@ -168,12 +182,14 @@ class HistorySyncService extends EventEmitter {
       this.lastSyncAt = payload.dispatchedAt;
       this.lastSentCount = payload.history.length;
       this.lastPayload = payload;
+      this.lastResponse = res?.responseData || res;
       this.lastError = null;
 
-      this.emit('synced', { timestamp: this.lastSyncAt, count: payload.history.length, payload });
+      this.emit('synced', { timestamp: this.lastSyncAt, count: payload.history.length, payload, result: res });
       return { ok: true, sentCount: payload.history.length, timestamp: this.lastSyncAt, payload, result: res };
     } catch (err) {
       this.lastError = err.message;
+      this.lastResponse = null;
       if (this.listenerCount('error') > 0) {
         try {
           this.emit('error', err);
@@ -217,10 +233,13 @@ class HistorySyncService extends EventEmitter {
       endpoint: this.getEndpointUrl(),
       intervalMinutes: this.getIntervalMinutes(),
       targetIds: this.getTargetIds(),
+      targetTypes: this.getTargetTypes(),
+      isSyncing: this.isSyncing,
       lastSyncAt: this.lastSyncAt || cursor.lastSyncAt,
       lastError: this.lastError,
       lastSentCount: this.lastSentCount,
-      lastPayload: this.lastPayload
+      lastPayload: this.lastPayload,
+      lastResponse: this.lastResponse
     };
   }
 }

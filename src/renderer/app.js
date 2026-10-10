@@ -35,15 +35,22 @@ function prettyType(type) {
     interface: 'Network interface',
     gateway: 'Default gateway',
     ping: 'ICMP ping',
+    icmp: 'ICMP ping',
     tcp: 'TCP port',
+    rtsp: 'RTSP stream',
     http: 'HTTP/HTTPS',
     system_service: 'Local service',
     process: 'Local process',
+    docker: 'Docker container',
     disk: 'Disk storage',
     memory: 'System RAM',
     cpu: 'CPU utilization',
     command: 'Custom script'
   }[type] || type);
+}
+
+function passwordEyeMarkup() {
+  return `<button type="button" class="password-toggle-btn" title="Toggle password visibility" aria-label="Toggle password visibility"><svg class="eye-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg></button>`;
 }
 
 function renderSparklineSvg(points = []) {
@@ -343,15 +350,15 @@ function renderAuth(setup = null) {
     <form id="setup-form">
       <div class="field"><label for="setup-name">Display name</label><input id="setup-name" name="displayName" required maxlength="80" autocomplete="name" placeholder="Administrator" /></div>
       <div class="field"><label for="setup-user">Username</label><input id="setup-user" name="username" required minlength="3" maxlength="40" autocomplete="username" placeholder="admin" /></div>
-      <div class="field"><label for="setup-password">Password</label><input id="setup-password" name="password" required minlength="10" type="password" autocomplete="new-password" placeholder="At least 10 characters" /></div>
-      <div class="field"><label for="setup-confirm">Confirm password</label><input id="setup-confirm" required minlength="10" type="password" autocomplete="new-password" /></div>
+      <div class="field"><label for="setup-password">Password</label><div class="password-wrapper"><input id="setup-password" name="password" required minlength="10" type="password" autocomplete="new-password" placeholder="At least 10 characters" />${passwordEyeMarkup()}</div></div>
+      <div class="field"><label for="setup-confirm">Confirm password</label><div class="password-wrapper"><input id="setup-confirm" required minlength="10" type="password" autocomplete="new-password" />${passwordEyeMarkup()}</div></div>
       <div class="actions"><button class="button" type="submit">Create Super Admin</button></div><div class="error" id="auth-error"></div>
     </form>` : `
     <h2>Welcome back</h2>
     <p class="helper">Sign in to view the local monitoring dashboard.</p>
     <form id="login-form">
       <div class="field"><label for="login-user">Username</label><input id="login-user" name="username" required autocomplete="username" autofocus /></div>
-      <div class="field"><label for="login-password">Password</label><input id="login-password" name="password" required type="password" autocomplete="current-password" /></div>
+      <div class="field"><label for="login-password">Password</label><div class="password-wrapper"><input id="login-password" name="password" required type="password" autocomplete="current-password" />${passwordEyeMarkup()}</div></div>
       <div class="actions"><button class="button" type="submit">Sign in</button></div><div class="error" id="auth-error"></div>
     </form>`;
   const form = content.querySelector('form');
@@ -400,6 +407,7 @@ function renderShell() {
           <button data-page="users">♙ Users</button>
           ${isAdmin() ? '<button data-page="server">☁ Server</button>' : ''}
           ${isAdmin() ? '<button data-page="webhooks">⚑ Webhooks</button>' : ''}
+          ${isAdmin() ? '<button data-page="remote-data">📡 Remote Data</button>' : ''}
           ${isAdmin() ? '<button data-page="settings">⚙ Settings</button>' : ''}
           <button data-page="about">ⓘ About</button>
         </nav>
@@ -459,6 +467,7 @@ async function renderPage() {
   else if (state.page === 'users') await renderUsers(content);
   else if (state.page === 'server') await renderServer(content);
   else if (state.page === 'webhooks') await renderWebhooks(content);
+  else if (state.page === 'remote-data') await renderRemoteData(content);
   else if (state.page === 'settings') await renderSettings(content);
   else await renderAbout(content);
   startLiveClock();
@@ -889,6 +898,7 @@ async function renderSettings(content) {
         <div class="setting-row"><span><strong>Export monitor definitions</strong><small>Download your configured monitors as a JSON file for backup.</small></span><button class="button secondary small" id="settings-export-monitors" type="button">Export JSON</button></div>
         <div class="setting-row"><span><strong>Import monitor definitions</strong><small>Load monitors from a JSON file. Duplicates will be safely handled.</small></span><button class="button secondary small" id="settings-import-monitors" type="button">Import JSON</button></div>
       </div></article>
+      <article class="card"><div class="panel-title"><h3>Clean Reset &amp; Uninstall</h3><span>Reset all credentials &amp; storage</span></div><div class="panel-body protected-exit"><div><strong>Factory Reset &amp; Wipe All Credentials</strong><p class="helper">Wipes all passwords (including Super Admin), local databases, monitor configurations, and resets to clean state as if freshly uninstalled.</p></div><button class="button danger" type="button" id="factory-reset-btn">Wipe &amp; Reset App…</button></div></article>
       <article class="card"><div class="panel-title"><h3>Protected exit</h3><span>Super Admin only</span></div><div class="panel-body protected-exit"><div><strong>Quit Remote Care Monitor</strong><p class="helper">To stop local monitoring, confirm the current Super Admin password. Closing this dashboard only sends it back to the system tray.</p></div><button class="button danger" type="button" id="request-quit">Quit app…</button></div></article>
       <div class="actions"><button class="button" type="submit">Save settings</button><span class="helper settings-help">All monitoring settings and credentials are encrypted or stored locally.</span></div>
       <div class="error" id="settings-error"></div>
@@ -966,6 +976,7 @@ async function renderSettings(content) {
     }
   });
 
+  document.getElementById('factory-reset-btn')?.addEventListener('click', () => openFactoryResetDialog());
   document.getElementById('request-quit')?.addEventListener('click', () => openQuitDialog('settings'));
 }
 
@@ -1014,7 +1025,10 @@ async function renderServer(content) {
           </div>
           <div class="field">
             <label>Server API Key (x-api-key)</label>
-            <input name="serverAuthToken" type="password" value="${escapeHtml(settings.serverAuthToken || settings.cloudAuthToken || '')}" placeholder="Wiitronics_diagnostic" />
+            <div class="password-wrapper">
+              <input name="serverAuthToken" type="password" value="${escapeHtml(settings.serverAuthToken || settings.cloudAuthToken || '')}" placeholder="Wiitronics_diagnostic" />
+              ${passwordEyeMarkup()}
+            </div>
             <span class="helper">Supplied via <code>x-api-key: Wiitronics_diagnostic</code> (or configured secret key) and <code>Authorization: Bearer &lt;token&gt;</code>.</span>
           </div>
           <div class="two-col">
@@ -1460,6 +1474,264 @@ async function renderWebhooks(content) {
   });
 }
 
+function openFactoryResetDialog() {
+  if (document.querySelector('dialog[data-factory-reset]')) return;
+  const dialog = document.createElement('dialog');
+  dialog.dataset.factoryReset = 'true';
+  dialog.innerHTML = `
+    <div class="dialog-header"><h3>Factory Reset &amp; Wipe Everything?</h3><button class="button ghost small" type="button" data-close>Cancel</button></div>
+    <form>
+      <div class="dialog-body">
+        <div class="quit-warning">
+          <span aria-hidden="true">⚠️</span>
+          <div>
+            <strong>Destructive Operation: Complete Data Wipe</strong>
+            <p>This will erase all local databases, all monitor definitions, incident history, and all account credentials including the Super Admin password. The application will return to its initial uninstalled state.</p>
+          </div>
+        </div>
+        <div class="field">
+          <label for="reset-password">Confirm Super Admin Password</label>
+          <div class="password-wrapper">
+            <input id="reset-password" name="password" type="password" required autocomplete="current-password" autofocus />
+            ${passwordEyeMarkup()}
+          </div>
+        </div>
+        <div class="error"></div>
+      </div>
+      <div class="dialog-footer">
+        <button class="button secondary" type="button" data-close>Cancel</button>
+        <button class="button danger" type="submit">Erase Everything &amp; Reset</button>
+      </div>
+    </form>`;
+  dialog.querySelectorAll('[data-close]').forEach((btn) => btn.addEventListener('click', () => dialog.close()));
+  dialog.addEventListener('close', () => dialog.remove());
+  dialog.querySelector('form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const error = form.querySelector('.error');
+    error.textContent = '';
+    const submitBtn = form.querySelector('button[type="submit"]');
+    submitBtn.disabled = true;
+    try {
+      await request(() => remoteCare.factoryResetWipe(state.session.token, form.elements.password.value));
+      dialog.close();
+      flash('All credentials and data wiped successfully. Reloading initial setup…', 'info');
+      setTimeout(() => window.location.reload(), 1000);
+    } catch (err) {
+      error.textContent = err.message || 'Failed to perform factory reset.';
+      submitBtn.disabled = false;
+    }
+  });
+  document.body.append(dialog);
+  dialog.showModal();
+}
+
+const REMOTE_DATA_MONITOR_TYPES = [
+  { id: 'http', label: 'HTTP / HTTPS Endpoints', desc: 'Web services and REST APIs' },
+  { id: 'icmp', label: 'ICMP Ping', desc: 'Direct ICMP echo response' },
+  { id: 'gateway', label: 'Default Gateway', desc: 'Local router / gateway availability' },
+  { id: 'rtsp', label: 'RTSP Stream', desc: 'IP cameras and streaming video ports' },
+  { id: 'disk', label: 'Disk Storage', desc: 'Filesystem and partition storage thresholds' },
+  { id: 'ping', label: 'Ping (ICMP)', desc: 'Standard ping host reachability' },
+  { id: 'tcp', label: 'TCP Port', desc: 'Raw TCP socket connectivity' },
+  { id: 'internet', label: 'Internet Connection', desc: 'External internet connectivity verification' },
+  { id: 'interface', label: 'Network Interface', desc: 'Wi-Fi / Ethernet adapter connectivity' },
+  { id: 'system_service', label: 'Local System Service', desc: 'systemd, Windows service, or launchd' },
+  { id: 'process', label: 'Local Process', desc: 'Running system process verification' },
+  { id: 'docker', label: 'Docker Container / Daemon', desc: 'Docker container state or daemon health' },
+  { id: 'memory', label: 'System RAM Usage', desc: 'Device memory utilization limits' },
+  { id: 'cpu', label: 'CPU Utilization', desc: 'Processor load and core saturation' },
+  { id: 'command', label: 'Custom Shell Script', desc: 'CLI scripts and exit code evaluations' }
+];
+
+async function renderRemoteData(content) {
+  if (!isAdmin()) {
+    state.page = 'overview';
+    return renderOverview(content);
+  }
+  state.settings = await request(() => remoteCare.getAppSettings(state.session.token));
+  const settings = state.settings;
+  const syncStatus = await request(() => remoteCare.getRemoteSyncStatus(state.session.token)).catch(() => ({}));
+
+  const cloud = syncStatus.cloud || {};
+  const history = syncStatus.history || {};
+  const isPosting = cloud.isPublishing || history.isSyncing;
+  const hasError = Boolean(history.lastError || cloud.lastError);
+
+  let bannerClass = 'idle';
+  let bannerIcon = 'ℹ';
+  let bannerTitle = 'Idle / Waiting for Interval';
+  let bannerDesc = 'Sync triggers on result changes for history, and every 1 minute for telemetry heartbeat.';
+
+  if (isPosting) {
+    bannerClass = 'posting';
+    bannerIcon = '<span class="spinner-pulse"></span>';
+    bannerTitle = 'Transmitting Data to Remote Server…';
+    bannerDesc = `Active request in-flight to ${escapeHtml(history.serverUrl || cloud.serverUrl || settings.serverUrl || 'remote server')}`;
+  } else if (hasError) {
+    bannerClass = 'error';
+    bannerIcon = '⚠️';
+    bannerTitle = 'Server Connection Error / Not Responding';
+    bannerDesc = escapeHtml(history.lastError || cloud.lastError || 'Remote server did not respond.');
+  } else if (history.lastSyncAt || cloud.lastPublishedAt) {
+    bannerClass = 'success';
+    bannerIcon = '✓';
+    bannerTitle = 'Synchronized &amp; Connected';
+    bannerDesc = `Last successful communication: ${prettyTime(history.lastSyncAt || cloud.lastPublishedAt)}`;
+  }
+
+  // Monitor types filter selection
+  const rawTypes = settings.historySyncTargetTypes;
+  const selectedTypes = Array.isArray(rawTypes) && rawTypes.length > 0 && !rawTypes.includes('all')
+    ? new Set(rawTypes)
+    : new Set(REMOTE_DATA_MONITOR_TYPES.map((t) => t.id));
+
+  const serverUrl = settings.serverUrl || settings.serverBaseUrl || 'http://<YOUR_SERVER_IP>:3999';
+
+  content.innerHTML = `
+    <header class="page-header">
+      <div>
+        <h2>Remote Server Activity &amp; Telemetry</h2>
+        <p>Real-time status of payloads transmitted to the remote diagnostics server, error feedback, and monitor type dispatch filters.</p>
+      </div>
+      ${liveClockMarkup()}
+    </header>
+
+    <div class="sync-status-banner ${bannerClass}">
+      <span class="sync-status-icon">${bannerIcon}</span>
+      <div class="sync-status-info">
+        <h4>${bannerTitle}</h4>
+        <p>${bannerDesc}</p>
+      </div>
+      <div style="margin-left:auto;display:flex;gap:8px;align-items:center;">
+        <button class="button secondary small" id="trigger-sync-now-btn" type="button" ${isPosting ? 'disabled' : ''}>${isPosting ? 'Sending…' : '📡 Send Telemetry &amp; History Now'}</button>
+        <button class="button ghost small" id="refresh-sync-view-btn" type="button">↻ Refresh</button>
+      </div>
+    </div>
+
+    <form id="remote-types-form">
+      <article class="card">
+        <div class="panel-title">
+          <h3>Select Monitored Types to Send</h3>
+          <span>POST /api/history filter</span>
+        </div>
+        <div class="panel-body settings-list">
+          <p class="helper" style="margin:0 0 12px">Select which monitor types are allowed to be sent to the remote server. Unselected types will remain local-only.</p>
+          <div style="display:flex;gap:8px;margin-bottom:12px">
+            <button class="button ghost small" type="button" id="types-select-all">Select All</button>
+            <button class="button ghost small" type="button" id="types-deselect-all">Deselect All</button>
+          </div>
+          <div class="types-grid">
+            ${REMOTE_DATA_MONITOR_TYPES.map((t) => `
+              <label class="type-check-label">
+                <input type="checkbox" name="types" value="${t.id}" ${selectedTypes.has(t.id) ? 'checked' : ''} />
+                <div class="type-title-group">
+                  <strong>${escapeHtml(t.label)}</strong>
+                  <small>${escapeHtml(t.desc)}</small>
+                </div>
+              </label>
+            `).join('')}
+          </div>
+          <div class="actions" style="margin-top:16px;padding:0">
+            <button class="button" type="submit">Save Monitored Types Filter</button>
+            <span class="helper settings-help">Filters state transition history events sent to <code>POST /api/history</code>.</span>
+          </div>
+          <div class="error" id="types-error"></div>
+        </div>
+      </article>
+    </form>
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(420px, 1fr));gap:20px;">
+      <article class="card">
+        <div class="panel-title">
+          <h3>Monitor Status Changes (POST /api/history)</h3>
+          <span>${history.isSyncing ? '<span class="status-pill warning"><span class="spinner-pulse"></span> Sending</span>' : (history.lastError ? '<span class="status-pill down">Error</span>' : '<span class="status-pill good">Ready</span>')}</span>
+        </div>
+        <div class="panel-body">
+          <div class="info-grid" style="margin-bottom:14px">
+            <div class="info-item"><span>Endpoint</span><strong>${escapeHtml(serverUrl)}/api/history</strong></div>
+            <div class="info-item"><span>Last Dispatched</span><strong>${history.lastSyncAt ? prettyTime(history.lastSyncAt) : 'Never'}</strong></div>
+          </div>
+          <div style="margin-bottom:12px">
+            <strong style="display:block;margin-bottom:4px;font-size:0.85rem;color:var(--text-muted)">Latest Dispatched Request Body</strong>
+            <pre class="server-response-box"><code>${escapeHtml(JSON.stringify(history.lastPayload || { message: 'No history events dispatched yet.' }, null, 2))}</code></pre>
+          </div>
+          <div>
+            <strong style="display:block;margin-bottom:4px;font-size:0.85rem;color:var(--text-muted)">Server Response / Status</strong>
+            <pre class="server-response-box"><code>${escapeHtml(JSON.stringify(history.lastResponse || (history.lastError ? { error: history.lastError } : { message: 'No server response received yet.' }), null, 2))}</code></pre>
+          </div>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="panel-title">
+          <h3>Heartbeat &amp; Telemetry (POST /api/sync)</h3>
+          <span>${cloud.isPublishing ? '<span class="status-pill warning"><span class="spinner-pulse"></span> Sending</span>' : (cloud.lastError ? '<span class="status-pill down">Error</span>' : '<span class="status-pill good">Ready</span>')}</span>
+        </div>
+        <div class="panel-body">
+          <div class="info-grid" style="margin-bottom:14px">
+            <div class="info-item"><span>Endpoint</span><strong>${escapeHtml(serverUrl)}/api/sync</strong></div>
+            <div class="info-item"><span>Last Dispatched</span><strong>${cloud.lastPublishedAt ? prettyTime(cloud.lastPublishedAt) : 'Never'}</strong></div>
+          </div>
+          <div style="margin-bottom:12px">
+            <strong style="display:block;margin-bottom:4px;font-size:0.85rem;color:var(--text-muted)">Latest Dispatched Request Body</strong>
+            <pre class="server-response-box"><code>${escapeHtml(JSON.stringify(cloud.lastPayload || { message: 'No telemetry heartbeat dispatched yet.' }, null, 2))}</code></pre>
+          </div>
+          <div>
+            <strong style="display:block;margin-bottom:4px;font-size:0.85rem;color:var(--text-muted)">Server Response / Status</strong>
+            <pre class="server-response-box"><code>${escapeHtml(JSON.stringify(cloud.lastResponse || (cloud.lastError ? { error: cloud.lastError } : { message: 'No server response received yet.' }), null, 2))}</code></pre>
+          </div>
+        </div>
+      </article>
+    </div>`;
+
+  // Listeners
+  document.getElementById('trigger-sync-now-btn')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    btn.textContent = 'Sending…';
+    try {
+      await request(() => remoteCare.triggerRemoteSync(state.session.token));
+      flash('Remote sync and heartbeat triggered.');
+      setTimeout(() => { if (state.page === 'remote-data') renderRemoteData(content); }, 600);
+    } catch (err) {
+      flash(err.message, 'down');
+      btn.disabled = false;
+      btn.textContent = '📡 Send Telemetry & History Now';
+    }
+  });
+
+  document.getElementById('refresh-sync-view-btn')?.addEventListener('click', () => {
+    renderRemoteData(content);
+  });
+
+  document.getElementById('types-select-all')?.addEventListener('click', () => {
+    content.querySelectorAll('#remote-types-form input[type="checkbox"]').forEach((cb) => { cb.checked = true; });
+  });
+
+  document.getElementById('types-deselect-all')?.addEventListener('click', () => {
+    content.querySelectorAll('#remote-types-form input[type="checkbox"]').forEach((cb) => { cb.checked = false; });
+  });
+
+  const typesForm = document.getElementById('remote-types-form');
+  typesForm?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const errBox = document.getElementById('types-error');
+    errBox.textContent = '';
+    const checkedBoxes = Array.from(typesForm.querySelectorAll('input[name="types"]:checked')).map((cb) => cb.value);
+    try {
+      const next = {
+        ...state.settings,
+        historySyncTargetTypes: checkedBoxes.length === REMOTE_DATA_MONITOR_TYPES.length ? ['all'] : checkedBoxes
+      };
+      state.settings = await request(() => remoteCare.saveAppSettings(state.session.token, next));
+      flash('Monitored types filter saved successfully.');
+    } catch (err) {
+      errBox.textContent = err.message || 'Failed to save types filter.';
+    }
+  });
+}
+
 async function renderAbout(content) {
   if (!state.appInfo) state.appInfo = await request(() => remoteCare.getAppInfo(state.session.token));
   const runtime = state.appInfo.runtime || {};
@@ -1479,6 +1751,7 @@ function monitorFields(type) {
     interface: type === 'interface',
     service: type === 'system_service',
     process: type === 'process',
+    docker: type === 'docker',
     dns: type === 'internet',
     disk: type === 'disk',
     threshold: ['disk', 'memory', 'cpu'].includes(type),
@@ -1514,6 +1787,60 @@ function interfaceOptions(current = 'auto') {
   return options.map((opt) => `<option value="${escapeHtml(opt.value)}" ${opt.value === current ? 'selected' : ''}>${escapeHtml(opt.label)}</option>`).join('');
 }
 
+async function loadProcessAndServiceLists(dialog) {
+  try {
+    const [processesRes, servicesRes, dockersRes] = await Promise.allSettled([
+      remoteCare.getRunningProcesses(state.session.token),
+      remoteCare.getSystemServices(state.session.token),
+      remoteCare.getDockerContainers(state.session.token)
+    ]);
+
+    if (processesRes.status === 'fulfilled' && Array.isArray(processesRes.value)) {
+      const datalist = dialog.querySelector('#process-list');
+      const select = dialog.querySelector('#process-picker');
+      const input = dialog.querySelector('input[name="processName"]');
+      if (datalist && select && input) {
+        datalist.innerHTML = processesRes.value.map((p) => `<option value="${escapeHtml(p)}"></option>`).join('');
+        select.innerHTML = '<option value="">Select running process…</option>' +
+          processesRes.value.map((p) => `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`).join('');
+        select.addEventListener('change', () => {
+          if (select.value) input.value = select.value;
+        });
+      }
+    }
+
+    if (servicesRes.status === 'fulfilled' && Array.isArray(servicesRes.value)) {
+      const datalist = dialog.querySelector('#services-list');
+      const select = dialog.querySelector('#services-picker');
+      const input = dialog.querySelector('input[name="serviceName"]');
+      if (datalist && select && input) {
+        datalist.innerHTML = servicesRes.value.map((s) => `<option value="${escapeHtml(s.name)}"></option>`).join('');
+        select.innerHTML = '<option value="">Select running service…</option>' +
+          servicesRes.value.map((s) => `<option value="${escapeHtml(s.name)}">${escapeHtml(s.name)}${s.description ? ` (${escapeHtml(s.description)})` : ''}</option>`).join('');
+        select.addEventListener('change', () => {
+          if (select.value) input.value = select.value;
+        });
+      }
+    }
+
+    if (dockersRes.status === 'fulfilled' && Array.isArray(dockersRes.value)) {
+      const datalist = dialog.querySelector('#docker-list');
+      const select = dialog.querySelector('#docker-picker');
+      const input = dialog.querySelector('input[name="dockerContainer"]');
+      if (datalist && select && input) {
+        datalist.innerHTML = dockersRes.value.map((d) => `<option value="${escapeHtml(d.name)}">${escapeHtml(d.status || '')}</option>`).join('');
+        select.innerHTML = '<option value="">Select container…</option>' +
+          dockersRes.value.map((d) => `<option value="${escapeHtml(d.name)}">${escapeHtml(d.name)}${d.status ? ` [${escapeHtml(d.status)}]` : ''}</option>`).join('');
+        select.addEventListener('change', () => {
+          if (select.value) input.value = select.value;
+        });
+      }
+    }
+  } catch {
+    // Non-fatal if listing fails
+  }
+}
+
 function openMonitorDialog(target = null) {
   const value = (key, fallback = '') => escapeHtml(target?.[key] ?? fallback);
   const checked = target?.enabled === false ? '' : 'checked';
@@ -1531,6 +1858,7 @@ function openMonitorDialog(target = null) {
         <option value="disk">Disk storage usage</option>
         <option value="ping">Ping (ICMP)</option>
         <option value="tcp">TCP port</option>
+        <option value="docker">Docker container / daemon</option>
         <option value="internet">Internet connection</option>
         <option value="interface">Network interface</option>
         <option value="system_service">Local system service</option>
@@ -1552,8 +1880,33 @@ function openMonitorDialog(target = null) {
       <div class="field" data-monitor-field="url"><label>HTTP/HTTPS URL</label><input name="url" type="url" value="${value('url')}" placeholder="https://api.example.com/health" /></div>
       <div class="field" data-monitor-field="dns"><label>DNS hostname to resolve</label><input name="dnsHost" value="${escapeHtml(metadata.dnsHost || '')}" placeholder="cloudflare.com" /><span class="helper">Used before the Internet HTTPS check to distinguish DNS failure.</span></div>
       <div class="field" data-monitor-field="interface"><label>Network interface to monitor</label><select name="interfaceName">${interfaceOptions(target?.interfaceName || 'auto')}</select><span class="helper">Select “Wi-Fi / Wireless” or a specific adapter (e.g. en0) to alert immediately when Wi-Fi is disconnected.</span></div>
-      <div class="field" data-monitor-field="service"><label>Service name</label><input name="serviceName" value="${value('serviceName')}" placeholder="mosquitto.service or Mosquitto" /><span class="helper">Linux/Raspberry Pi uses systemd; Windows uses the Windows Service name; macOS uses a launchd label.</span></div>
-      <div class="field" data-monitor-field="process"><label>Process name</label><input name="processName" value="${value('processName')}" placeholder="node or python3" /></div>
+      <div class="field" data-monitor-field="service">
+        <label>Service name</label>
+        <div class="input-with-select">
+          <input name="serviceName" list="services-list" value="${value('serviceName')}" placeholder="mosquitto.service or Mosquitto" />
+          <select class="picker-select" id="services-picker"><option value="">Select running service…</option></select>
+        </div>
+        <datalist id="services-list"></datalist>
+        <span class="helper">Linux/Raspberry Pi uses systemd; Windows uses the Windows Service name; macOS uses a launchd label.</span>
+      </div>
+      <div class="field" data-monitor-field="process">
+        <label>Process name</label>
+        <div class="input-with-select">
+          <input name="processName" list="process-list" value="${value('processName')}" placeholder="node or python3" />
+          <select class="picker-select" id="process-picker"><option value="">Select running process…</option></select>
+        </div>
+        <datalist id="process-list"></datalist>
+        <span class="helper">Select from active running system processes or enter process name manually.</span>
+      </div>
+      <div class="field" data-monitor-field="docker">
+        <label>Docker container name or ID</label>
+        <div class="input-with-select">
+          <input name="dockerContainer" list="docker-list" value="${escapeHtml(metadata.container || target?.processName || '')}" placeholder="Leave empty for Docker daemon, or select container" />
+          <select class="picker-select" id="docker-picker"><option value="">Select container…</option></select>
+        </div>
+        <datalist id="docker-list"></datalist>
+        <span class="helper">Leave blank to monitor Docker daemon health, or select/type a container name or ID.</span>
+      </div>
       <div class="field" data-monitor-field="disk"><label>Storage mount / folder path</label><input name="diskPath" value="${escapeHtml(metadata.path || (navigator.platform?.startsWith('Win') ? 'C:\\' : '/'))}" placeholder="/" /><span class="helper">Filesystem root or partition mount path to inspect.</span></div>
       <div class="field" data-monitor-field="threshold"><label>Alert utilization threshold (%)</label><input name="thresholdPercent" type="number" min="1" max="100" value="${escapeHtml(metadata.thresholdPercent ?? '90')}" placeholder="90" /><span class="helper">Alert triggers when usage reaches or exceeds this percentage.</span></div>
       <div class="field" data-monitor-field="command"><label>Shell command or script</label><textarea name="commandScript" rows="2" placeholder="e.g. ping -c 1 internal.db || exit 1">${escapeHtml(metadata.command || target?.host || '')}</textarea><span class="helper">Command run in system shell. Non-zero exit code or timeout flags an incident.</span></div>
@@ -1574,6 +1927,8 @@ function openMonitorDialog(target = null) {
   typeSelect.addEventListener('change', () => monitorFields(typeSelect.value));
   dialog.querySelectorAll('[data-close]').forEach((button) => button.addEventListener('click', () => dialog.close()));
   dialog.addEventListener('close', () => dialog.remove());
+
+  loadProcessAndServiceLists(dialog);
 
   if (!Array.isArray(state.adapters)) {
     remoteCare.getNetworkAdapters(state.session.token).then((adapters) => {
@@ -1598,8 +1953,12 @@ function openMonitorDialog(target = null) {
       thresholdPercent: values.thresholdPercent ? Number(values.thresholdPercent) : undefined,
       command: values.commandScript,
       expectedExitCode: values.expectedExitCode !== '' && values.expectedExitCode !== undefined ? Number(values.expectedExitCode) : undefined,
-      expectedOutput: values.expectedOutput
+      expectedOutput: values.expectedOutput,
+      container: values.dockerContainer?.trim() || undefined
     };
+    if (values.type === 'docker') {
+      values.processName = values.dockerContainer?.trim() || '';
+    }
     const payload = { ...values, id: target?.id, enabled: form.elements.enabled.checked, metadata: meta };
     try { await request(() => remoteCare.saveTarget(state.session.token, payload)); dialog.close(); await refreshDashboard(true); flash(`Monitor “${values.name}” saved.`); } catch (exception) { error.textContent = exception.message; }
   });
@@ -1615,7 +1974,7 @@ function openViewerDialog() {
       <div class="field"><label>Role</label><select name="role"><option value="viewer">Viewer (Read-only status &amp; history)</option><option value="operator">Operator (Run checks &amp; acknowledge incidents)</option></select></div>
       <div class="field"><label>Display name</label><input name="displayName" required maxlength="80" /></div>
       <div class="field"><label>Username</label><input name="username" required minlength="3" maxlength="40" /></div>
-      <div class="field"><label>Password</label><input name="password" required type="password" minlength="10" /></div>
+      <div class="field"><label>Password</label><div class="password-wrapper"><input name="password" required type="password" minlength="10" />${passwordEyeMarkup()}</div></div>
       <div class="error"></div>
     </div><div class="dialog-footer"><button class="button secondary" type="button" data-close>Cancel</button><button class="button" type="submit">Create account</button></div></form>`;
   document.body.append(dialog);
@@ -1689,9 +2048,9 @@ function openProfileDialog() {
       <section class="dialog-section">
         <h4 class="dialog-section-title">Change password</h4>
         <form id="password-form">
-          <div class="field"><label for="current-pwd">Current password</label><input id="current-pwd" name="currentPassword" type="password" required autocomplete="current-password" /></div>
-          <div class="field"><label for="new-pwd">New password</label><input id="new-pwd" name="newPassword" type="password" required minlength="10" autocomplete="new-password" placeholder="At least 10 characters" /></div>
-          <div class="field"><label for="confirm-pwd">Confirm new password</label><input id="confirm-pwd" name="confirmPassword" type="password" required minlength="10" autocomplete="new-password" /></div>
+          <div class="field"><label for="current-pwd">Current password</label><div class="password-wrapper"><input id="current-pwd" name="currentPassword" type="password" required autocomplete="current-password" />${passwordEyeMarkup()}</div></div>
+          <div class="field"><label for="new-pwd">New password</label><div class="password-wrapper"><input id="new-pwd" name="newPassword" type="password" required minlength="10" autocomplete="new-password" placeholder="At least 10 characters" />${passwordEyeMarkup()}</div></div>
+          <div class="field"><label for="confirm-pwd">Confirm new password</label><div class="password-wrapper"><input id="confirm-pwd" name="confirmPassword" type="password" required minlength="10" autocomplete="new-password" />${passwordEyeMarkup()}</div></div>
           <button class="button secondary" type="submit">Change password</button>
           <div class="error" id="password-error"></div>
         </form>
@@ -1753,7 +2112,7 @@ function openProfileDialog() {
 function openResetPasswordDialog(userId) {
   const user = state.users.find((item) => item.id === userId);
   const dialog = document.createElement('dialog');
-  dialog.innerHTML = `<div class="dialog-header"><h3>Reset Viewer password</h3><button class="button ghost small" data-close>Close</button></div><form><div class="dialog-body"><p class="helper">Set a new password for ${escapeHtml(user?.displayName || 'this Viewer')}. The account will be signed out of any active local session.</p><div class="field"><label>New password</label><input name="password" type="password" required minlength="10" /></div><div class="error"></div></div><div class="dialog-footer"><button class="button secondary" type="button" data-close>Cancel</button><button class="button" type="submit">Reset password</button></div></form>`;
+  dialog.innerHTML = `<div class="dialog-header"><h3>Reset Viewer password</h3><button class="button ghost small" data-close>Close</button></div><form><div class="dialog-body"><p class="helper">Set a new password for ${escapeHtml(user?.displayName || 'this Viewer')}. The account will be signed out of any active local session.</p><div class="field"><label>New password</label><div class="password-wrapper"><input name="password" type="password" required minlength="10" />${passwordEyeMarkup()}</div></div><div class="error"></div></div><div class="dialog-footer"><button class="button secondary" type="button" data-close>Cancel</button><button class="button" type="submit">Reset password</button></div></form>`;
   document.body.append(dialog); dialog.querySelectorAll('[data-close]').forEach((button) => button.addEventListener('click', () => dialog.close())); dialog.addEventListener('close', () => dialog.remove());
   dialog.querySelector('form').addEventListener('submit', async (event) => { event.preventDefault(); const form = event.currentTarget; const error = form.querySelector('.error'); try { await request(() => remoteCare.resetViewerPassword(state.session.token, userId, form.elements.password.value)); dialog.close(); flash('Viewer password reset.'); } catch (exception) { error.textContent = exception.message; } });
   dialog.showModal();
@@ -1767,7 +2126,7 @@ function openQuitDialog(source = 'settings') {
   if (document.querySelector('dialog[data-protected-quit]')) return;
   const dialog = document.createElement('dialog');
   dialog.dataset.protectedQuit = 'true';
-  dialog.innerHTML = `<div class="dialog-header"><h3>Quit Remote Care Monitor?</h3><button class="button ghost small" type="button" data-close>Keep running</button></div><form><div class="dialog-body"><div class="quit-warning"><span aria-hidden="true">!</span><div><strong>Monitoring will stop on this device.</strong><p>Closing the app normally only hides it in the system tray. Enter the current Super Admin password to quit.</p></div></div><div class="field"><label for="quit-password">Super Admin password</label><input id="quit-password" name="password" type="password" required autocomplete="current-password" autofocus /></div><div class="error"></div></div><div class="dialog-footer"><button class="button secondary" type="button" data-close>Cancel</button><button class="button danger" type="submit">Quit monitoring</button></div></form>`;
+  dialog.innerHTML = `<div class="dialog-header"><h3>Quit Remote Care Monitor?</h3><button class="button ghost small" type="button" data-close>Keep running</button></div><form><div class="dialog-body"><div class="quit-warning"><span aria-hidden="true">!</span><div><strong>Monitoring will stop on this device.</strong><p>Closing the app normally only hides it in the system tray. Enter the current Super Admin password to quit.</p></div></div><div class="field"><label for="quit-password">Super Admin password</label><div class="password-wrapper"><input id="quit-password" name="password" type="password" required autocomplete="current-password" autofocus />${passwordEyeMarkup()}</div></div><div class="error"></div></div><div class="dialog-footer"><button class="button secondary" type="button" data-close>Cancel</button><button class="button danger" type="submit">Quit monitoring</button></div></form>`;
   let authorizing = false;
   let cancellationSent = false;
   const cancelQuit = async () => {
@@ -1911,6 +2270,34 @@ remoteCare.onAppControl((event) => {
   if (state.session && isAdmin()) openQuitDialog(event.source || 'application');
   else flash('Sign in as a Super Admin to enter the password required to quit.', 'info');
 });
+
+// Delegated handler for password visibility eye toggles
+document.addEventListener('click', (event) => {
+  const toggleBtn = event.target.closest('.password-toggle-btn');
+  if (!toggleBtn) return;
+  event.preventDefault();
+  const wrapper = toggleBtn.closest('.password-wrapper');
+  if (!wrapper) return;
+  const input = wrapper.querySelector('input');
+  if (!input) return;
+  const isPassword = input.type === 'password';
+  input.type = isPassword ? 'text' : 'password';
+  toggleBtn.setAttribute('aria-label', isPassword ? 'Hide password' : 'Show password');
+  toggleBtn.title = isPassword ? 'Hide password' : 'Show password';
+  toggleBtn.classList.toggle('showing', isPassword);
+  toggleBtn.innerHTML = isPassword
+    ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="16" height="16"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>'
+    : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="16" height="16"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>';
+});
+
+if (typeof remoteCare.onRemoteSyncUpdate === 'function') {
+  remoteCare.onRemoteSyncUpdate(() => {
+    if (state.session && state.page === 'remote-data') {
+      const content = document.getElementById('page-content');
+      if (content) renderRemoteData(content);
+    }
+  });
+}
 
 (async function initialise() {
   ensureToastPopover();

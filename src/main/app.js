@@ -5,7 +5,7 @@ const { app, BrowserWindow, dialog, ipcMain, Menu, Tray, nativeImage } = require
 const { LocalDatabase, ROLES } = require('./database');
 const { verifyPassword, SessionStore } = require('./auth');
 const { MonitorEngine } = require('./monitor-engine');
-const { getNetworkAdapters } = require('./checks');
+const { getNetworkAdapters, getRunningProcesses, getSystemServices, getDockerContainers } = require('./checks');
 const { NotificationCenter } = require('./notification-center');
 const { configureAutostart, startedInBackground } = require('./autostart');
 const { dispatchWebhook } = require('./webhooks');
@@ -388,8 +388,10 @@ function initializeCloudServices() {
   }
 
   cloudPublisher = new CloudPublisher({ database, getSettings: () => database.getAppSettings() });
+  cloudPublisher.on('batch_delivered', (data) => broadcast('remote-sync-update', { source: 'cloudPublisher', event: 'batch_delivered', data }));
   cloudPublisher.on('error', (err) => {
     console.warn('[CloudPublisher] Network sync error:', err?.message || err);
+    broadcast('remote-sync-update', { source: 'cloudPublisher', event: 'error', error: err?.message || String(err) });
   });
   cloudPublisher.start();
 
@@ -397,8 +399,10 @@ function initializeCloudServices() {
   heartbeatService.start();
 
   historySyncService = new HistorySyncService({ database, getSettings: () => database.getAppSettings() });
+  historySyncService.on('synced', (data) => broadcast('remote-sync-update', { source: 'historySync', event: 'synced', data }));
   historySyncService.on('error', (err) => {
     console.warn('[HistorySyncService] Network history sync error:', err?.message || err);
+    broadcast('remote-sync-update', { source: 'historySync', event: 'error', error: err?.message || String(err) });
   });
   historySyncService.start();
 }
@@ -488,6 +492,21 @@ function registerIpc() {
   ipcMain.handle('network-adapters', async (_event, { token }) => {
     requireSession(token);
     return getNetworkAdapters();
+  });
+
+  ipcMain.handle('running-processes', async (_event, { token }) => {
+    requireSession(token);
+    return getRunningProcesses();
+  });
+
+  ipcMain.handle('system-services', async (_event, { token }) => {
+    requireSession(token);
+    return getSystemServices();
+  });
+
+  ipcMain.handle('docker-containers', async (_event, { token }) => {
+    requireSession(token);
+    return getDockerContainers();
   });
 
   ipcMain.handle('target-save', (_event, { token, target }) => {
@@ -604,6 +623,68 @@ function registerIpc() {
   ipcMain.handle('history-sync-status', (_event, { token }) => {
     requireSession(token);
     return historySyncService ? historySyncService.getStatus() : { enabled: false };
+  });
+
+  ipcMain.handle('remote-sync-status', (_event, { token }) => {
+    requireSession(token);
+    const settings = database.getAppSettings();
+    return {
+      isPosting: Boolean(cloudPublisher?.isPublishing || historySyncService?.isSyncing),
+      cloudPublisher: cloudPublisher?.getStatus() || null,
+      historySync: historySyncService?.getStatus() || null,
+      serverConfig: {
+        serverBaseUrl: settings.serverBaseUrl,
+        serverAuthToken: settings.serverAuthToken,
+        terminalHostname: settings.terminalHostname || require('node:os').hostname(),
+        serviceUuid: settings.serviceUuid,
+        deviceUuid: settings.deviceUuid,
+        cloudSyncEnabled: settings.cloudSyncEnabled,
+        historySyncEnabled: settings.historySyncEnabled,
+        historySyncIntervalMinutes: settings.historySyncIntervalMinutes,
+        historySyncTargetIds: settings.historySyncTargetIds,
+        historySyncTargetTypes: settings.historySyncTargetTypes || 'all'
+      }
+    };
+  });
+
+  ipcMain.handle('remote-sync-trigger', async (_event, { token }) => {
+    requireSession(token, [ROLES.SUPER_ADMIN, ROLES.OPERATOR]);
+    const results = {};
+    if (cloudPublisher) {
+      results.cloudSync = await cloudPublisher.publishPending().catch((err) => ({ error: err.message }));
+    }
+    if (historySyncService) {
+      results.historySync = await historySyncService.syncNow({ force: true }).catch((err) => ({ error: err.message }));
+    }
+    broadcast('remote-sync-update', { type: 'manual_trigger', results });
+    return results;
+  });
+
+  ipcMain.handle('factory-reset-wipe', async (_event, { token, password }) => {
+    const session = requireSession(token, ROLES.SUPER_ADMIN);
+    if (!database.verifySuperAdminPassword(session.userId, password || '')) {
+      database.audit(session.userId, 'failed_factory_reset', 'application', null, {});
+      throw new Error('Incorrect Super Admin password. Reset cancelled.');
+    }
+    database.audit(session.userId, 'authorized_factory_reset', 'application', null, {});
+    try {
+      monitor?.stop();
+      cloudPublisher?.stop();
+      heartbeatService?.stop();
+      historySyncService?.stop();
+      database.close();
+
+      const userData = app.getPath('userData');
+      const filesToWipe = ['remote-care.sqlite', 'remote-care.sqlite-wal', 'remote-care.sqlite-shm', 'remote-care-crash.log'];
+      for (const f of filesToWipe) {
+        try { fs.unlinkSync(path.join(userData, f)); } catch (_) {}
+      }
+      app.relaunch();
+      app.exit(0);
+      return { ok: true };
+    } catch (err) {
+      throw new Error(`Factory reset failed: ${err.message}`);
+    }
   });
 
   ipcMain.handle('targets-export', async (_event, { token, targetIds }) => {
