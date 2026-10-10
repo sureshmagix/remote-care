@@ -34,8 +34,8 @@ class CloudPublisher extends EventEmitter {
     this.emit('stopped');
   }
 
-  trigger() {
-    return this.publishPending().catch((err) => ({ error: err?.message || String(err) }));
+  trigger({ force = false } = {}) {
+    return this.publishPending(25, { force }).catch((err) => ({ error: err?.message || String(err) }));
   }
 
   getEndpointUrl() {
@@ -52,12 +52,15 @@ class CloudPublisher extends EventEmitter {
     return (settings?.serverAuthToken?.trim() || settings?.cloudAuthToken?.trim() || 'Wiitronics_diagnostic');
   }
 
-  async publishPending(batchSize = 25) {
+  async publishPending(batchSize = 25, { force = false } = {}) {
     if (this.isPublishing) return;
     const settings = this.getSettings();
     const endpoint = this.getEndpointUrl();
-    if (!settings?.cloudSyncEnabled || !endpoint) {
-      return { skipped: true, reason: 'Cloud/Server sync is disabled or endpoint is not configured.' };
+    if (!endpoint) {
+      return { skipped: true, reason: 'Cloud/Server endpoint is not configured.' };
+    }
+    if (!force && !settings?.cloudSyncEnabled) {
+      return { skipped: true, reason: 'Cloud/Server sync is disabled.' };
     }
 
     this.isPublishing = true;

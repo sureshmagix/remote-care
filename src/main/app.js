@@ -586,8 +586,13 @@ function registerIpc() {
 
     const { checkHttp } = require('./checks');
     const start = Date.now();
+    const apiKey = settings.serverAuthToken?.trim() || settings.cloudAuthToken?.trim() || 'Wiitronics_diagnostic';
+    const headers = {
+      'x-api-key': apiKey,
+      'Authorization': `Bearer ${apiKey}`
+    };
     try {
-      const res = await checkHttp({ url: target, timeoutMs: 5000, metadata: {} });
+      const res = await checkHttp(target, 5000, headers);
       const latency = Date.now() - start;
       return {
         ok: res.ok,
@@ -628,10 +633,14 @@ function registerIpc() {
   ipcMain.handle('remote-sync-status', (_event, { token }) => {
     requireSession(token);
     const settings = database.getAppSettings();
+    const cloudStatus = cloudPublisher?.getStatus() || null;
+    const historyStatus = historySyncService?.getStatus() || null;
     return {
       isPosting: Boolean(cloudPublisher?.isPublishing || historySyncService?.isSyncing),
-      cloudPublisher: cloudPublisher?.getStatus() || null,
-      historySync: historySyncService?.getStatus() || null,
+      cloudPublisher: cloudStatus,
+      historySync: historyStatus,
+      cloud: cloudStatus,
+      history: historyStatus,
       serverConfig: {
         serverBaseUrl: settings.serverBaseUrl,
         serverAuthToken: settings.serverAuthToken,
@@ -650,8 +659,13 @@ function registerIpc() {
   ipcMain.handle('remote-sync-trigger', async (_event, { token }) => {
     requireSession(token, [ROLES.SUPER_ADMIN, ROLES.OPERATOR]);
     const results = {};
+    if (heartbeatService) {
+      try {
+        heartbeatService.sendHeartbeat();
+      } catch (_) {}
+    }
     if (cloudPublisher) {
-      results.cloudSync = await cloudPublisher.publishPending().catch((err) => ({ error: err.message }));
+      results.cloudSync = await cloudPublisher.publishPending(25, { force: true }).catch((err) => ({ error: err.message }));
     }
     if (historySyncService) {
       results.historySync = await historySyncService.syncNow({ force: true }).catch((err) => ({ error: err.message }));

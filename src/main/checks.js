@@ -230,27 +230,30 @@ function checkTcp(host, port, timeoutMs) {
   });
 }
 
-async function checkHttp(url, timeoutMs) {
+async function checkHttp(url, timeoutMs = 3000, customHeaders = {}) {
+  const targetUrl = typeof url === 'object' && url !== null ? (url.url || url.target) : url;
+  const timeout = typeof url === 'object' && url !== null && url.timeoutMs ? url.timeoutMs : timeoutMs;
+  const headers = typeof url === 'object' && url !== null && url.headers ? { ...url.headers, ...customHeaders } : customHeaders;
   const startedAt = process.hrtime.bigint();
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const timer = setTimeout(() => controller.abort(), timeout);
   try {
-    const response = await fetch(url, { method: 'GET', signal: controller.signal, redirect: 'follow' });
+    const response = await fetch(targetUrl, { method: 'GET', headers, signal: controller.signal, redirect: 'follow' });
     await response.body?.cancel();
     const latencyMs = elapsed(startedAt);
     const ok = response.status >= 200 && response.status < 400;
     return {
       ok,
       latencyMs,
-      message: ok ? `${new URL(url).host} replied with HTTP ${response.status}.` : `${new URL(url).host} returned HTTP error ${response.status}.`,
-      details: { url, statusCode: response.status }
+      message: ok ? `${new URL(targetUrl).host} replied with HTTP ${response.status}.` : `${new URL(targetUrl).host} returned HTTP error ${response.status}.`,
+      details: { url: targetUrl, statusCode: response.status }
     };
   } catch (error) {
     return {
       ok: false,
       latencyMs: null,
-      message: error.name === 'AbortError' ? `HTTP request to ${url} timed out.` : `HTTP request to ${url} failed: ${error.message}`,
-      details: { url, error: error.message }
+      message: error.name === 'AbortError' ? `HTTP request to ${targetUrl} timed out.` : `HTTP request to ${targetUrl} failed: ${error.message}`,
+      details: { url: targetUrl, error: error.message }
     };
   } finally {
     clearTimeout(timer);

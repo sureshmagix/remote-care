@@ -407,7 +407,7 @@ function renderShell() {
           <button data-page="users">♙ Users</button>
           ${isAdmin() ? '<button data-page="server">☁ Server</button>' : ''}
           ${isAdmin() ? '<button data-page="webhooks">⚑ Webhooks</button>' : ''}
-          ${isAdmin() ? '<button data-page="remote-data">📡 Remote Data</button>' : ''}
+          ${(isAdmin() || isOperator()) ? '<button data-page="remote-data">📡 Remote Data</button>' : ''}
           ${isAdmin() ? '<button data-page="settings">⚙ Settings</button>' : ''}
           <button data-page="about">ⓘ About</button>
         </nav>
@@ -1545,7 +1545,7 @@ const REMOTE_DATA_MONITOR_TYPES = [
 ];
 
 async function renderRemoteData(content) {
-  if (!isAdmin()) {
+  if (!isAdmin() && !isOperator()) {
     state.page = 'overview';
     return renderOverview(content);
   }
@@ -1553,31 +1553,42 @@ async function renderRemoteData(content) {
   const settings = state.settings;
   const syncStatus = await request(() => remoteCare.getRemoteSyncStatus(state.session.token)).catch(() => ({}));
 
-  const cloud = syncStatus.cloud || {};
-  const history = syncStatus.history || {};
-  const isPosting = cloud.isPublishing || history.isSyncing;
-  const hasError = Boolean(history.lastError || cloud.lastError);
+  const cloud = syncStatus.cloud || syncStatus.cloudPublisher || {};
+  const history = syncStatus.history || syncStatus.historySync || {};
+  const serverConfig = syncStatus.serverConfig || {};
+  const isPosting = Boolean(syncStatus.isPosting || cloud.isPublishing || history.isSyncing);
+  const lastError = history.lastError || cloud.lastError || null;
+  const is401 = Boolean(lastError && /401|unauthorized/i.test(lastError));
+
+  const serverBaseUrl = settings.serverBaseUrl || serverConfig.serverBaseUrl || '';
+  const historyEndpoint = history.endpoint || (serverBaseUrl ? `${serverBaseUrl.replace(/\/+$/, '')}/api/history` : 'http://<YOUR_SERVER_IP>:3999/api/history');
+  const syncEndpoint = cloud.endpoint || (serverBaseUrl ? `${serverBaseUrl.replace(/\/+$/, '')}/api/sync` : 'http://<YOUR_SERVER_IP>:3999/api/sync');
 
   let bannerClass = 'idle';
   let bannerIcon = 'ℹ';
   let bannerTitle = 'Idle / Waiting for Interval';
-  let bannerDesc = 'Sync triggers on result changes for history, and every 1 minute for telemetry heartbeat.';
+  let bannerDesc = `Telemetry heartbeats sent every ${settings.cloudHeartbeatMinutes ?? 5}m. Result changes sync every ${settings.historySyncIntervalMinutes ?? 5}m on status changes.`;
 
   if (isPosting) {
     bannerClass = 'posting';
     bannerIcon = '<span class="spinner-pulse"></span>';
     bannerTitle = 'Transmitting Data to Remote Server…';
-    bannerDesc = `Active request in-flight to ${escapeHtml(history.serverUrl || cloud.serverUrl || settings.serverUrl || 'remote server')}`;
-  } else if (hasError) {
+    bannerDesc = `Active HTTP POST in-flight to ${escapeHtml(serverBaseUrl || 'remote server')}`;
+  } else if (is401) {
+    bannerClass = 'error';
+    bannerIcon = '🔒';
+    bannerTitle = 'Authentication Error (HTTP 401 Unauthorized)';
+    bannerDesc = `Server rejected the API key or secret token: ${escapeHtml(lastError)}. Please verify the Server API Key (x-api-key) in Server settings.`;
+  } else if (lastError) {
     bannerClass = 'error';
     bannerIcon = '⚠️';
     bannerTitle = 'Server Connection Error / Not Responding';
-    bannerDesc = escapeHtml(history.lastError || cloud.lastError || 'Remote server did not respond.');
-  } else if (history.lastSyncAt || cloud.lastPublishedAt) {
+    bannerDesc = escapeHtml(lastError);
+  } else if (history.lastSyncAt || cloud.lastSyncAt || cloud.lastPublishedAt) {
     bannerClass = 'success';
     bannerIcon = '✓';
     bannerTitle = 'Synchronized &amp; Connected';
-    bannerDesc = `Last successful communication: ${prettyTime(history.lastSyncAt || cloud.lastPublishedAt)}`;
+    bannerDesc = `Last successful communication: ${prettyTime(history.lastSyncAt || cloud.lastSyncAt || cloud.lastPublishedAt)}`;
   }
 
   // Monitor types filter selection
@@ -1585,8 +1596,6 @@ async function renderRemoteData(content) {
   const selectedTypes = Array.isArray(rawTypes) && rawTypes.length > 0 && !rawTypes.includes('all')
     ? new Set(rawTypes)
     : new Set(REMOTE_DATA_MONITOR_TYPES.map((t) => t.id));
-
-  const serverUrl = settings.serverUrl || settings.serverBaseUrl || 'http://<YOUR_SERVER_IP>:3999';
 
   content.innerHTML = `
     <header class="page-header">
@@ -1608,6 +1617,52 @@ async function renderRemoteData(content) {
         <button class="button ghost small" id="refresh-sync-view-btn" type="button">↻ Refresh</button>
       </div>
     </div>
+
+    ${is401 && isAdmin() ? `
+      <div class="sync-status-banner error" style="margin-bottom:18px;border-color:var(--status-down);">
+        <span class="sync-status-icon">⚠️</span>
+        <div class="sync-status-info">
+          <h4>Action Required: Update Server API Key</h4>
+          <p>The remote server is actively refusing requests because <code>x-api-key</code> does not match the server's expected key.</p>
+        </div>
+        <button class="button small secondary" id="jump-to-server-tab-btn" type="button" style="margin-left:auto;">Edit Server Key →</button>
+      </div>
+    ` : ''}
+
+    <article class="card" style="margin-bottom:18px;">
+      <div class="panel-title">
+        <h3>Active Server Configuration &amp; Credentials</h3>
+        <span>Target Server</span>
+      </div>
+      <div class="panel-body">
+        <div class="info-grid">
+          <div class="info-item">
+            <span>Server Base URL</span>
+            <strong>${escapeHtml(serverBaseUrl || 'Not configured in Server tab')}</strong>
+          </div>
+          <div class="info-item">
+            <span>Active API Key (x-api-key)</span>
+            <strong>${settings.serverAuthToken ? escapeHtml(settings.serverAuthToken.slice(0, 4) + '••••••••') : 'Wiitronics_diagnostic (default)'}</strong>
+          </div>
+          <div class="info-item">
+            <span>Terminal Hostname</span>
+            <strong>${escapeHtml(settings.terminalHostname || serverConfig.terminalHostname || 'Default OS hostname')}</strong>
+          </div>
+          <div class="info-item">
+            <span>Heartbeat (/api/sync)</span>
+            <strong>${settings.cloudSyncEnabled ? `Enabled (every ${settings.cloudHeartbeatMinutes ?? 5}m)` : '<span style="color:var(--text-muted)">Paused / Disabled</span>'}</strong>
+          </div>
+          <div class="info-item">
+            <span>History Sync (/api/history)</span>
+            <strong>${settings.historySyncEnabled ? `Enabled (every ${settings.historySyncIntervalMinutes ?? 5}m)` : '<span style="color:var(--text-muted)">Paused / Disabled</span>'}</strong>
+          </div>
+          <div class="info-item">
+            <span>Commissioned UUIDs</span>
+            <strong>${escapeHtml(settings.serviceUuid || 'Default')} / ${escapeHtml(settings.deviceUuid || 'Default')}</strong>
+          </div>
+        </div>
+      </div>
+    </article>
 
     <form id="remote-types-form">
       <article class="card">
@@ -1649,7 +1704,7 @@ async function renderRemoteData(content) {
         </div>
         <div class="panel-body">
           <div class="info-grid" style="margin-bottom:14px">
-            <div class="info-item"><span>Endpoint</span><strong>${escapeHtml(serverUrl)}/api/history</strong></div>
+            <div class="info-item"><span>Endpoint</span><strong>${escapeHtml(historyEndpoint)}</strong></div>
             <div class="info-item"><span>Last Dispatched</span><strong>${history.lastSyncAt ? prettyTime(history.lastSyncAt) : 'Never'}</strong></div>
           </div>
           <div style="margin-bottom:12px">
@@ -1670,8 +1725,8 @@ async function renderRemoteData(content) {
         </div>
         <div class="panel-body">
           <div class="info-grid" style="margin-bottom:14px">
-            <div class="info-item"><span>Endpoint</span><strong>${escapeHtml(serverUrl)}/api/sync</strong></div>
-            <div class="info-item"><span>Last Dispatched</span><strong>${cloud.lastPublishedAt ? prettyTime(cloud.lastPublishedAt) : 'Never'}</strong></div>
+            <div class="info-item"><span>Endpoint</span><strong>${escapeHtml(syncEndpoint)}</strong></div>
+            <div class="info-item"><span>Last Dispatched</span><strong>${(cloud.lastPublishedAt || cloud.lastSyncAt) ? prettyTime(cloud.lastPublishedAt || cloud.lastSyncAt) : 'Never'}</strong></div>
           </div>
           <div style="margin-bottom:12px">
             <strong style="display:block;margin-bottom:4px;font-size:0.85rem;color:var(--text-muted)">Latest Dispatched Request Body</strong>
@@ -1686,6 +1741,11 @@ async function renderRemoteData(content) {
     </div>`;
 
   // Listeners
+  document.getElementById('jump-to-server-tab-btn')?.addEventListener('click', async () => {
+    state.page = 'server';
+    await renderPage();
+  });
+
   document.getElementById('trigger-sync-now-btn')?.addEventListener('click', async (e) => {
     const btn = e.currentTarget;
     btn.disabled = true;
