@@ -730,3 +730,81 @@ body.desktop-notification { min-width: 0; min-height: 0; background: #07131f; }
   white-space: pre-wrap;
 }
 
+.brand-mark svg {
+  width: 28px;
+  height: 28px;
+  display: block;
+}
+
+/* Small Remote Data Indication Tab in Overview */
+.overview-remote-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  text-align: left;
+  transition: border-color 0.2s ease, background-color 0.2s ease;
+}
+.overview-remote-tab.clickable {
+  cursor: pointer;
+}
+.overview-remote-tab.clickable:hover {
+  border-color: var(--brand);
+  background: var(--surface-2);
+}
+.overview-remote-tab.good {
+  border-color: rgba(45, 212, 161, 0.38);
+  background: rgba(45, 212, 161, 0.06);
+}
+.overview-remote-tab.posting {
+  border-color: rgba(56, 189, 248, 0.48);
+  background: rgba(14, 165, 233, 0.1);
+}
+.overview-remote-tab.down {
+  border-color: rgba(255, 107, 107, 0.45);
+  background: rgba(255, 107, 107, 0.08);
+}
+.overview-remote-tab .remote-tab-body {
+  display: grid;
+  gap: 2px;
+}
+.overview-remote-tab .remote-tab-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  color: var(--text);
+  white-space: nowrap;
+}
+.overview-remote-tab .remote-tab-badge {
+  padding: 1px 6px;
+  border-radius: 99px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  background: rgba(148, 163, 184, 0.15);
+  color: var(--muted);
+}
+.overview-remote-tab.good .remote-tab-badge {
+  background: rgba(45, 212, 161, 0.16);
+  color: #8ef1cf;
+}
+.overview-remote-tab.posting .remote-tab-badge {
+  background: rgba(56, 189, 248, 0.2);
+  color: #7dd3fc;
+}
+.overview-remote-tab.down .remote-tab-badge {
+  background: rgba(255, 107, 107, 0.2);
+  color: #ffadb3;
+}
+.overview-remote-tab .remote-tab-time {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}

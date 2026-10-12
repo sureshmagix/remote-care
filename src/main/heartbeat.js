@@ -26,9 +26,9 @@ class HeartbeatService {
     }
   }
 
-  restart() {
+  restart({ sendImmediate = true } = {}) {
     this.stop();
-    this.start({ sendImmediate: false });
+    this.start({ sendImmediate });
   }
 
   getSelectedMonitoredTargets(dashboard, settings) {

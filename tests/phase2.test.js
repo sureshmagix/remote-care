@@ -906,12 +906,84 @@ test('saveAppSettings accepts historySyncTargetTypes as array or string, include
     assert.equal(sentHistoryPayload.history[0].details.monitor_name, 'Primary Web Portal');
     assert.equal(sentHistoryPayload.history[0].details.service_uuid, 'UPDATED_SERVICE_UUID_777');
     assert.equal(sentHistoryPayload.history[0].details.device_uuid, 'UPDATED_DEVICE_UUID_888');
+
+    // Verify lastPayload in HistorySyncService stores only the last 1 history value
+    const historyStatus = historySync.getStatus();
+    assert.equal(historyStatus.lastPayload.history.length, 1);
+    assert.equal(historyStatus.lastPayload.entriesCount, 1);
+    assert.equal(historyStatus.lastPayload.history[0].name, 'Main Branch Gateway');
   } finally {
     database.close();
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
 
+test('periodic sync runs automatically once serverBaseUrl is configured without manual button click', async () => {
+  const { database, directory } = temporaryDatabase();
+  try {
+    const admin = database.createInitialAdmin({ username: 'admin', displayName: 'Admin', password: 'password-123' });
+    const target = database.saveTarget({
+      name: 'Periodic Ping Target',
+      type: 'ping',
+      host: '192.168.1.1',
+      intervalSeconds: 10,
+      timeoutMs: 1000,
+      failureThreshold: 1,
+      recoveryThreshold: 1,
+      severity: 'critical',
+      downMessage: 'Down',
+      recoveryMessage: 'Up',
+      enabled: true
+    }, admin.id);
 
+    database.recordCheck(target.id, { ok: true, status: 'healthy', latencyMs: 4, message: 'OK' });
+    database.recordCheck(target.id, { ok: false, status: 'down', latencyMs: 100, message: 'Timeout' });
 
+    // Configure only serverBaseUrl (leaving cloudSyncEnabled & historySyncEnabled at default false)
+    database.updateAppSettings({
+      serverBaseUrl: 'http://192.168.1.200:3999'
+    }, admin.id);
 
+    const publisher = new CloudPublisher({ database, getSettings: () => database.getAppSettings() });
+    const heartbeat = new HeartbeatService({ database, publisher, getSettings: () => database.getAppSettings() });
+    const historySync = new HistorySyncService({ database, getSettings: () => database.getAppSettings() });
+
+    assert.equal(publisher.isEnabled(), true);
+    assert.equal(historySync.isEnabled(), true);
+
+    let periodicSyncCount = 0;
+    publisher.sendBatch = async () => {
+      periodicSyncCount += 1;
+      return { ok: true, statusCode: 200, responseData: { received: true } };
+    };
+
+    let periodicHistoryCount = 0;
+    let dispatchedHistoryBatch = null;
+    historySync.sendPayload = async (_url, _token, payload) => {
+      periodicHistoryCount += 1;
+      dispatchedHistoryBatch = payload;
+      return { ok: true, statusCode: 200, responseData: { received: true } };
+    };
+
+    // Simulate periodic background timer execution (force: false)
+    heartbeat.sendHeartbeat({ triggerPublish: false });
+    const pubRes = await publisher.publishPending(25, { force: false });
+    const histRes = await historySync.syncNow({ force: false });
+
+    assert.equal(pubRes.publishedCount, 2);
+    assert.equal(publisher.getStatus().lastPayload.events.length, 1);
+    assert.equal(periodicSyncCount, 1);
+    assert.equal(histRes.ok, true);
+    assert.equal(periodicHistoryCount, 1);
+    assert.equal(dispatchedHistoryBatch.history.length, 2);
+
+    // And lastPayload in status keeps only the last 1 history entry
+    const status = historySync.getStatus();
+    assert.equal(status.enabled, true);
+    assert.equal(status.lastPayload.history.length, 1);
+    assert.equal(status.lastPayload.history[0].status, 'down');
+  } finally {
+    database.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});

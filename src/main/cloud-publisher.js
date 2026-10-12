@@ -59,6 +59,13 @@ class CloudPublisher extends EventEmitter {
     return (settings?.serverAuthToken?.trim() || settings?.cloudAuthToken?.trim() || 'Wiitronics_diagnostic');
   }
 
+  isEnabled() {
+    const endpoint = this.getEndpointUrl();
+    if (!endpoint) return false;
+    const settings = this.getSettings();
+    return Boolean(settings?.cloudSyncEnabled || endpoint);
+  }
+
   async publishPending(batchSize = 25, { force = false } = {}) {
     if (this.isPublishing) {
       if (!force) return { skipped: true, reason: 'Cloud publish already in progress.' };
@@ -68,12 +75,11 @@ class CloudPublisher extends EventEmitter {
       }
       if (this.isPublishing) return { skipped: true, reason: 'Cloud publish already in progress.' };
     }
-    const settings = this.getSettings();
     const endpoint = this.getEndpointUrl();
     if (!endpoint) {
       return { skipped: true, reason: 'Cloud/Server endpoint is not configured.' };
     }
-    if (!force && !settings?.cloudSyncEnabled) {
+    if (!force && !this.isEnabled()) {
       return { skipped: true, reason: 'Cloud/Server sync is disabled.' };
     }
 
@@ -112,7 +118,10 @@ class CloudPublisher extends EventEmitter {
       };
 
       const authToken = this.getAuthToken();
-      this.lastPayload = payload;
+      this.lastPayload = {
+        ...payload,
+        events: payload.events.slice(-1)
+      };
       const result = await this.sendBatch(endpoint, authToken, payload);
       this.lastResponse = result?.responseData || result;
       const deliveredIds = pending.map((p) => p.id);
@@ -199,7 +208,6 @@ class CloudPublisher extends EventEmitter {
   }
 
   getStatus() {
-    const settings = this.getSettings();
     const endpoint = this.getEndpointUrl();
     let protocol = 'https';
     if (endpoint) {
@@ -211,7 +219,7 @@ class CloudPublisher extends EventEmitter {
     }
     const pendingCount = this.database.getPendingOutboundCount?.() ?? 0;
     return {
-      enabled: Boolean(settings?.cloudSyncEnabled),
+      enabled: this.isEnabled(),
       protocol,
       endpoint: endpoint || null,
       isPublishing: this.isPublishing,

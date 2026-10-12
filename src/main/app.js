@@ -193,8 +193,15 @@ function createTrayIcon() {
     } catch (_) {}
   }
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
-    <rect width="64" height="64" rx="14" fill="#0e7490"/>
-    <path d="M14 35c9-13 27-13 36 0M20 42c6-8 18-8 24 0M29 49a3 3 0 1 0 6 0 3 3 0 0 0-6 0" fill="none" stroke="white" stroke-width="4" stroke-linecap="round"/>
+    <defs>
+      <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0%" stop-color="#0ea5e9"/>
+        <stop offset="100%" stop-color="#0369a1"/>
+      </linearGradient>
+    </defs>
+    <rect width="64" height="64" rx="16" fill="url(#bg)"/>
+    <path d="M32 10L14 18v13c0 12.2 7.7 23.3 18 27 10.3-3.7 18-14.8 18-27V18L32 10z" fill="rgba(7,19,31,0.35)" stroke="#ffffff" stroke-width="2.5" stroke-linejoin="round"/>
+    <path d="M18 33h7l4-9 6 18 4-9h7" fill="none" stroke="#38bdf8" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
   </svg>`;
   return nativeImage.createFromDataURL(`data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`).resize({ width: 18, height: 18 });
 }
@@ -374,6 +381,41 @@ function requireSession(token, allowedRoles = null) {
   return session;
 }
 
+function getRemoteSyncSummary() {
+  const settings = database?.getAppSettings() || {};
+  const cloudStatus = cloudPublisher?.getStatus() || { enabled: false };
+  const historyStatus = historySyncService?.getStatus() || { enabled: false };
+  const isConfigured = Boolean(
+    settings.serverBaseUrl?.trim() ||
+    settings.cloudHttpsUrl?.trim() ||
+    settings.historySyncUrl?.trim()
+  );
+  const isEnabled = Boolean(cloudStatus.enabled || historyStatus.enabled);
+  const isPosting = Boolean(cloudPublisher?.isPublishing || historySyncService?.isSyncing);
+  const lastTelemetrySyncAt = cloudStatus.lastSyncAt || null;
+  const lastHistorySyncAt = historyStatus.lastSyncAt || null;
+  let lastSyncAt = null;
+  if (lastTelemetrySyncAt && lastHistorySyncAt) {
+    lastSyncAt = lastTelemetrySyncAt > lastHistorySyncAt ? lastTelemetrySyncAt : lastHistorySyncAt;
+  } else {
+    lastSyncAt = lastHistorySyncAt || lastTelemetrySyncAt;
+  }
+  const lastError = historyStatus.lastError || cloudStatus.lastError || null;
+  const endpoint = settings.serverBaseUrl?.trim() || historyStatus.endpoint || cloudStatus.endpoint || '';
+
+  return {
+    isConfigured,
+    isEnabled,
+    isPosting,
+    endpoint,
+    lastSyncAt,
+    lastTelemetrySyncAt,
+    lastHistorySyncAt,
+    lastError,
+    historyIntervalMinutes: Number(settings.historySyncIntervalMinutes) || 5
+  };
+}
+
 function initializeCloudServices() {
   if (cloudPublisher) {
     cloudPublisher.stop();
@@ -405,6 +447,17 @@ function initializeCloudServices() {
     broadcast('remote-sync-update', { source: 'historySync', event: 'error', error: err?.message || String(err) });
   });
   historySyncService.start();
+
+  // Ensure initial monitor check results recorded shortly after startup are synced promptly
+  const initialSyncTimer = setTimeout(() => {
+    if (cloudPublisher?.isEnabled()) {
+      cloudPublisher.publishPending().catch(() => {});
+    }
+    if (historySyncService?.isEnabled()) {
+      historySyncService.syncNow().catch(() => {});
+    }
+  }, 3000);
+  initialSyncTimer.unref?.();
 }
 
 function registerIpc() {
@@ -444,7 +497,10 @@ function registerIpc() {
 
   ipcMain.handle('dashboard', (_event, { token }) => {
     requireSession(token);
-    return monitor.dashboard();
+    return {
+      ...monitor.dashboard(),
+      remoteSync: getRemoteSyncSummary()
+    };
   });
 
   ipcMain.handle('history-list', (_event, { token, filters }) => {
@@ -647,8 +703,8 @@ function registerIpc() {
         terminalHostname: settings.terminalHostname || require('node:os').hostname(),
         serviceUuid: settings.serviceUuid,
         deviceUuid: settings.deviceUuid,
-        cloudSyncEnabled: settings.cloudSyncEnabled,
-        historySyncEnabled: settings.historySyncEnabled,
+        cloudSyncEnabled: Boolean(cloudStatus?.enabled ?? settings.cloudSyncEnabled),
+        historySyncEnabled: Boolean(historyStatus?.enabled ?? settings.historySyncEnabled),
         historySyncIntervalMinutes: settings.historySyncIntervalMinutes,
         historySyncTargetIds: settings.historySyncTargetIds,
         historySyncTargetTypes: settings.historySyncTargetTypes || 'all'
@@ -807,6 +863,7 @@ function registerIpc() {
       historySyncService.restart();
     }
     broadcast('monitor-update', { type: 'app_settings_updated', settings: saved });
+    broadcast('remote-sync-update', { type: 'settings_updated', settings: saved });
     return saved;
   });
 
@@ -865,6 +922,9 @@ app.whenReady().then(() => {
   monitor.on('update', (event) => {
     updateTray();
     broadcast('monitor-update', event);
+    if (historySyncService?.isEnabled() && !historySyncService.lastSyncAt) {
+      historySyncService.syncNow().catch(() => {});
+    }
   });
   registerIpc();
   tray = new Tray(createTrayIcon());

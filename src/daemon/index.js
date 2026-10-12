@@ -6,6 +6,7 @@ const { LocalDatabase } = require('../main/database');
 const { MonitorEngine } = require('../main/monitor-engine');
 const { CloudPublisher } = require('../main/cloud-publisher');
 const { HeartbeatService } = require('../main/heartbeat');
+const { HistorySyncService } = require('../main/history-sync');
 const { dispatchWebhook } = require('../main/webhooks');
 
 function resolveDefaultDbPath() {
@@ -36,7 +37,7 @@ function log(level, message, meta = '') {
 
 async function main() {
   const dbPath = resolveDefaultDbPath();
-  log('info', `Starting Remote Care Monitor Daemon v2.0.3...`);
+  log('info', `Starting Remote Care Monitor Daemon v2.0.4...`);
   log('info', `Database path: ${dbPath}`);
 
   const database = new LocalDatabase(dbPath);
@@ -44,7 +45,7 @@ async function main() {
   database.startRuntimeSession(sessionId, {
     mode: 'headless_daemon',
     platform: process.platform,
-    version: '2.0.3'
+    version: '2.0.4'
   });
 
   const cloudPublisher = new CloudPublisher({
@@ -55,6 +56,11 @@ async function main() {
   const heartbeatService = new HeartbeatService({
     database,
     publisher: cloudPublisher,
+    getSettings: () => database.getAppSettings()
+  });
+
+  const historySyncService = new HistorySyncService({
+    database,
     getSettings: () => database.getAppSettings()
   });
 
@@ -98,6 +104,7 @@ async function main() {
     monitor.start();
     cloudPublisher.start();
     heartbeatService.start();
+    historySyncService.start();
     log('info', 'Monitoring engine and cloud sync services active.');
   } else {
     log('warn', 'No Super Admin account found. Please launch the desktop app first to initialize the administrator credentials.');
@@ -108,6 +115,7 @@ async function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     log('info', `Received ${signal}. Shutting down cleanly...`);
+    historySyncService.stop();
     heartbeatService.stop();
     cloudPublisher.stop();
     monitor.stop();

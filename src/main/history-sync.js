@@ -102,8 +102,10 @@ class HistorySyncService extends EventEmitter {
   }
 
   isEnabled() {
+    const endpoint = this.getEndpointUrl();
+    if (!endpoint) return false;
     const settings = this.getSettings();
-    return Boolean(settings?.historySyncEnabled);
+    return Boolean(settings?.historySyncEnabled || endpoint);
   }
 
   buildPayload({ previewRecent = false, limit = 50, targetIds = undefined, targetTypes = undefined, includeLatestOnForce = false } = {}) {
@@ -137,7 +139,7 @@ class HistorySyncService extends EventEmitter {
         sinceId: cursor.lastId,
         limit: 100
       });
-      if (includeLatestOnForce && entries.length === 0) {
+      if ((includeLatestOnForce || !this.lastPayload) && entries.length === 0) {
         entries = this.database.getHistoryChanges({
           targetIds: resolvedTargets,
           targetTypes: resolvedTypes,
@@ -257,13 +259,21 @@ class HistorySyncService extends EventEmitter {
         this.database.setHistorySyncCursor(this.database.getHistorySyncCursor().lastId, payload.dispatchedAt);
       }
 
+      const lastSingleHistory = payload.history.length > 0
+        ? payload.history.slice(-1)
+        : (this.lastPayload?.history?.length > 0 ? this.lastPayload.history.slice(-1) : []);
+
       this.lastSyncAt = payload.dispatchedAt;
       this.lastSentCount = payload.history.length;
-      this.lastPayload = payload;
+      this.lastPayload = {
+        ...payload,
+        entriesCount: lastSingleHistory.length,
+        history: lastSingleHistory
+      };
       this.lastResponse = res?.responseData || res;
       this.lastError = null;
 
-      this.emit('synced', { timestamp: this.lastSyncAt, count: payload.history.length, payload, result: res });
+      this.emit('synced', { timestamp: this.lastSyncAt, count: payload.history.length, payload: this.lastPayload, result: res });
       return { ok: true, sentCount: payload.history.length, timestamp: this.lastSyncAt, payload, result: res };
     } catch (err) {
       this.lastError = err.message;
@@ -279,8 +289,11 @@ class HistorySyncService extends EventEmitter {
     }
   }
 
-  start() {
+  start({ syncImmediate = true } = {}) {
     if (this.timer) return;
+    if (syncImmediate && this.isEnabled()) {
+      void this.syncNow().catch(() => {});
+    }
     const intervalMinutes = this.getIntervalMinutes();
     this.timer = setInterval(() => {
       if (this.isEnabled()) {
@@ -299,9 +312,9 @@ class HistorySyncService extends EventEmitter {
     this.emit('stopped');
   }
 
-  restart() {
+  restart({ syncImmediate = true } = {}) {
     this.stop();
-    this.start();
+    this.start({ syncImmediate });
   }
 
   getStatus() {

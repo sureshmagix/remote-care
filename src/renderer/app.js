@@ -334,11 +334,19 @@ async function request(action) {
   }
 }
 
+function brandLogoMarkup() {
+  return `<svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <path d="M32 6L12 15v15c0 14.2 8.5 26.8 20 31 11.5-4.2 20-16.8 20-31V15L32 6z" fill="#07131f" fill-opacity="0.42" stroke="#ffffff" stroke-width="3.2" stroke-linejoin="round"/>
+    <path d="M16 33h8.5l4.2-10 6.6 20 4.2-10H48" stroke="#ffffff" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="32" cy="18" r="2.6" fill="#2dd4a1"/>
+  </svg>`;
+}
+
 function renderAuth(setup = null) {
   root.innerHTML = `
     <main class="auth-shell">
       <section class="auth-card">
-        <div class="brand"><div class="brand-mark">RC</div><div><h1>Remote Care Monitor</h1><p>Local network and service monitoring</p></div></div>
+        <div class="brand"><div class="brand-mark">${brandLogoMarkup()}</div><div><h1>Remote Care Monitor</h1><p>Local network and service monitoring</p></div></div>
         <div id="auth-content"></div>
       </section>
     </main>`;
@@ -399,7 +407,7 @@ function renderShell() {
   root.innerHTML = `
     <main class="app-shell">
       <aside class="sidebar">
-        <div class="brand"><div class="brand-mark">RC</div><div><h1>Remote Care</h1><p>Local Monitor</p></div></div>
+        <div class="brand"><div class="brand-mark">${brandLogoMarkup()}</div><div><h1>Remote Care</h1><p>Local Monitor</p></div></div>
         <nav class="nav" aria-label="Dashboard navigation">
           <button data-page="overview">● Overview</button>
           <button data-page="monitors">◉ Monitors</button>
@@ -455,6 +463,99 @@ function overallStatus() {
   if (summary.warning) return { text: `${summary.warning} monitor${summary.warning === 1 ? '' : 's'} checking`, className: 'warning' };
   if (summary.total === 0) return { text: 'No monitors configured', className: 'warning' };
   return { text: 'All active monitors healthy', className: 'good' };
+}
+
+function remoteSyncOverviewState() {
+  const remoteSync = state.dashboard?.remoteSync || {};
+  const settings = state.settings || {};
+  const isConfigured = Boolean(
+    remoteSync.isConfigured ||
+    settings.serverBaseUrl?.trim() ||
+    settings.cloudHttpsUrl?.trim() ||
+    settings.historySyncUrl?.trim()
+  );
+  const isEnabled = Boolean(remoteSync.isEnabled || isConfigured);
+  const isPosting = Boolean(remoteSync.isPosting);
+  const lastSyncAt = remoteSync.lastSyncAt || remoteSync.lastHistorySyncAt || remoteSync.lastTelemetrySyncAt || null;
+  const lastError = remoteSync.lastError || null;
+
+  let stateClass = 'idle';
+  let dotClass = '';
+  let badgeText = 'Not Configured';
+  if (isPosting) {
+    stateClass = 'posting';
+    dotClass = 'good';
+    badgeText = 'Sending…';
+  } else if (!isConfigured || !isEnabled) {
+    stateClass = 'idle';
+    dotClass = '';
+    badgeText = 'Not Sent';
+  } else if (lastError) {
+    stateClass = 'down';
+    dotClass = 'down';
+    badgeText = 'Sync Error';
+  } else if (lastSyncAt) {
+    stateClass = 'good';
+    dotClass = 'good';
+    badgeText = 'Sending Active';
+  } else {
+    stateClass = 'good';
+    dotClass = 'good';
+    badgeText = 'Scheduled';
+  }
+
+  const lastSentText = lastSyncAt
+    ? `Last sent: ${prettyTime(lastSyncAt)}`
+    : (isConfigured ? 'Last sent: Waiting for sync…' : 'Last sent: Never');
+
+  const tooltip = lastError
+    ? `Remote sync error: ${lastError}`
+    : (remoteSync.endpoint ? `Remote Server: ${remoteSync.endpoint}` : 'Configure server in Server tab');
+
+  return {
+    stateClass,
+    dotClass,
+    badgeText,
+    lastSentText,
+    tooltip,
+    isPosting
+  };
+}
+
+function remoteSyncOverviewTabMarkup() {
+  const info = remoteSyncOverviewState();
+  const canOpenRemoteData = isAdmin() || isOperator();
+  return `
+    <div class="overview-remote-tab ${info.stateClass}${canOpenRemoteData ? ' clickable' : ''}" id="overview-remote-sync-tab" title="${escapeHtml(info.tooltip)}" ${canOpenRemoteData ? 'role="button" tabindex="0"' : ''}>
+      ${info.isPosting ? '<span class="spinner-pulse" id="overview-remote-sync-dot"></span>' : `<span class="dot ${info.dotClass}" id="overview-remote-sync-dot"></span>`}
+      <div class="remote-tab-body">
+        <div class="remote-tab-top">
+          <span>Remote Data</span>
+          <span class="remote-tab-badge" id="overview-remote-sync-badge">${escapeHtml(info.badgeText)}</span>
+        </div>
+        <div class="remote-tab-time" id="overview-remote-sync-time">${escapeHtml(info.lastSentText)}</div>
+      </div>
+    </div>`;
+}
+
+function updateRemoteSyncOverviewTab() {
+  const tab = document.getElementById('overview-remote-sync-tab');
+  if (!tab) return;
+  const info = remoteSyncOverviewState();
+  const canOpenRemoteData = isAdmin() || isOperator();
+  const expectedClass = `overview-remote-tab ${info.stateClass}${canOpenRemoteData ? ' clickable' : ''}`;
+  if (tab.className !== expectedClass) tab.className = expectedClass;
+  tab.title = info.tooltip;
+
+  const dotEl = document.getElementById('overview-remote-sync-dot');
+  if (dotEl) {
+    const wantedDotClass = info.isPosting ? 'spinner-pulse' : `dot ${info.dotClass}`.trim();
+    if (dotEl.className !== wantedDotClass) dotEl.className = wantedDotClass;
+  }
+  const badgeEl = document.getElementById('overview-remote-sync-badge');
+  if (badgeEl && badgeEl.textContent !== info.badgeText) badgeEl.textContent = info.badgeText;
+  const timeEl = document.getElementById('overview-remote-sync-time');
+  if (timeEl && timeEl.textContent !== info.lastSentText) timeEl.textContent = info.lastSentText;
 }
 
 async function renderPage() {
@@ -523,7 +624,7 @@ async function renderOverview(content) {
   const { summary, activeIncidents, notifications } = state.dashboard;
   const overall = overallStatus();
   content.innerHTML = `
-    <header class="page-header"><div><h2>Monitoring overview</h2><p>Local checks continue while this window is hidden in the tray.</p></div><div class="header-tools">${liveClockMarkup()}<div class="status-line"><span class="dot ${overall.className}" id="overall-dot"></span><span id="overall-text">${overall.text}</span></div></div></header>
+    <header class="page-header"><div><h2>Monitoring overview</h2><p>Local checks continue while this window is hidden in the tray.</p></div><div class="header-tools">${remoteSyncOverviewTabMarkup()}${liveClockMarkup()}<div class="status-line"><span class="dot ${overall.className}" id="overall-dot"></span><span id="overall-text">${overall.text}</span></div></div></header>
     <section class="stat-grid">
       <article class="card stat"><div class="label">Active monitors</div><div class="number" id="stat-total">${summary.total}</div></article>
       <article class="card stat good"><div class="label">Healthy</div><div class="number" id="stat-healthy">${summary.healthy}</div></article>
@@ -538,6 +639,20 @@ async function renderOverview(content) {
         <article class="card" style="margin-top:18px"><div class="panel-title"><h3>Recent notifications</h3><span>Local history</span></div><div class="panel-body" id="notification-list"></div></article>
       </div>
     </section>`;
+  if (isAdmin() || isOperator()) {
+    const remoteTab = document.getElementById('overview-remote-sync-tab');
+    remoteTab?.addEventListener('click', async () => {
+      state.page = 'remote-data';
+      await renderPage();
+    });
+    remoteTab?.addEventListener('keydown', async (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        state.page = 'remote-data';
+        await renderPage();
+      }
+    });
+  }
   renderIncidentsList(activeIncidents);
   renderNotificationsList(notifications);
   renderAdapterList();
@@ -567,6 +682,7 @@ function updateOverviewLive() {
   const incidentCount = document.getElementById('incident-count');
   if (incidentCount) incidentCount.textContent = `${activeIncidents.length} open`;
 
+  updateRemoteSyncOverviewTab();
   renderIncidentsList(activeIncidents);
   renderNotificationsList(notifications);
   renderAdapterList();
@@ -994,8 +1110,8 @@ async function renderServer(content) {
   const base = (settings.serverBaseUrl || '').trim().replace(/\/+$/, '');
   const derivedHealth = base ? `${base}/health` : '';
   const derivedHistory = base ? `${base}/api/history` : '';
-  const currentHealth = settings.serverHealthUrl || derivedHealth;
-  const currentHistory = settings.historySyncUrl || derivedHistory;
+  const cloudSyncChecked = (settings.cloudSyncEnabled || Boolean(base)) ? 'checked' : '';
+  const historySyncChecked = (settings.historySyncEnabled || Boolean(base)) ? 'checked' : '';
 
   const targets = state.dashboard?.targets || [];
   const savedTargetIdsRaw = settings.historySyncTargetIds || '';
@@ -1016,7 +1132,7 @@ async function renderServer(content) {
         <div class="panel-body settings-list">
           <label class="setting-row">
             <span><strong>Enable server synchronization</strong><small>Publish outbound monitoring events, telemetry, and heartbeats to the remote care server.</small></span>
-            <input name="cloudSyncEnabled" type="checkbox" ${checked('cloudSyncEnabled')} />
+            <input name="cloudSyncEnabled" type="checkbox" ${cloudSyncChecked} />
           </label>
           <div class="field" style="margin-top:10px">
             <label>Server Base URL</label>
@@ -1063,7 +1179,7 @@ async function renderServer(content) {
         <div class="panel-body settings-list">
           <label class="setting-row">
             <span><strong>Enable History of Changes Sync</strong><small>Send the recorded history of changes in monitor results to the server periodically.</small></span>
-            <input name="historySyncEnabled" type="checkbox" ${checked('historySyncEnabled')} />
+            <input name="historySyncEnabled" type="checkbox" ${historySyncChecked} />
           </label>
           <div class="field" style="margin-top:10px">
             <label>History Sync URL</label>
@@ -1218,6 +1334,12 @@ async function renderServer(content) {
     if (b) {
       if (healthInput) healthInput.placeholder = `${b}/health`;
       if (historyInput) historyInput.placeholder = `${b}/api/history`;
+      if (form.elements.cloudSyncEnabled && !state.settings.serverBaseUrl) {
+        form.elements.cloudSyncEnabled.checked = true;
+      }
+      if (form.elements.historySyncEnabled && !state.settings.serverBaseUrl) {
+        form.elements.historySyncEnabled.checked = true;
+      }
     } else {
       if (healthInput) healthInput.placeholder = 'http://localhost:3999/health';
       if (historyInput) historyInput.placeholder = 'http://localhost:3999/api/history';
@@ -1674,6 +1796,25 @@ async function renderRemoteData(content) {
     return checkedBoxes.join(',');
   };
 
+  const latestSingleHistoryPayload = (() => {
+    const raw = history.lastPayload;
+    if (!raw || typeof raw !== 'object') {
+      return { message: 'No history events dispatched yet.' };
+    }
+    if (Array.isArray(raw.history)) {
+      const lastOne = raw.history.slice(-1);
+      return {
+        ...raw,
+        entriesCount: lastOne.length,
+        history: lastOne
+      };
+    }
+    return raw;
+  })();
+
+  const isHeartbeatActive = Boolean(cloud.enabled || settings.cloudSyncEnabled || serverBaseUrl);
+  const isHistorySyncActive = Boolean(history.enabled || settings.historySyncEnabled || serverBaseUrl);
+
   content.innerHTML = `
     <header class="page-header">
       <div>
@@ -1727,11 +1868,11 @@ async function renderRemoteData(content) {
           </div>
           <div class="info-item">
             <span>Heartbeat (/api/sync)</span>
-            <strong>${settings.cloudSyncEnabled ? `Enabled (every ${settings.cloudHeartbeatMinutes ?? 5}m)` : '<span style="color:var(--text-muted)">Paused / Disabled</span>'}</strong>
+            <strong>${isHeartbeatActive ? `Enabled (every ${settings.cloudHeartbeatMinutes ?? 5}m)` : '<span style="color:var(--text-muted)">Paused / Disabled</span>'}</strong>
           </div>
           <div class="info-item">
             <span>History Sync (/api/history)</span>
-            <strong>${settings.historySyncEnabled ? `Enabled (every ${settings.historySyncIntervalMinutes ?? 5}m)` : '<span style="color:var(--text-muted)">Paused / Disabled</span>'}</strong>
+            <strong>${isHistorySyncActive ? `Enabled (every ${settings.historySyncIntervalMinutes ?? 5}m)` : '<span style="color:var(--text-muted)">Paused / Disabled</span>'}</strong>
           </div>
           <div class="info-item">
             <span>Commissioned UUIDs</span>
@@ -1793,8 +1934,8 @@ async function renderRemoteData(content) {
             <div class="info-item"><span>Last Dispatched</span><strong>${history.lastSyncAt ? prettyTime(history.lastSyncAt) : 'Never'}</strong></div>
           </div>
           <div style="margin-bottom:12px">
-            <strong style="display:block;margin-bottom:4px;font-size:0.85rem;color:var(--text-muted)">Latest Dispatched Request Body</strong>
-            <pre class="server-response-box"><code>${escapeHtml(JSON.stringify(history.lastPayload || { message: 'No history events dispatched yet.' }, null, 2))}</code></pre>
+            <strong style="display:block;margin-bottom:4px;font-size:0.85rem;color:var(--text-muted)">Latest Dispatched Request Body (Last 1 History Value)</strong>
+            <pre class="server-response-box"><code>${escapeHtml(JSON.stringify(latestSingleHistoryPayload, null, 2))}</code></pre>
           </div>
           <div>
             <strong style="display:block;margin-bottom:4px;font-size:0.85rem;color:var(--text-muted)">Server Response / Status</strong>
@@ -2467,9 +2608,12 @@ document.addEventListener('click', (event) => {
 
 if (typeof remoteCare.onRemoteSyncUpdate === 'function') {
   remoteCare.onRemoteSyncUpdate(() => {
-    if (state.session && state.page === 'remote-data') {
+    if (!state.session) return;
+    if (state.page === 'remote-data') {
       const content = document.getElementById('page-content');
       if (content) renderRemoteData(content);
+    } else {
+      scheduleRefresh();
     }
   });
 }
