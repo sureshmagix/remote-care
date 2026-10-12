@@ -1,6 +1,6 @@
 {
   "name": "remote-care-monitor",
-  "version": "2.0.1",
+  "version": "2.0.3",
   "description": "Cross-platform network, target, system resource, and headless server monitor.",
   "homepage": "https://archidtech.in",
   "desktopName": "remote-care-monitor",
@@ -21,7 +21,12 @@
     "lint": "node --check src/main/app.js && node --check src/main/autostart.js && node --check src/main/database.js && node --check src/main/monitor-engine.js && node --check src/main/checks.js && node --check src/main/notification-center.js && node --check src/main/notification-preload.js && node --check src/main/webhooks.js && node --check src/main/cloud-publisher.js && node --check src/main/heartbeat.js && node --check src/daemon/index.js && node --check src/renderer/notification.js && node --check src/renderer/app.js",
     "pack": "electron-builder --dir",
     "dist": "electron-builder",
-    "build:win": "node scripts/build-win.js"
+    "build:win": "node scripts/build-win.js",
+    "build:linux": "node scripts/build-linux.js",
+    "build:mac": "node scripts/build-mac.js",
+    "build:mac:x64": "node scripts/build-mac.js --x64",
+    "build:mac:arm64": "node scripts/build-mac.js --arm64",
+    "build:all": "npm run build:win && npm run build:linux && npm run build:mac"
   },
   "build": {
     "appId": "in.archidtech.remotecare",

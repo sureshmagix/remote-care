@@ -679,7 +679,7 @@ class LocalDatabase {
       } else if (typeof DEFAULT_APP_SETTINGS[name] === 'boolean') {
         if (typeof input[name] !== 'boolean') throw new Error('Each setting must be enabled or disabled.');
       } else {
-        if (name === 'historySyncTargetIds' && Array.isArray(input[name])) {
+        if ((name === 'historySyncTargetIds' || name === 'historySyncTargetTypes') && Array.isArray(input[name])) {
           input[name] = input[name].join(',');
         }
         if (typeof input[name] !== 'string') throw new Error(`${name} must be a string.`);
@@ -1038,7 +1038,7 @@ class LocalDatabase {
     return { filters: normalized, results: rows.map(mapHistoryResult) };
   }
 
-  getHistoryChanges({ targetIds = null, targetTypes = null, sinceId = null, limit = 100, reverse = false } = {}) {
+  getHistoryChanges({ targetIds = null, targetTypes = null, sinceId = null, limit = 100, reverse = false, onlyEnabled = false, latestPerTarget = false } = {}) {
     let query = `
       SELECT r.id, r.target_id, t.name AS target_name, t.type AS target_type,
              t.host AS target_host, t.metadata_json AS target_metadata_json,
@@ -1050,21 +1050,41 @@ class LocalDatabase {
     const clauses = [];
     const params = [];
 
-    if (sinceId !== null && sinceId !== undefined && Number(sinceId) > 0) {
+    if (onlyEnabled) {
+      clauses.push('t.enabled = 1');
+    }
+
+    if (latestPerTarget) {
+      clauses.push('r.id IN (SELECT MAX(id) FROM check_results GROUP BY target_id)');
+    } else if (sinceId !== null && sinceId !== undefined && Number(sinceId) > 0) {
       clauses.push('r.id > ?');
       params.push(Number(sinceId));
     }
 
-    if (Array.isArray(targetIds) && targetIds.length > 0) {
+    if (Array.isArray(targetIds)) {
+      if (targetIds.length === 0) {
+        return [];
+      }
       const placeholders = targetIds.map(() => '?').join(',');
       clauses.push(`r.target_id IN (${placeholders})`);
       params.push(...targetIds.map(Number));
     }
 
     if (Array.isArray(targetTypes) && targetTypes.length > 0) {
-      const placeholders = targetTypes.map(() => '?').join(',');
+      const expanded = new Set();
+      for (const item of targetTypes) {
+        const clean = String(item).trim().toLowerCase();
+        if (!clean) continue;
+        expanded.add(clean);
+        if (clean === 'icmp' || clean === 'ping') {
+          expanded.add('icmp');
+          expanded.add('ping');
+        }
+      }
+      const expandedList = [...expanded];
+      const placeholders = expandedList.map(() => '?').join(',');
       clauses.push(`t.type IN (${placeholders})`);
-      params.push(...targetTypes.map(String));
+      params.push(...expandedList);
     }
 
     if (clauses.length > 0) {
@@ -1076,6 +1096,7 @@ class LocalDatabase {
     const settings = this.getAppSettings();
     const globalServiceUuid = settings?.serviceUuid?.trim() || 'ASSIGNED_SERVICE_UUID';
     const globalDeviceUuid = settings?.deviceUuid?.trim() || 'ASSIGNED_DEVICE_UUID';
+    const isPlaceholder = (val) => !val || val === 'ASSIGNED_SERVICE_UUID' || val === 'ASSIGNED_DEVICE_UUID' || val === 'ASSIGNED_DEVICE_OR_SERVICE_UUID';
 
     const mapHistoryRow = (row) => {
       const targetMeta = parseJson(row.target_metadata_json, {});
@@ -1085,8 +1106,16 @@ class LocalDatabase {
       if (targetType === 'ping') targetType = 'icmp';
 
       const targetId = targetMeta.targetUuid || targetMeta.uuid ? String(targetMeta.targetUuid || targetMeta.uuid) : row.target_id;
-      const serviceUuid = targetMeta.serviceUuid || targetMeta.service_uuid || parsedDetails.service_uuid || globalServiceUuid;
-      const deviceUuid = targetMeta.deviceUuid || targetMeta.device_uuid || parsedDetails.device_uuid || globalDeviceUuid;
+      const serviceUuid = targetMeta.serviceUuid
+        || targetMeta.service_uuid
+        || (!isPlaceholder(globalServiceUuid) && globalServiceUuid)
+        || parsedDetails.service_uuid
+        || globalServiceUuid;
+      const deviceUuid = targetMeta.deviceUuid
+        || targetMeta.device_uuid
+        || (!isPlaceholder(globalDeviceUuid) && globalDeviceUuid)
+        || parsedDetails.device_uuid
+        || globalDeviceUuid;
 
       let ip = parsedDetails.ip || targetMeta.ip;
       if (!ip && row.target_host && !row.target_host.includes('/') && !row.target_host.includes(':')) {
@@ -1098,6 +1127,7 @@ class LocalDatabase {
 
       const details = {
         ...parsedDetails,
+        monitor_name: row.target_name,
         service_uuid: serviceUuid,
         device_uuid: deviceUuid,
         ...(ip ? { ip } : {})
@@ -1106,6 +1136,7 @@ class LocalDatabase {
       return {
         id: row.id,
         targetId,
+        name: row.target_name,
         targetName: row.target_name,
         targetType,
         locationName: row.location_name || DEFAULT_LOCATION_NAME,
@@ -1226,6 +1257,10 @@ class LocalDatabase {
   enqueueEvent(eventType, payload) {
     this.db.prepare('INSERT INTO outbound_events (event_type, payload_json, created_at) VALUES (?, ?, ?)')
       .run(eventType, JSON.stringify(payload), now());
+  }
+
+  clearPendingHeartbeats() {
+    this.db.prepare("DELETE FROM outbound_events WHERE event_type = 'device.heartbeat' AND delivered_at IS NULL").run();
   }
 
   getPendingOutboundEvents(limit = 25) {

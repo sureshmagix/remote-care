@@ -8,10 +8,11 @@ class HeartbeatService {
     this.timer = null;
   }
 
-  start() {
+  start({ sendImmediate = true } = {}) {
     if (this.timer) return;
-    // Send immediate heartbeat on startup
-    this.sendHeartbeat();
+    if (sendImmediate) {
+      this.sendHeartbeat();
+    }
     const settings = this.getSettings();
     const intervalMinutes = Math.max(1, Number.parseInt(settings?.cloudHeartbeatMinutes ?? 5, 10));
     this.timer = setInterval(() => this.sendHeartbeat(), intervalMinutes * 60 * 1000);
@@ -23,6 +24,43 @@ class HeartbeatService {
       clearInterval(this.timer);
       this.timer = null;
     }
+  }
+
+  restart() {
+    this.stop();
+    this.start({ sendImmediate: false });
+  }
+
+  getSelectedMonitoredTargets(dashboard, settings) {
+    const rawTargets = (dashboard?.targets || []).filter((t) => t.enabled !== false);
+    const rawIds = settings?.historySyncTargetIds;
+    let filtered = rawTargets;
+    if (rawIds && rawIds !== 'all' && String(rawIds).trim()) {
+      if (String(rawIds).trim().toLowerCase() === 'none') {
+        filtered = [];
+      } else {
+        const ids = new Set(String(rawIds).split(',').map((s) => Number.parseInt(s.trim(), 10)).filter((n) => Number.isInteger(n) && n > 0));
+        if (ids.size > 0) {
+          filtered = filtered.filter((t) => ids.has(Number(t.id)));
+        }
+      }
+    }
+
+    const rawTypes = settings?.historySyncTargetTypes;
+    if (rawTypes && rawTypes !== 'all' && String(rawTypes).trim()) {
+      const types = Array.isArray(rawTypes)
+        ? rawTypes.map((s) => String(s).trim().toLowerCase()).filter(Boolean)
+        : String(rawTypes).split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+      if (types.includes('none')) {
+        filtered = [];
+      } else if (!types.includes('all') && types.length > 0) {
+        filtered = filtered.filter((t) => {
+          const tType = String(t.type || '').toLowerCase();
+          return types.some((rt) => (rt === 'icmp' || rt === 'ping') ? (tType === 'icmp' || tType === 'ping') : rt === tType);
+        });
+      }
+    }
+    return filtered;
   }
 
   collectTelemetry() {
@@ -37,10 +75,24 @@ class HeartbeatService {
     const service_uuid = settings?.serviceUuid?.trim() || settings?.service_uuid?.trim() || 'ASSIGNED_SERVICE_UUID';
     const device_uuid = settings?.deviceUuid?.trim() || settings?.device_uuid?.trim() || 'ASSIGNED_DEVICE_UUID';
 
-    const totalMonitors = dashboard?.summary?.total ?? 0;
-    const healthyMonitors = dashboard?.summary?.healthy ?? 0;
-    const warningMonitors = dashboard?.summary?.warning ?? 0;
-    const downMonitors = dashboard?.summary?.down ?? 0;
+    const monitoredTargets = this.getSelectedMonitoredTargets(dashboard, settings);
+    const monitors = monitoredTargets.map((t) => ({
+      id: t.targetUuid || String(t.id),
+      targetId: t.targetUuid || String(t.id),
+      name: t.name,
+      targetName: t.name,
+      type: t.type === 'ping' ? 'icmp' : t.type,
+      locationName: t.locationName,
+      status: t.status,
+      ok: t.status === 'healthy',
+      latencyMs: t.lastLatencyMs ?? null,
+      lastCheckedAt: t.lastCheckedAt || null
+    }));
+
+    const totalMonitors = monitoredTargets.length;
+    const healthyMonitors = monitoredTargets.filter((t) => t.status === 'healthy').length;
+    const warningMonitors = monitoredTargets.filter((t) => t.status === 'warning').length;
+    const downMonitors = monitoredTargets.filter((t) => t.status === 'down').length;
 
     const fullTelemetry = {
       hostname,
@@ -62,6 +114,8 @@ class HeartbeatService {
         warning: warningMonitors,
         down: downMonitors
       },
+      monitorNames: monitoredTargets.map((t) => t.name),
+      monitors,
       activeIncidentsCount: dashboard?.activeIncidents?.length || 0,
       service_uuid,
       device_uuid,
@@ -86,6 +140,8 @@ class HeartbeatService {
       return {
         hostname: fullTelemetry.hostname,
         monitorsSummary: fullTelemetry.monitorsSummary,
+        monitorNames: fullTelemetry.monitorNames,
+        monitors: fullTelemetry.monitors,
         activeIncidentsCount: fullTelemetry.activeIncidentsCount,
         service_uuid: fullTelemetry.service_uuid,
         device_uuid: fullTelemetry.device_uuid,
@@ -97,6 +153,7 @@ class HeartbeatService {
       return {
         hostname: fullTelemetry.hostname,
         status: fullTelemetry.monitorsSummary.down > 0 ? 'down' : 'healthy',
+        monitorNames: fullTelemetry.monitorNames,
         service_uuid: fullTelemetry.service_uuid,
         device_uuid: fullTelemetry.device_uuid,
         timestamp: fullTelemetry.timestamp
@@ -106,11 +163,14 @@ class HeartbeatService {
     return fullTelemetry;
   }
 
-  sendHeartbeat() {
+  sendHeartbeat({ triggerPublish = true } = {}) {
     try {
       const telemetry = this.collectTelemetry();
+      this.database.clearPendingHeartbeats?.();
       this.database.enqueueEvent('device.heartbeat', telemetry);
-      this.publisher?.trigger()?.catch?.(() => {});
+      if (triggerPublish) {
+        this.publisher?.trigger()?.catch?.(() => {});
+      }
       return telemetry;
     } catch (err) {
       // Non-fatal error; log or emit

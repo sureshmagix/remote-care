@@ -773,5 +773,145 @@ test('cloud publisher and history sync handle unreachable server / ECONNREFUSED 
   }
 });
 
+test('saveAppSettings accepts historySyncTargetTypes as array or string, includes Monitor Name in JSON, filters types to selected & monitored targets, and uses latest server config on forced sync', async () => {
+  const { database, directory } = temporaryDatabase();
+  try {
+    const admin = database.createInitialAdmin({ username: 'admin', displayName: 'Admin', password: 'password-123' });
+
+    // 1. Verify historySyncTargetTypes accepts array without throwing "historySyncTargetTypes must be a string"
+    const updated1 = database.updateAppSettings({
+      historySyncTargetTypes: ['http', 'gateway']
+    }, admin.id);
+    assert.equal(updated1.historySyncTargetTypes, 'http,gateway');
+
+    const updated2 = database.updateAppSettings({
+      historySyncTargetTypes: ['all']
+    }, admin.id);
+    assert.equal(updated2.historySyncTargetTypes, 'all');
+
+    // 2. Create 2 active monitors (http, gateway) and 1 disabled monitor (docker)
+    const tHttp = database.saveTarget({
+      name: 'Primary Web Portal',
+      type: 'http',
+      url: 'https://portal.example.com/health',
+      intervalSeconds: 15,
+      timeoutMs: 3000,
+      failureThreshold: 2,
+      recoveryThreshold: 1,
+      severity: 'critical',
+      downMessage: 'Portal down',
+      recoveryMessage: 'Portal up',
+      enabled: true
+    }, admin.id);
+
+    const tGw = database.saveTarget({
+      name: 'Main Branch Gateway',
+      type: 'gateway',
+      intervalSeconds: 15,
+      timeoutMs: 3000,
+      failureThreshold: 2,
+      recoveryThreshold: 1,
+      severity: 'warning',
+      downMessage: 'Gateway down',
+      recoveryMessage: 'Gateway up',
+      enabled: true
+    }, admin.id);
+
+    const tDocker = database.saveTarget({
+      name: 'Disabled Container',
+      type: 'docker',
+      intervalSeconds: 15,
+      timeoutMs: 3000,
+      failureThreshold: 2,
+      recoveryThreshold: 1,
+      severity: 'warning',
+      downMessage: 'Container down',
+      recoveryMessage: 'Container up',
+      enabled: false
+    }, admin.id);
+
+    database.recordCheck(tHttp.id, { ok: true, status: 'healthy', latencyMs: 12, message: 'HTTP 200 OK' });
+    database.recordCheck(tGw.id, { ok: true, status: 'healthy', latencyMs: 3, message: 'Gateway reachable' });
+    database.recordCheck(tDocker.id, { ok: false, status: 'down', latencyMs: 0, message: 'Stopped' });
+
+    // 3. Initial heartbeat before server config is updated
+    const publisher = new CloudPublisher({ database, getSettings: () => database.getAppSettings() });
+    const heartbeat = new HeartbeatService({ database, publisher, getSettings: () => database.getAppSettings() });
+    const historySync = new HistorySyncService({ database, getSettings: () => database.getAppSettings() });
+
+    heartbeat.sendHeartbeat({ triggerPublish: false });
+    assert.equal(database.getPendingOutboundCount(), 1);
+
+    // 4. Update Active Server Configuration & Credentials and select only active types
+    database.updateAppSettings({
+      serverBaseUrl: 'http://192.168.10.50:3999',
+      serverAuthToken: 'Updated_Secret_Key_999',
+      terminalHostname: 'updated-terminal-host-02',
+      serviceUuid: 'UPDATED_SERVICE_UUID_777',
+      deviceUuid: 'UPDATED_DEVICE_UUID_888',
+      historySyncTargetIds: `${tHttp.id},${tGw.id}`,
+      historySyncTargetTypes: ['http', 'gateway', 'rtsp'] // rtsp is not monitored, so only http and gateway should be active
+    }, admin.id);
+
+    // Verify targetTypes are restricted to the monitors that are already selected and monitored
+    const activeTypes = historySync.getTargetTypes();
+    assert.deepEqual(activeTypes, ['http', 'gateway']);
+
+    // 5. Simulate clicking "Send Telemetry & History Now"
+    let sentSyncAuth = null;
+    let sentSyncUrl = null;
+    let sentSyncPayload = null;
+    publisher.sendBatch = async (url, token, payload) => {
+      sentSyncUrl = url;
+      sentSyncAuth = token;
+      sentSyncPayload = payload;
+      return { ok: true, statusCode: 200, responseData: { success: true } };
+    };
+
+    let sentHistoryAuth = null;
+    let sentHistoryUrl = null;
+    let sentHistoryPayload = null;
+    historySync.sendPayload = async (url, token, payload) => {
+      sentHistoryUrl = url;
+      sentHistoryAuth = token;
+      sentHistoryPayload = payload;
+      return { ok: true, statusCode: 200, responseData: { success: true } };
+    };
+
+    heartbeat.sendHeartbeat({ triggerPublish: false });
+    await publisher.publishPending(25, { force: true });
+    await historySync.syncNow({ force: true });
+
+    // Verify /api/sync used latest server configuration & credentials and includes Monitor Names
+    assert.equal(sentSyncUrl, 'http://192.168.10.50:3999/api/sync');
+    assert.equal(sentSyncAuth, 'Updated_Secret_Key_999');
+    assert.equal(sentSyncPayload.events.length, 1);
+    const hbPayload = sentSyncPayload.events[0].payload;
+    assert.equal(hbPayload.hostname, 'updated-terminal-host-02');
+    assert.equal(hbPayload.service_uuid, 'UPDATED_SERVICE_UUID_777');
+    assert.equal(hbPayload.device_uuid, 'UPDATED_DEVICE_UUID_888');
+    assert.deepEqual([...hbPayload.monitorNames].sort(), ['Main Branch Gateway', 'Primary Web Portal']);
+    assert.equal(hbPayload.monitors.length, 2);
+    assert.ok(hbPayload.monitors.some((m) => m.name === 'Primary Web Portal'));
+
+    // Verify /api/history used latest server configuration & credentials, active types, and includes Monitor Names
+    assert.equal(sentHistoryUrl, 'http://192.168.10.50:3999/api/history');
+    assert.equal(sentHistoryAuth, 'Updated_Secret_Key_999');
+    assert.equal(sentHistoryPayload.clientHostname, 'updated-terminal-host-02');
+    assert.deepEqual(sentHistoryPayload.targetTypes, ['http', 'gateway']);
+    assert.deepEqual([...sentHistoryPayload.targetNames].sort(), ['Main Branch Gateway', 'Primary Web Portal']);
+    assert.equal(sentHistoryPayload.history.length, 2);
+    assert.equal(sentHistoryPayload.history[0].name, 'Primary Web Portal');
+    assert.equal(sentHistoryPayload.history[0].targetName, 'Primary Web Portal');
+    assert.equal(sentHistoryPayload.history[0].details.monitor_name, 'Primary Web Portal');
+    assert.equal(sentHistoryPayload.history[0].details.service_uuid, 'UPDATED_SERVICE_UUID_777');
+    assert.equal(sentHistoryPayload.history[0].details.device_uuid, 'UPDATED_DEVICE_UUID_888');
+  } finally {
+    database.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+
 
 

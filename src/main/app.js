@@ -661,7 +661,7 @@ function registerIpc() {
     const results = {};
     if (heartbeatService) {
       try {
-        heartbeatService.sendHeartbeat();
+        heartbeatService.sendHeartbeat({ triggerPublish: false });
       } catch (_) {}
     }
     if (cloudPublisher) {
@@ -795,7 +795,17 @@ function registerIpc() {
   ipcMain.handle('app-settings-save', (_event, { token, settings }) => {
     const session = requireSession(token, ROLES.SUPER_ADMIN);
     const saved = database.updateAppSettings(settings, session.userId);
-    historySyncService?.restart();
+    if (cloudPublisher) {
+      cloudPublisher.lastError = null;
+      cloudPublisher.restart();
+    }
+    if (heartbeatService) {
+      heartbeatService.restart();
+    }
+    if (historySyncService) {
+      historySyncService.lastError = null;
+      historySyncService.restart();
+    }
     broadcast('monitor-update', { type: 'app_settings_updated', settings: saved });
     return saved;
   });

@@ -39,17 +39,61 @@ class HistorySyncService extends EventEmitter {
     const settings = this.getSettings();
     const raw = settings?.historySyncTargetIds;
     if (!raw || raw === 'all' || !String(raw).trim()) return null;
+    if (String(raw).trim().toLowerCase() === 'none') return [];
     const items = String(raw).split(',').map((s) => Number.parseInt(s.trim(), 10)).filter((n) => Number.isInteger(n) && n > 0);
     return items.length > 0 ? items : null;
   }
 
-  getTargetTypes() {
+  getActiveMonitoredTargets(explicitTargetIds = undefined) {
+    const allTargets = (this.database.listTargets?.() || []).filter((t) => t.enabled !== false);
+    const configuredIds = explicitTargetIds !== undefined ? explicitTargetIds : this.getTargetIds();
+    if (Array.isArray(configuredIds)) {
+      if (configuredIds.length === 0) return [];
+      const idSet = new Set(configuredIds.map(Number));
+      return allTargets.filter((t) => idSet.has(Number(t.id)));
+    }
+    return allTargets;
+  }
+
+  getTargetTypes(explicitTargetIds = undefined) {
     const settings = this.getSettings();
     const raw = settings?.historySyncTargetTypes;
-    if (!raw || raw === 'all' || !String(raw).trim()) return null;
-    if (Array.isArray(raw)) return raw.map((s) => String(s).trim().toLowerCase()).filter(Boolean);
-    const items = String(raw).split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
-    return items.length > 0 ? items : null;
+    const activeTargets = this.getActiveMonitoredTargets(explicitTargetIds);
+    const activeTypesSet = new Set();
+    for (const t of activeTargets) {
+      if (t.type) {
+        activeTypesSet.add(String(t.type).trim().toLowerCase());
+      }
+    }
+
+    let configuredTypes = null;
+    if (raw && raw !== 'all' && String(raw).trim()) {
+      const items = Array.isArray(raw)
+        ? raw.map((s) => String(s).trim().toLowerCase()).filter(Boolean)
+        : String(raw).split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+      if (items.includes('none')) return ['__none__'];
+      if (!items.includes('all') && items.length > 0) {
+        configuredTypes = items;
+      }
+    }
+
+    if (configuredTypes) {
+      if (activeTypesSet.size > 0) {
+        const matched = configuredTypes.filter((type) => {
+          if (type === 'icmp' || type === 'ping') {
+            return activeTypesSet.has('icmp') || activeTypesSet.has('ping');
+          }
+          return activeTypesSet.has(type);
+        });
+        return matched.length > 0 ? matched : ['__none__'];
+      }
+      return configuredTypes;
+    }
+
+    if (activeTypesSet.size > 0) {
+      return [...activeTypesSet];
+    }
+    return null;
   }
 
   getIntervalMinutes() {
@@ -62,18 +106,26 @@ class HistorySyncService extends EventEmitter {
     return Boolean(settings?.historySyncEnabled);
   }
 
-  buildPayload({ previewRecent = false, limit = 50, targetIds = undefined, targetTypes = undefined } = {}) {
+  buildPayload({ previewRecent = false, limit = 50, targetIds = undefined, targetTypes = undefined, includeLatestOnForce = false } = {}) {
     const resolvedTargets = targetIds !== undefined ? targetIds : this.getTargetIds();
-    const resolvedTypes = targetTypes !== undefined ? targetTypes : this.getTargetTypes();
+    const resolvedTypes = targetTypes !== undefined ? targetTypes : this.getTargetTypes(resolvedTargets);
     const cursor = this.database.getHistorySyncCursor();
     const settings = this.getSettings();
     const clientHostname = settings?.terminalHostname?.trim() || settings?.clientHostname?.trim() || os.hostname();
+
+    const matchingTargets = this.getActiveMonitoredTargets(resolvedTargets).filter((t) => {
+      if (!resolvedTypes) return true;
+      if (resolvedTypes.includes('__none__')) return false;
+      const tType = String(t.type || '').toLowerCase();
+      return resolvedTypes.some((rt) => (rt === 'icmp' || rt === 'ping') ? (tType === 'icmp' || tType === 'ping') : rt === tType);
+    });
 
     let entries = [];
     if (previewRecent) {
       entries = this.database.getHistoryChanges({
         targetIds: resolvedTargets,
         targetTypes: resolvedTypes,
+        onlyEnabled: true,
         limit,
         reverse: true
       });
@@ -81,20 +133,46 @@ class HistorySyncService extends EventEmitter {
       entries = this.database.getHistoryChanges({
         targetIds: resolvedTargets,
         targetTypes: resolvedTypes,
+        onlyEnabled: true,
         sinceId: cursor.lastId,
         limit: 100
       });
+      if (includeLatestOnForce && entries.length === 0) {
+        entries = this.database.getHistoryChanges({
+          targetIds: resolvedTargets,
+          targetTypes: resolvedTypes,
+          onlyEnabled: true,
+          latestPerTarget: true,
+          limit: 100
+        });
+      }
     }
+
+    const displayTypes = resolvedTypes === null
+      ? (matchingTargets.length > 0 ? [...new Set(matchingTargets.map((t) => (t.type === 'ping' ? 'icmp' : t.type)))] : 'all')
+      : [...new Set(resolvedTypes.filter((t) => t !== '__none__').map((t) => (t === 'ping' ? 'icmp' : t)))];
 
     return {
       version: '2.0',
       dispatchedAt: new Date().toISOString(),
       clientHostname,
       targetIds: resolvedTargets === null ? 'all' : resolvedTargets,
-      targetTypes: resolvedTypes === null ? 'all' : resolvedTypes,
+      targetTypes: displayTypes,
+      targetNames: matchingTargets.map((t) => t.name),
+      monitors: matchingTargets.map((t) => ({
+        id: t.targetUuid || String(t.id),
+        targetId: t.targetUuid || String(t.id),
+        name: t.name,
+        targetName: t.name,
+        type: t.type === 'ping' ? 'icmp' : t.type,
+        locationName: t.locationName,
+        status: t.status
+      })),
       entriesCount: entries.length,
       history: entries.map((entry) => ({
         ...entry,
+        name: entry.targetName || entry.name,
+        targetName: entry.targetName || entry.name,
         targetId: String(entry.targetId)
       }))
     };
@@ -168,12 +246,12 @@ class HistorySyncService extends EventEmitter {
 
     this.isSyncing = true;
     try {
-      const payload = this.buildPayload({ previewRecent: false });
+      const payload = this.buildPayload({ previewRecent: false, includeLatestOnForce: force });
       const authToken = this.getAuthToken();
       const res = await this.sendPayload(endpoint, authToken, payload);
 
       if (payload.history.length > 0) {
-        const maxId = Math.max(...payload.history.map((e) => e.id));
+        const maxId = Math.max(this.database.getHistorySyncCursor().lastId, ...payload.history.map((e) => e.id));
         this.database.setHistorySyncCursor(maxId, payload.dispatchedAt);
       } else {
         this.database.setHistorySyncCursor(this.database.getHistorySyncCursor().lastId, payload.dispatchedAt);

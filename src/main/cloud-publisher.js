@@ -17,11 +17,13 @@ class CloudPublisher extends EventEmitter {
     this.lastResponse = null;
   }
 
-  start(intervalMs = 15_000) {
+  start(intervalMs) {
     if (this.timer) return;
+    const settings = this.getSettings();
+    const resolvedIntervalMs = intervalMs || Math.max(2_000, Number.parseInt(settings?.serverSyncIntervalSeconds ?? 15, 10) * 1000);
     this.timer = setInterval(() => {
       void this.publishPending().catch(() => {});
-    }, intervalMs);
+    }, resolvedIntervalMs);
     this.timer.unref?.();
     this.emit('started');
   }
@@ -32,6 +34,11 @@ class CloudPublisher extends EventEmitter {
       this.timer = null;
     }
     this.emit('stopped');
+  }
+
+  restart() {
+    this.stop();
+    this.start();
   }
 
   trigger({ force = false } = {}) {
@@ -53,7 +60,14 @@ class CloudPublisher extends EventEmitter {
   }
 
   async publishPending(batchSize = 25, { force = false } = {}) {
-    if (this.isPublishing) return;
+    if (this.isPublishing) {
+      if (!force) return { skipped: true, reason: 'Cloud publish already in progress.' };
+      // Wait for current in-flight publish to finish when forced manually
+      for (let i = 0; i < 50 && this.isPublishing; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      if (this.isPublishing) return { skipped: true, reason: 'Cloud publish already in progress.' };
+    }
     const settings = this.getSettings();
     const endpoint = this.getEndpointUrl();
     if (!endpoint) {
@@ -70,15 +84,31 @@ class CloudPublisher extends EventEmitter {
         return { publishedCount: 0 };
       }
 
+      const latestSettings = this.getSettings();
+      const latestHostname = latestSettings?.terminalHostname?.trim() || latestSettings?.clientHostname?.trim();
+      const latestServiceUuid = latestSettings?.serviceUuid?.trim() || latestSettings?.service_uuid?.trim();
+      const latestDeviceUuid = latestSettings?.deviceUuid?.trim() || latestSettings?.device_uuid?.trim();
+
       const payload = {
         version: '2.0',
         dispatchedAt: new Date().toISOString(),
-        events: pending.map((row) => ({
-          id: row.id,
-          eventType: row.event_type,
-          payload: typeof row.payload_json === 'string' ? JSON.parse(row.payload_json) : row.payload_json,
-          createdAt: row.created_at
-        }))
+        events: pending.map((row) => {
+          const eventPayload = typeof row.payload_json === 'string' ? JSON.parse(row.payload_json) : { ...(row.payload_json || {}) };
+          if (eventPayload && typeof eventPayload === 'object') {
+            if (latestHostname) eventPayload.hostname = latestHostname;
+            if (latestServiceUuid) eventPayload.service_uuid = latestServiceUuid;
+            if (latestDeviceUuid) eventPayload.device_uuid = latestDeviceUuid;
+            if (eventPayload.targetName && !eventPayload.name) {
+              eventPayload.name = eventPayload.targetName;
+            }
+          }
+          return {
+            id: row.id,
+            eventType: row.event_type,
+            payload: eventPayload,
+            createdAt: row.created_at
+          };
+        })
       };
 
       const authToken = this.getAuthToken();

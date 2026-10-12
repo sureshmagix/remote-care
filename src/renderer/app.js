@@ -1549,9 +1549,14 @@ async function renderRemoteData(content) {
     state.page = 'overview';
     return renderOverview(content);
   }
-  state.settings = await request(() => remoteCare.getAppSettings(state.session.token));
+  const [freshSettings, freshDashboard, syncStatus] = await Promise.all([
+    request(() => remoteCare.getAppSettings(state.session.token)),
+    request(() => remoteCare.getDashboard(state.session.token)).catch(() => state.dashboard),
+    request(() => remoteCare.getRemoteSyncStatus(state.session.token)).catch(() => ({}))
+  ]);
+  state.settings = freshSettings;
+  if (freshDashboard) state.dashboard = freshDashboard;
   const settings = state.settings;
-  const syncStatus = await request(() => remoteCare.getRemoteSyncStatus(state.session.token)).catch(() => ({}));
 
   const cloud = syncStatus.cloud || syncStatus.cloudPublisher || {};
   const history = syncStatus.history || syncStatus.historySync || {};
@@ -1561,6 +1566,7 @@ async function renderRemoteData(content) {
   const is401 = Boolean(lastError && /401|unauthorized/i.test(lastError));
 
   const serverBaseUrl = settings.serverBaseUrl || serverConfig.serverBaseUrl || '';
+  const activeAuthToken = settings.serverAuthToken || settings.cloudAuthToken || serverConfig.serverAuthToken || '';
   const historyEndpoint = history.endpoint || (serverBaseUrl ? `${serverBaseUrl.replace(/\/+$/, '')}/api/history` : 'http://<YOUR_SERVER_IP>:3999/api/history');
   const syncEndpoint = cloud.endpoint || (serverBaseUrl ? `${serverBaseUrl.replace(/\/+$/, '')}/api/sync` : 'http://<YOUR_SERVER_IP>:3999/api/sync');
 
@@ -1591,11 +1597,82 @@ async function renderRemoteData(content) {
     bannerDesc = `Last successful communication: ${prettyTime(history.lastSyncAt || cloud.lastSyncAt || cloud.lastPublishedAt)}`;
   }
 
-  // Monitor types filter selection
+  // Determine Monitors which are already selected and monitored (enabled)
+  const allTargets = state.dashboard?.targets || [];
+  const savedTargetIdsRaw = String(settings.historySyncTargetIds || '').trim();
+  const savedTargetIds = savedTargetIdsRaw && savedTargetIdsRaw !== 'all' && savedTargetIdsRaw.toLowerCase() !== 'none'
+    ? savedTargetIdsRaw.split(',').map((s) => Number(s.trim())).filter((n) => Number.isInteger(n) && n > 0)
+    : null;
+
+  const selectedMonitoredTargets = savedTargetIdsRaw.toLowerCase() === 'none'
+    ? []
+    : allTargets.filter((t) => {
+      if (t.enabled === false) return false;
+      if (savedTargetIds && savedTargetIds.length > 0) {
+        return savedTargetIds.includes(Number(t.id));
+      }
+      return true;
+    });
+
+  // Group selected & monitored targets by their monitor type
+  const monitorsByType = new Map();
+  for (const target of selectedMonitoredTargets) {
+    const tType = String(target.type || '').trim().toLowerCase();
+    if (!tType) continue;
+    if (!monitorsByType.has(tType)) {
+      monitorsByType.set(tType, []);
+    }
+    monitorsByType.get(tType).push(target.name);
+  }
+
+  const typeMetaById = new Map(REMOTE_DATA_MONITOR_TYPES.map((t) => [t.id, t]));
+  const availableMonitorTypes = [];
+  for (const [typeId, monitorNames] of monitorsByType.entries()) {
+    const meta = typeMetaById.get(typeId) || {
+      id: typeId,
+      label: prettyType(typeId),
+      desc: 'Active monitored check type'
+    };
+    availableMonitorTypes.push({
+      ...meta,
+      monitorNames
+    });
+  }
+
+  // Parse saved historySyncTargetTypes (string or array) and match against availableMonitorTypes
   const rawTypes = settings.historySyncTargetTypes;
-  const selectedTypes = Array.isArray(rawTypes) && rawTypes.length > 0 && !rawTypes.includes('all')
-    ? new Set(rawTypes)
-    : new Set(REMOTE_DATA_MONITOR_TYPES.map((t) => t.id));
+  const parsedTypes = Array.isArray(rawTypes)
+    ? rawTypes.map((s) => String(s).trim().toLowerCase()).filter(Boolean)
+    : (typeof rawTypes === 'string' && rawTypes.trim()
+      ? rawTypes.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
+      : ['all']);
+
+  const isNoneSelected = parsedTypes.includes('none');
+  const isAllSelected = !isNoneSelected && (parsedTypes.length === 0 || parsedTypes.includes('all'));
+  const selectedTypes = new Set();
+  if (!isNoneSelected) {
+    for (const t of availableMonitorTypes) {
+      if (isAllSelected) {
+        selectedTypes.add(t.id);
+      } else if (
+        parsedTypes.includes(t.id) ||
+        ((t.id === 'ping' || t.id === 'icmp') && (parsedTypes.includes('ping') || parsedTypes.includes('icmp')))
+      ) {
+        selectedTypes.add(t.id);
+      }
+    }
+    if (!isAllSelected && selectedTypes.size === 0 && availableMonitorTypes.length > 0) {
+      availableMonitorTypes.forEach((t) => selectedTypes.add(t.id));
+    }
+  }
+
+  const computeTypesSettingValue = (formEl) => {
+    if (!formEl || availableMonitorTypes.length === 0) return settings.historySyncTargetTypes || 'all';
+    const checkedBoxes = Array.from(formEl.querySelectorAll('input[name="types"]:checked')).map((cb) => cb.value);
+    if (checkedBoxes.length === 0) return 'none';
+    if (checkedBoxes.length === availableMonitorTypes.length) return 'all';
+    return checkedBoxes.join(',');
+  };
 
   content.innerHTML = `
     <header class="page-header">
@@ -1632,7 +1709,7 @@ async function renderRemoteData(content) {
     <article class="card" style="margin-bottom:18px;">
       <div class="panel-title">
         <h3>Active Server Configuration &amp; Credentials</h3>
-        <span>Target Server</span>
+        <span>${isAdmin() ? '<button class="button ghost small" id="edit-server-config-btn" type="button" style="padding:2px 8px;font-size:11px;">Edit in Server Tab →</button>' : 'Target Server'}</span>
       </div>
       <div class="panel-body">
         <div class="info-grid">
@@ -1642,7 +1719,7 @@ async function renderRemoteData(content) {
           </div>
           <div class="info-item">
             <span>Active API Key (x-api-key)</span>
-            <strong>${settings.serverAuthToken ? escapeHtml(settings.serverAuthToken.slice(0, 4) + '••••••••') : 'Wiitronics_diagnostic (default)'}</strong>
+            <strong>${activeAuthToken ? escapeHtml(activeAuthToken.slice(0, 4) + '••••••••') : 'Wiitronics_diagnostic (default)'}</strong>
           </div>
           <div class="info-item">
             <span>Terminal Hostname</span>
@@ -1660,6 +1737,10 @@ async function renderRemoteData(content) {
             <span>Commissioned UUIDs</span>
             <strong>${escapeHtml(settings.serviceUuid || 'Default')} / ${escapeHtml(settings.deviceUuid || 'Default')}</strong>
           </div>
+          <div class="info-item" style="grid-column: 1 / -1;">
+            <span>Selected &amp; Monitored Targets (${selectedMonitoredTargets.length})</span>
+            <strong>${selectedMonitoredTargets.length ? escapeHtml(selectedMonitoredTargets.map((t) => `${t.name} (${prettyType(t.type)})`).join(', ')) : 'No active monitors selected'}</strong>
+          </div>
         </div>
       </div>
     </article>
@@ -1668,29 +1749,33 @@ async function renderRemoteData(content) {
       <article class="card">
         <div class="panel-title">
           <h3>Select Monitored Types to Send</h3>
-          <span>POST /api/history filter</span>
+          <span>POST /api/history filter (${availableMonitorTypes.length} active type${availableMonitorTypes.length === 1 ? '' : 's'})</span>
         </div>
         <div class="panel-body settings-list">
-          <p class="helper" style="margin:0 0 12px">Select which monitor types are allowed to be sent to the remote server. Unselected types will remain local-only.</p>
-          <div style="display:flex;gap:8px;margin-bottom:12px">
-            <button class="button ghost small" type="button" id="types-select-all">Select All</button>
-            <button class="button ghost small" type="button" id="types-deselect-all">Deselect All</button>
-          </div>
-          <div class="types-grid">
-            ${REMOTE_DATA_MONITOR_TYPES.map((t) => `
-              <label class="type-check-label">
-                <input type="checkbox" name="types" value="${t.id}" ${selectedTypes.has(t.id) ? 'checked' : ''} />
-                <div class="type-title-group">
-                  <strong>${escapeHtml(t.label)}</strong>
-                  <small>${escapeHtml(t.desc)}</small>
-                </div>
-              </label>
-            `).join('')}
-          </div>
-          <div class="actions" style="margin-top:16px;padding:0">
-            <button class="button" type="submit">Save Monitored Types Filter</button>
-            <span class="helper settings-help">Filters state transition history events sent to <code>POST /api/history</code>.</span>
-          </div>
+          <p class="helper" style="margin:0 0 12px">Showing monitor types from the monitors that are currently selected and enabled for monitoring. Unselected types will remain local-only.</p>
+          ${availableMonitorTypes.length ? `
+            <div style="display:flex;gap:8px;margin-bottom:12px">
+              <button class="button ghost small" type="button" id="types-select-all">Select All</button>
+              <button class="button ghost small" type="button" id="types-deselect-all">Deselect All</button>
+            </div>
+            <div class="types-grid">
+              ${availableMonitorTypes.map((t) => `
+                <label class="type-check-label">
+                  <input type="checkbox" name="types" value="${escapeHtml(t.id)}" ${selectedTypes.has(t.id) ? 'checked' : ''} />
+                  <div class="type-title-group">
+                    <strong>${escapeHtml(t.label)}</strong>
+                    <small>${escapeHtml(t.desc)} · <em>Monitors: ${escapeHtml(t.monitorNames.join(', '))}</em></small>
+                  </div>
+                </label>
+              `).join('')}
+            </div>
+            <div class="actions" style="margin-top:16px;padding:0">
+              <button class="button" type="submit" ${!isAdmin() ? 'disabled' : ''}>Save Monitored Types Filter</button>
+              <span class="helper settings-help">Filters state transition history events and monitor types sent to <code>POST /api/history</code>.</span>
+            </div>
+          ` : `
+            <div class="empty">No active monitors are currently selected and monitored. Enable or select monitors in the Monitors / Server tab first.</div>
+          `}
           <div class="error" id="types-error"></div>
         </div>
       </article>
@@ -1745,15 +1830,42 @@ async function renderRemoteData(content) {
     state.page = 'server';
     await renderPage();
   });
+  document.getElementById('edit-server-config-btn')?.addEventListener('click', async () => {
+    state.page = 'server';
+    await renderPage();
+  });
+
+  const typesForm = document.getElementById('remote-types-form');
 
   document.getElementById('trigger-sync-now-btn')?.addEventListener('click', async (e) => {
     const btn = e.currentTarget;
     btn.disabled = true;
     btn.textContent = 'Sending…';
     try {
-      await request(() => remoteCare.triggerRemoteSync(state.session.token));
-      flash('Remote sync and heartbeat triggered.');
-      setTimeout(() => { if (state.page === 'remote-data') renderRemoteData(content); }, 600);
+      if (isAdmin() && typesForm && availableMonitorTypes.length > 0) {
+        const currentTypesValue = computeTypesSettingValue(typesForm);
+        const latestSettings = await request(() => remoteCare.getAppSettings(state.session.token));
+        if (latestSettings.historySyncTargetTypes !== currentTypesValue) {
+          state.settings = await request(() => remoteCare.saveAppSettings(state.session.token, {
+            ...latestSettings,
+            historySyncTargetTypes: currentTypesValue
+          }));
+        } else {
+          state.settings = latestSettings;
+        }
+      }
+      const res = await request(() => remoteCare.triggerRemoteSync(state.session.token));
+      const syncErr = res?.historySync?.error || res?.cloudSync?.error;
+      if (syncErr) {
+        flash(`Sync completed with error: ${syncErr}`, 'down');
+      } else if (res?.historySync?.skipped && res?.cloudSync?.skipped) {
+        flash(res?.historySync?.reason || res?.cloudSync?.reason || 'Server Base URL is not configured.', 'down');
+      } else {
+        flash('Telemetry and history sent with latest server configuration and credentials.', 'recovered');
+      }
+      if (state.page === 'remote-data') {
+        await renderRemoteData(content);
+      }
     } catch (err) {
       flash(err.message, 'down');
       btn.disabled = false;
@@ -1773,19 +1885,22 @@ async function renderRemoteData(content) {
     content.querySelectorAll('#remote-types-form input[type="checkbox"]').forEach((cb) => { cb.checked = false; });
   });
 
-  const typesForm = document.getElementById('remote-types-form');
   typesForm?.addEventListener('submit', async (e) => {
     e.preventDefault();
     const errBox = document.getElementById('types-error');
     errBox.textContent = '';
-    const checkedBoxes = Array.from(typesForm.querySelectorAll('input[name="types"]:checked')).map((cb) => cb.value);
     try {
+      const latestSettings = await request(() => remoteCare.getAppSettings(state.session.token));
+      const typesValue = computeTypesSettingValue(typesForm);
       const next = {
-        ...state.settings,
-        historySyncTargetTypes: checkedBoxes.length === REMOTE_DATA_MONITOR_TYPES.length ? ['all'] : checkedBoxes
+        ...latestSettings,
+        historySyncTargetTypes: typesValue
       };
       state.settings = await request(() => remoteCare.saveAppSettings(state.session.token, next));
       flash('Monitored types filter saved successfully.');
+      if (state.page === 'remote-data') {
+        await renderRemoteData(content);
+      }
     } catch (err) {
       errBox.textContent = err.message || 'Failed to save types filter.';
     }
