@@ -12,6 +12,7 @@ class HistorySyncService extends EventEmitter {
     this.timer = null;
     this.isSyncing = false;
     this.lastSyncAt = null;
+    this.lastAttemptAt = 0;
     this.lastError = null;
     this.lastSentCount = 0;
     this.lastPayload = null;
@@ -108,7 +109,7 @@ class HistorySyncService extends EventEmitter {
     return Boolean(settings?.historySyncEnabled || endpoint);
   }
 
-  buildPayload({ previewRecent = false, limit = 50, targetIds = undefined, targetTypes = undefined, includeLatestOnForce = false } = {}) {
+  buildPayload({ previewRecent = false, limit = 50, targetIds = undefined, targetTypes = undefined } = {}) {
     const resolvedTargets = targetIds !== undefined ? targetIds : this.getTargetIds();
     const resolvedTypes = targetTypes !== undefined ? targetTypes : this.getTargetTypes(resolvedTargets);
     const cursor = this.database.getHistorySyncCursor();
@@ -139,7 +140,7 @@ class HistorySyncService extends EventEmitter {
         sinceId: cursor.lastId,
         limit: 100
       });
-      if ((includeLatestOnForce || !this.lastPayload) && entries.length === 0) {
+      if (entries.length === 0) {
         entries = this.database.getHistoryChanges({
           targetIds: resolvedTargets,
           targetTypes: resolvedTypes,
@@ -236,7 +237,11 @@ class HistorySyncService extends EventEmitter {
 
   async syncNow({ force = false } = {}) {
     if (this.isSyncing) {
-      return { skipped: true, reason: 'History sync is currently running.' };
+      if (!force) return { skipped: true, reason: 'History sync is currently running.' };
+      for (let i = 0; i < 50 && this.isSyncing; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      if (this.isSyncing) return { skipped: true, reason: 'History sync is currently running.' };
     }
     const endpoint = this.getEndpointUrl();
     if (!force && (!this.isEnabled() || !endpoint)) {
@@ -247,8 +252,9 @@ class HistorySyncService extends EventEmitter {
     }
 
     this.isSyncing = true;
+    this.lastAttemptAt = Date.now();
     try {
-      const payload = this.buildPayload({ previewRecent: false, includeLatestOnForce: force });
+      const payload = this.buildPayload({ previewRecent: false });
       const authToken = this.getAuthToken();
       const res = await this.sendPayload(endpoint, authToken, payload);
 
@@ -289,10 +295,21 @@ class HistorySyncService extends EventEmitter {
     }
   }
 
+  checkDue() {
+    if (!this.isEnabled() || this.isSyncing) return Promise.resolve(null);
+    const intervalMs = this.getIntervalMinutes() * 60 * 1000;
+    const lastSyncMs = this.lastSyncAt ? new Date(this.lastSyncAt).getTime() : 0;
+    const baseline = Math.max(this.lastAttemptAt || 0, lastSyncMs || 0);
+    if (!baseline || (Date.now() - baseline >= intervalMs)) {
+      return this.syncNow().catch(() => null);
+    }
+    return Promise.resolve(null);
+  }
+
   start({ syncImmediate = true } = {}) {
     if (this.timer) return;
     if (syncImmediate && this.isEnabled()) {
-      void this.syncNow().catch(() => {});
+      void this.syncNow({ force: true }).catch(() => {});
     }
     const intervalMinutes = this.getIntervalMinutes();
     this.timer = setInterval(() => {
@@ -300,7 +317,9 @@ class HistorySyncService extends EventEmitter {
         void this.syncNow().catch(() => {});
       }
     }, intervalMinutes * 60 * 1000);
-    this.timer.unref?.();
+    if (!process.versions?.electron) {
+      this.timer.unref?.();
+    }
     this.emit('started', { intervalMinutes });
   }
 

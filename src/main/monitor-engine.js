@@ -18,9 +18,11 @@ class MonitorEngine extends EventEmitter {
     if (this.timer) return;
     this.refreshSchedule(true);
     this.timer = setInterval(() => this.tick(), 500);
-    this.timer.unref?.();
     this.pruneTimer = setInterval(() => this.database.pruneHistory(30), 24 * 60 * 60 * 1000);
-    this.pruneTimer.unref?.();
+    if (!process.versions?.electron) {
+      this.timer.unref?.();
+      this.pruneTimer.unref?.();
+    }
     this.emit('update', { type: 'engine_started' });
   }
 

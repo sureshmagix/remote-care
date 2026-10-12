@@ -854,6 +854,13 @@ function updateDashboardLive() {
     if (form && !form.contains(document.activeElement)) {
       loadHistory(historyFilterValues(form)).catch(() => {});
     }
+  } else if (state.page === 'remote-data') {
+    const rs = state.dashboard?.remoteSync || {};
+    const sig = `${rs.lastSyncAt || ''}|${rs.lastHistorySyncAt || ''}|${rs.lastTelemetrySyncAt || ''}|${Boolean(rs.isPosting)}|${rs.lastError || ''}`;
+    if (sig !== lastRemoteDataSyncSignature) {
+      const content = document.getElementById('page-content');
+      if (content) void renderRemoteData(content);
+    }
   }
 }
 
@@ -1096,14 +1103,36 @@ async function renderSettings(content) {
   document.getElementById('request-quit')?.addEventListener('click', () => openQuitDialog('settings'));
 }
 
+const REMOTE_DATA_MONITOR_TYPES = [
+  { id: 'http', label: 'HTTP / HTTPS Endpoints', desc: 'Web services and REST APIs' },
+  { id: 'icmp', label: 'ICMP Ping', desc: 'Direct ICMP echo response' },
+  { id: 'gateway', label: 'Default Gateway', desc: 'Local router / gateway availability' },
+  { id: 'rtsp', label: 'RTSP Stream', desc: 'IP cameras and streaming video ports' },
+  { id: 'disk', label: 'Disk Storage', desc: 'Filesystem and partition storage thresholds' },
+  { id: 'ping', label: 'Ping (ICMP)', desc: 'Standard ping host reachability' },
+  { id: 'tcp', label: 'TCP Port', desc: 'Raw TCP socket connectivity' },
+  { id: 'internet', label: 'Internet Connection', desc: 'External internet connectivity verification' },
+  { id: 'interface', label: 'Network Interface', desc: 'Wi-Fi / Ethernet adapter connectivity' },
+  { id: 'system_service', label: 'Local System Service', desc: 'systemd, Windows service, or launchd' },
+  { id: 'process', label: 'Local Process', desc: 'Running system process verification' },
+  { id: 'docker', label: 'Docker Container / Daemon', desc: 'Docker container state or daemon health' },
+  { id: 'memory', label: 'System RAM Usage', desc: 'Device memory utilization limits' },
+  { id: 'cpu', label: 'CPU Utilization', desc: 'Processor load and core saturation' },
+  { id: 'command', label: 'Custom Shell Script', desc: 'CLI scripts and exit code evaluations' }
+];
+
 async function renderServer(content) {
   if (!isAdmin()) {
     state.page = 'overview';
     return renderOverview(content);
   }
-  state.settings = await request(() => remoteCare.getAppSettings(state.session.token));
+  const [freshSettings, freshDashboard] = await Promise.all([
+    request(() => remoteCare.getAppSettings(state.session.token)),
+    request(() => remoteCare.getDashboard(state.session.token)).catch(() => state.dashboard)
+  ]);
+  state.settings = freshSettings;
+  if (freshDashboard) state.dashboard = freshDashboard;
   const settings = state.settings;
-  const checked = (name) => settings[name] ? 'checked' : '';
   const isSelected = (val) => (settings.telemetrySelection || 'all') === val ? 'selected' : '';
 
   // Calculate default endpoints derived from base URL if not explicitly set
@@ -1113,31 +1142,54 @@ async function renderServer(content) {
   const cloudSyncChecked = (settings.cloudSyncEnabled || Boolean(base)) ? 'checked' : '';
   const historySyncChecked = (settings.historySyncEnabled || Boolean(base)) ? 'checked' : '';
 
-  const targets = state.dashboard?.targets || [];
-  const savedTargetIdsRaw = settings.historySyncTargetIds || '';
-  const savedTargetIds = savedTargetIdsRaw && savedTargetIdsRaw !== 'all'
+  const activeTargets = (state.dashboard?.targets || []).filter((t) => t.enabled !== false);
+  const savedTargetIdsRaw = String(settings.historySyncTargetIds || '').trim();
+  const isNoTargetsSaved = savedTargetIdsRaw.toLowerCase() === 'none';
+  const savedTargetIds = savedTargetIdsRaw && savedTargetIdsRaw !== 'all' && !isNoTargetsSaved
     ? savedTargetIdsRaw.split(',').map((s) => Number(s.trim())).filter((n) => Number.isInteger(n) && n > 0)
     : null;
 
   const isTargetChecked = (targetId) => {
+    if (isNoTargetsSaved) return false;
     if (savedTargetIds === null || savedTargetIds.length === 0) return true; // default all checked
-    return savedTargetIds.includes(targetId);
+    return savedTargetIds.includes(Number(targetId));
   };
 
+  // Parse saved historySyncTargetTypes
+  const rawTypes = settings.historySyncTargetTypes;
+  const parsedTypes = Array.isArray(rawTypes)
+    ? rawTypes.map((s) => String(s).trim().toLowerCase()).filter(Boolean)
+    : (typeof rawTypes === 'string' && rawTypes.trim()
+      ? rawTypes.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
+      : ['all']);
+  const isNoneTypeSaved = parsedTypes.includes('none');
+  const isAllTypeSaved = !isNoneTypeSaved && (parsedTypes.length === 0 || parsedTypes.includes('all'));
+
+  const typeMetaById = new Map(REMOTE_DATA_MONITOR_TYPES.map((t) => [t.id, t]));
+
   content.innerHTML = `
-    <header class="page-header"><div><h2>Server Integration</h2><p>Configure remote care server base URL, telemetry options, health verification, and result changes history sync.</p></div>${liveClockMarkup()}</header>
+    <header class="page-header">
+      <div>
+        <h2>Server Configuration</h2>
+        <p>Configure remote care server connection, credentials, periodic sync intervals, and monitor/type filters for Remote Data transmission.</p>
+      </div>
+      <div class="header-tools">
+        <button class="button secondary small" id="btn-open-remote-data-tab" type="button">📡 View Live Remote Data →</button>
+        ${liveClockMarkup()}
+      </div>
+    </header>
     <form id="server-form" class="settings-form">
       <article class="card">
-        <div class="panel-title"><h3>Server Connection</h3><span>Core integration</span></div>
+        <div class="panel-title"><h3>Server Connection &amp; Credentials</h3><span>Core integration</span></div>
         <div class="panel-body settings-list">
           <label class="setting-row">
-            <span><strong>Enable server synchronization</strong><small>Publish outbound monitoring events, telemetry, and heartbeats to the remote care server.</small></span>
+            <span><strong>Enable Server Synchronization</strong><small>Automatically send periodic telemetry heartbeats and outbound events to the remote care server.</small></span>
             <input name="cloudSyncEnabled" type="checkbox" ${cloudSyncChecked} />
           </label>
           <div class="field" style="margin-top:10px">
             <label>Server Base URL</label>
             <input name="serverBaseUrl" type="url" value="${escapeHtml(settings.serverBaseUrl || '')}" placeholder="http://192.168.1.100:3999" id="server-base-url-input" />
-            <span class="helper">Enter only the base URL of your remote care server (e.g. <code>http://&lt;YOUR_SERVER_IP&gt;:3999</code>). Endpoints <code>/api/sync</code>, <code>/api/history</code>, and <code>/health</code> are derived automatically.</span>
+            <span class="helper">Enter the base URL of your remote care server (e.g. <code>http://&lt;YOUR_SERVER_IP&gt;:3999</code>). Endpoints <code>/api/sync</code>, <code>/api/history</code>, and <code>/health</code> are derived automatically.</span>
           </div>
           <div class="field">
             <label>Server API Key (x-api-key)</label>
@@ -1154,9 +1206,9 @@ async function renderServer(content) {
               <span class="helper">Unique hostname of this terminal. Defaults to system hostname if blank.</span>
             </div>
             <div class="field">
-              <label>Sync Interval (seconds)</label>
-              <input name="serverSyncIntervalSeconds" type="number" min="2" max="3600" step="1" value="${settings.serverSyncIntervalSeconds ?? 15}" required />
-              <span class="helper">Frequency outbound events are flushed to server.</span>
+              <label>Separate Health Check URL (optional)</label>
+              <input name="serverHealthUrl" type="url" value="${escapeHtml(settings.serverHealthUrl || '')}" placeholder="${escapeHtml(derivedHealth || 'http://localhost:3999/health')}" id="server-health-url-input" />
+              <span class="helper">Dedicated URL to query server health. Defaults to <code>&lt;Base URL&gt;/health</code> if left blank.</span>
             </div>
           </div>
           <div class="two-col">
@@ -1171,158 +1223,238 @@ async function renderServer(content) {
               <span class="helper">Assigned Device UUID during commissioning.</span>
             </div>
           </div>
-        </div>
-      </article>
-
-      <article class="card">
-        <div class="panel-title"><h3>Result Changes History Sync</h3><span>Periodic delta history</span></div>
-        <div class="panel-body settings-list">
-          <label class="setting-row">
-            <span><strong>Enable History of Changes Sync</strong><small>Send the recorded history of changes in monitor results to the server periodically.</small></span>
-            <input name="historySyncEnabled" type="checkbox" ${historySyncChecked} />
-          </label>
-          <div class="field" style="margin-top:10px">
-            <label>History Sync URL</label>
-            <input name="historySyncUrl" type="url" value="${escapeHtml(settings.historySyncUrl || '')}" placeholder="${escapeHtml(derivedHistory || 'http://localhost:3999/api/history')}" id="history-sync-url-input" />
-            <span class="helper">Dedicated endpoint for result changes history (<code>POST /api/history</code>). Defaults to <code>&lt;Base URL&gt;/api/history</code> if left blank.</span>
-          </div>
-          <div class="field">
-            <label>History Sync Delay / Interval (minutes)</label>
-            <input name="historySyncIntervalMinutes" type="number" min="1" max="1440" step="1" value="${settings.historySyncIntervalMinutes ?? 5}" required />
-            <span class="helper">How frequently the recorded changes in monitor result are sent to the server (default: 5 minutes).</span>
-          </div>
-
-          <div class="field">
-            <label>Select Monitors to Send in History Sync</label>
-            <div class="monitor-select-box">
-              <div class="monitor-select-header">
-                <span>Select which monitors are tracked for history transmission:</span>
-                <div class="btn-group">
-                  <button type="button" class="button secondary small" id="btn-select-all-monitors" style="padding:2px 8px;font-size:11px;">Select All</button>
-                  <button type="button" class="button secondary small" id="btn-deselect-all-monitors" style="padding:2px 8px;font-size:11px;">Deselect All</button>
-                </div>
-              </div>
-              <div class="monitor-select-grid" id="history-monitors-list">
-                ${targets.length ? targets.map((t) => `
-                  <label class="monitor-select-item">
-                    <input type="checkbox" data-history-target-id="${t.id}" ${isTargetChecked(t.id) ? 'checked' : ''} />
-                    <div class="monitor-select-info">
-                      <span class="monitor-select-name">${escapeHtml(t.name)}</span>
-                      <span class="monitor-select-sub">${escapeHtml(prettyType(t.type))} · ${escapeHtml(t.locationName || 'Local')}</span>
-                    </div>
-                  </label>
-                `).join('') : '<span style="color:var(--muted);font-size:12px;">No monitors configured yet. Default targets will be included.</span>'}
-              </div>
-            </div>
-          </div>
-
           <div class="setting-row notification-test">
-            <span><strong>History Transmission &amp; JSON Preview</strong><small id="history-sync-status-text">Click "Preview JSON Payload" to inspect the JSON payload structure.</small></span>
-            <div class="btn-group">
-              <button class="button secondary small" id="btn-preview-history" type="button">Preview JSON Payload</button>
-              <button class="button secondary small" id="btn-sync-history-now" type="button">Sync History Now</button>
-            </div>
-          </div>
-
-          <div class="json-preview-card" id="history-preview-card">
-            <div class="json-preview-toolbar">
-              <div class="meta" id="history-preview-meta">
-                <span>Payload Preview: <strong id="history-preview-mode">Pending / Recent Changes</strong></span>
-                <span id="history-preview-count">0 change(s)</span>
-              </div>
-              <button class="button secondary small" id="btn-copy-history-json" type="button" style="padding:3px 8px;font-size:11px;">Copy JSON</button>
-            </div>
-            <pre class="json-preview-content" id="history-preview-content">// Click "Preview JSON Payload" to generate the live payload…</pre>
-          </div>
-        </div>
-      </article>
-
-      <article class="card">
-        <div class="panel-title"><h3>Telemetry Configuration</h3><span>Selected JSON payloads</span></div>
-        <div class="panel-body settings-list">
-          <div class="field" style="margin-top:10px">
-            <label>Telemetry Data to Send (JSON format)</label>
-            <select name="telemetrySelection">
-              <option value="all" ${isSelected('all')}>All Telemetry (System specs, RAM, CPU, load avg, monitor states, incidents)</option>
-              <option value="system_metrics" ${isSelected('system_metrics')}>System &amp; Hardware Metrics Only (CPU cores, load avg, RAM usage, host details)</option>
-              <option value="monitors_only" ${isSelected('monitors_only')}>Monitors &amp; Incidents Only (Active incident counts, monitor health summary)</option>
-              <option value="minimal" ${isSelected('minimal')}>Minimal Status Only (Hostname, overall status, timestamp)</option>
-            </select>
-            <span class="helper">Choose which telemetry payload components are packaged and sent to the server.</span>
-          </div>
-          <div class="field">
-            <label>Periodic heartbeat interval (minutes)</label>
-            <input name="cloudHeartbeatMinutes" type="number" min="1" max="1440" value="${settings.cloudHeartbeatMinutes ?? 5}" required />
-            <span class="helper">How frequently the client sends its telemetry heartbeat JSON.</span>
-          </div>
-          <div class="setting-row notification-test">
-            <span><strong>Publish pending telemetry events now</strong><small id="cloud-sync-status-text">Checking queue status…</small></span>
-            <button class="button secondary small" id="trigger-cloud-sync" type="button">Publish now</button>
-          </div>
-        </div>
-      </article>
-
-      <article class="card">
-        <div class="panel-title"><h3>Server Health Check</h3><span>Dedicated health endpoint</span></div>
-        <div class="panel-body settings-list">
-          <div class="field" style="margin-top:10px">
-            <label>Separate Health Check URL</label>
-            <input name="serverHealthUrl" type="url" value="${escapeHtml(settings.serverHealthUrl || '')}" placeholder="${escapeHtml(derivedHealth || 'http://localhost:3000/health')}" id="server-health-url-input" />
-            <span class="helper">Dedicated URL to query server health. Defaults to <code>&lt;Base URL&gt;/health</code> if left blank.</span>
-          </div>
-          <div class="setting-row notification-test">
-            <span><strong>Verify Server Health</strong><small id="server-health-status-text">Check if the server is responding and healthy.</small></span>
+            <span><strong>Verify Server Connectivity</strong><small id="server-health-status-text">Check if the remote server is reachable and responding healthy.</small></span>
             <button class="button secondary small" id="btn-check-server-health" type="button">Check Health</button>
           </div>
           <div id="server-health-result" style="display:none;"></div>
         </div>
       </article>
 
+      <article class="card">
+        <div class="panel-title"><h3>Heartbeat &amp; Telemetry Configuration</h3><span>Periodic POST /api/sync</span></div>
+        <div class="panel-body settings-list">
+          <div class="two-col" style="margin-top:10px">
+            <div class="field">
+              <label>Telemetry Data to Send (JSON format)</label>
+              <select name="telemetrySelection">
+                <option value="all" ${isSelected('all')}>All Telemetry (System specs, RAM, CPU, load avg, monitor states, incidents)</option>
+                <option value="system_metrics" ${isSelected('system_metrics')}>System &amp; Hardware Metrics Only (CPU cores, load avg, RAM usage, host details)</option>
+                <option value="monitors_only" ${isSelected('monitors_only')}>Monitors &amp; Incidents Only (Active incident counts, monitor health summary)</option>
+                <option value="minimal" ${isSelected('minimal')}>Minimal Status Only (Hostname, overall status, timestamp)</option>
+              </select>
+              <span class="helper">Choose which telemetry payload components are packaged and sent to the server.</span>
+            </div>
+            <div class="field">
+              <label>Periodic Telemetry Sync Interval (minutes)</label>
+              <input name="cloudHeartbeatMinutes" type="number" min="1" max="1440" step="1" value="${settings.cloudHeartbeatMinutes ?? 5}" required />
+              <span class="helper">How frequently telemetry &amp; heartbeat JSON payloads are automatically sent to <code>POST /api/sync</code> (default: 5 minutes).</span>
+            </div>
+          </div>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="panel-title"><h3>History Sync &amp; Monitor Filters Configuration</h3><span>Periodic POST /api/history</span></div>
+        <div class="panel-body settings-list">
+          <label class="setting-row">
+            <span><strong>Enable History of Changes Sync</strong><small>Automatically send monitor status changes and latest monitor snapshots to the server periodically.</small></span>
+            <input name="historySyncEnabled" type="checkbox" ${historySyncChecked} />
+          </label>
+          <div class="two-col" style="margin-top:10px">
+            <div class="field">
+              <label>History Sync URL (optional override)</label>
+              <input name="historySyncUrl" type="url" value="${escapeHtml(settings.historySyncUrl || '')}" placeholder="${escapeHtml(derivedHistory || 'http://localhost:3999/api/history')}" id="history-sync-url-input" />
+              <span class="helper">Dedicated endpoint for result changes history. Defaults to <code>&lt;Base URL&gt;/api/history</code> if left blank.</span>
+            </div>
+            <div class="field">
+              <label>Periodic History Sync Interval (minutes)</label>
+              <input name="historySyncIntervalMinutes" type="number" min="1" max="1440" step="1" value="${settings.historySyncIntervalMinutes ?? 5}" required />
+              <span class="helper">How frequently monitor history is automatically sent to <code>POST /api/history</code> (default: 5 minutes).</span>
+            </div>
+          </div>
+
+          <div class="field">
+            <label>Select Monitored Targets to Send</label>
+            <div class="monitor-select-box">
+              <div class="monitor-select-header">
+                <span>Select which active monitors are included in Remote Data transmission:</span>
+                <div class="btn-group">
+                  <button type="button" class="button secondary small" id="btn-select-all-monitors" style="padding:2px 8px;font-size:11px;">Select All</button>
+                  <button type="button" class="button secondary small" id="btn-deselect-all-monitors" style="padding:2px 8px;font-size:11px;">Deselect All</button>
+                </div>
+              </div>
+              <div class="monitor-select-grid" id="history-monitors-list">
+                ${activeTargets.length ? activeTargets.map((t) => `
+                  <label class="monitor-select-item">
+                    <input type="checkbox" data-history-target-id="${t.id}" data-target-type="${escapeHtml(String(t.type || '').toLowerCase())}" data-target-name="${escapeHtml(t.name)}" ${isTargetChecked(t.id) ? 'checked' : ''} />
+                    <div class="monitor-select-info">
+                      <span class="monitor-select-name">${escapeHtml(t.name)}</span>
+                      <span class="monitor-select-sub">${escapeHtml(prettyType(t.type))} · ${escapeHtml(t.locationName || 'Local')}</span>
+                    </div>
+                  </label>
+                `).join('') : '<span style="color:var(--muted);font-size:12px;">No active monitors enabled. Enable monitors in the Monitors tab first.</span>'}
+              </div>
+            </div>
+          </div>
+
+          <div class="field">
+            <label>Select Monitored Types to Send</label>
+            <div class="monitor-select-box">
+              <div class="monitor-select-header">
+                <span>Filter monitor types from the selected &amp; monitored targets above:</span>
+                <div class="btn-group">
+                  <button type="button" class="button secondary small" id="btn-select-all-types" style="padding:2px 8px;font-size:11px;">Select All Types</button>
+                  <button type="button" class="button secondary small" id="btn-deselect-all-types" style="padding:2px 8px;font-size:11px;">Deselect All Types</button>
+                </div>
+              </div>
+              <div class="types-grid" id="server-types-list" style="margin-top:8px;"></div>
+            </div>
+          </div>
+        </div>
+      </article>
+
       <div class="actions">
         <button class="button" type="submit">Save Server Configuration</button>
-        <span class="helper settings-help">Configuration is stored securely in the local SQLite database.</span>
+        <span class="helper settings-help">Saves configuration and immediately activates automatic periodic transmission to the remote server.</span>
       </div>
       <div class="error" id="server-error"></div>
     </form>`;
 
   const form = document.getElementById('server-form');
   const error = document.getElementById('server-error');
+  const typesListEl = document.getElementById('server-types-list');
 
-  const updateCloudStatus = async () => {
-    const statusEl = document.getElementById('cloud-sync-status-text');
-    if (!statusEl) return;
-    try {
-      const status = await remoteCare.getCloudSyncStatus(state.session.token);
-      statusEl.textContent = `Pending events: ${status?.pendingCount ?? 0} · Endpoint: ${status?.endpoint || 'Not configured'}`;
-    } catch {
-      statusEl.textContent = 'Queue status unavailable';
+  document.getElementById('btn-open-remote-data-tab')?.addEventListener('click', async () => {
+    state.page = 'remote-data';
+    await renderPage();
+  });
+
+  // Track which types are currently checked in the UI
+  const currentTypeSelection = new Set();
+  let initializedTypes = false;
+
+  const computeAvailableMonitorTypes = () => {
+    const checkedTargetBoxes = Array.from(form.querySelectorAll('[data-history-target-id]:checked'));
+    const byType = new Map();
+    for (const cb of checkedTargetBoxes) {
+      const tType = String(cb.dataset.targetType || '').trim().toLowerCase();
+      const tName = cb.dataset.targetName || '';
+      if (!tType) continue;
+      if (!byType.has(tType)) byType.set(tType, []);
+      byType.get(tType).push(tName);
     }
+    const list = [];
+    for (const [typeId, monitorNames] of byType.entries()) {
+      const meta = typeMetaById.get(typeId) || {
+        id: typeId,
+        label: prettyType(typeId),
+        desc: 'Active monitored check type'
+      };
+      list.push({ ...meta, monitorNames });
+    }
+    return list;
   };
-  void updateCloudStatus();
+
+  const renderAvailableTypes = () => {
+    if (!typesListEl) return;
+    const availableTypes = computeAvailableMonitorTypes();
+    if (!initializedTypes) {
+      initializedTypes = true;
+      if (!isNoneTypeSaved) {
+        for (const t of availableTypes) {
+          if (isAllTypeSaved) {
+            currentTypeSelection.add(t.id);
+          } else if (
+            parsedTypes.includes(t.id) ||
+            ((t.id === 'ping' || t.id === 'icmp') && (parsedTypes.includes('ping') || parsedTypes.includes('icmp')))
+          ) {
+            currentTypeSelection.add(t.id);
+          }
+        }
+        if (!isAllTypeSaved && currentTypeSelection.size === 0 && availableTypes.length > 0) {
+          availableTypes.forEach((t) => currentTypeSelection.add(t.id));
+        }
+      }
+    } else {
+      // Auto-select newly added monitor types when user checks a monitor
+      for (const t of availableTypes) {
+        if (!typesListEl.querySelector(`input[name="types"][value="${CSS.escape(t.id)}"]`)) {
+          currentTypeSelection.add(t.id);
+        }
+      }
+    }
+
+    if (availableTypes.length === 0) {
+      typesListEl.innerHTML = '<span style="color:var(--muted);font-size:12px;">Select at least one active monitor above to filter its monitor types.</span>';
+      return;
+    }
+
+    typesListEl.innerHTML = availableTypes.map((t) => `
+      <label class="type-check-label">
+        <input type="checkbox" name="types" value="${escapeHtml(t.id)}" ${currentTypeSelection.has(t.id) ? 'checked' : ''} />
+        <div class="type-title-group">
+          <strong>${escapeHtml(t.label)}</strong>
+          <small>${escapeHtml(t.desc)} · <em>Monitors: ${escapeHtml(t.monitorNames.join(', '))}</em></small>
+        </div>
+      </label>
+    `).join('');
+
+    typesListEl.querySelectorAll('input[name="types"]').forEach((cb) => {
+      cb.addEventListener('change', () => {
+        if (cb.checked) currentTypeSelection.add(cb.value);
+        else currentTypeSelection.delete(cb.value);
+      });
+    });
+  };
+
+  renderAvailableTypes();
+
+  form.querySelectorAll('[data-history-target-id]').forEach((cb) => {
+    cb.addEventListener('change', () => renderAvailableTypes());
+  });
 
   // Helper to extract currently checked monitor IDs from UI
   const getSelectedTargetIds = () => {
     const checkboxes = form.querySelectorAll('[data-history-target-id]');
-    if (!checkboxes.length) return '';
+    if (!checkboxes.length) return 'all';
     const checked = Array.from(checkboxes).filter((cb) => cb.checked).map((cb) => Number(cb.dataset.historyTargetId));
-    if (checked.length === checkboxes.length) return 'all'; // all selected
+    if (checked.length === 0) return 'none';
+    if (checked.length === checkboxes.length) return 'all';
     return checked.join(',');
   };
 
-  const getSelectedTargetIdsArray = () => {
-    const checkboxes = form.querySelectorAll('[data-history-target-id]');
-    if (!checkboxes.length) return null;
-    const checked = Array.from(checkboxes).filter((cb) => cb.checked).map((cb) => Number(cb.dataset.historyTargetId));
-    if (checked.length === checkboxes.length) return null; // null means all
-    return checked;
+  const getSelectedTargetTypes = () => {
+    const availableTypes = computeAvailableMonitorTypes();
+    if (!availableTypes.length) return 'none';
+    const checkedBoxes = Array.from(form.querySelectorAll('input[name="types"]:checked')).map((cb) => cb.value);
+    if (checkedBoxes.length === 0) return 'none';
+    if (checkedBoxes.length === availableTypes.length) return 'all';
+    return checkedBoxes.join(',');
   };
 
   // Select all / Deselect all monitors handlers
   document.getElementById('btn-select-all-monitors')?.addEventListener('click', () => {
     form.querySelectorAll('[data-history-target-id]').forEach((cb) => { cb.checked = true; });
+    renderAvailableTypes();
   });
   document.getElementById('btn-deselect-all-monitors')?.addEventListener('click', () => {
     form.querySelectorAll('[data-history-target-id]').forEach((cb) => { cb.checked = false; });
+    renderAvailableTypes();
+  });
+
+  // Select all / Deselect all types handlers
+  document.getElementById('btn-select-all-types')?.addEventListener('click', () => {
+    form.querySelectorAll('input[name="types"]').forEach((cb) => {
+      cb.checked = true;
+      currentTypeSelection.add(cb.value);
+    });
+  });
+  document.getElementById('btn-deselect-all-types')?.addEventListener('click', () => {
+    form.querySelectorAll('input[name="types"]').forEach((cb) => {
+      cb.checked = false;
+      currentTypeSelection.delete(cb.value);
+    });
   });
 
   // Auto-update health and history URL placeholders when base URL changes
@@ -1345,78 +1477,6 @@ async function renderServer(content) {
       if (historyInput) historyInput.placeholder = 'http://localhost:3999/api/history';
     }
   });
-
-  // History Preview generator function
-  const refreshHistoryPreview = async (previewRecent = true) => {
-    const previewContent = document.getElementById('history-preview-content');
-    const previewCount = document.getElementById('history-preview-count');
-    const previewMode = document.getElementById('history-preview-mode');
-    if (!previewContent) return;
-    try {
-      const selectedIds = getSelectedTargetIdsArray();
-      const payload = await remoteCare.getHistorySyncPreview(state.session.token, {
-        previewRecent,
-        targetIds: selectedIds,
-        limit: 25
-      });
-      previewContent.textContent = JSON.stringify(payload, null, 2);
-      if (previewCount) previewCount.textContent = `${payload.entriesCount || 0} change(s)`;
-      if (previewMode) previewMode.textContent = previewRecent ? 'Recent Changes' : 'Pending Queue';
-    } catch (err) {
-      previewContent.textContent = `// Error generating preview: ${err.message}`;
-    }
-  };
-
-  // Preview button click
-  document.getElementById('btn-preview-history')?.addEventListener('click', () => {
-    void refreshHistoryPreview(true);
-  });
-
-  // Copy JSON button
-  document.getElementById('btn-copy-history-json')?.addEventListener('click', (event) => {
-    const previewContent = document.getElementById('history-preview-content');
-    if (!previewContent || !previewContent.textContent) return;
-    navigator.clipboard.writeText(previewContent.textContent).then(() => {
-      const btn = event.currentTarget;
-      const old = btn.textContent;
-      btn.textContent = 'Copied!';
-      setTimeout(() => { btn.textContent = old; }, 1500);
-    });
-  });
-
-  // Sync History Now button
-  document.getElementById('btn-sync-history-now')?.addEventListener('click', async (event) => {
-    const button = event.currentTarget;
-    const statusText = document.getElementById('history-sync-status-text');
-    const previewContent = document.getElementById('history-preview-content');
-    error.textContent = '';
-    button.disabled = true;
-    try {
-      const res = await request(() => remoteCare.triggerHistorySync(state.session.token));
-      if (res.ok) {
-        flash(`History sync successful: ${res.sentCount} change(s) transmitted to server.`, 'recovered');
-        if (statusText) statusText.textContent = `Last sent: ${new Date(res.timestamp).toLocaleTimeString()} (${res.sentCount} changes)`;
-        if (res.payload && previewContent) {
-          previewContent.textContent = JSON.stringify(res.payload, null, 2);
-          const previewCount = document.getElementById('history-preview-count');
-          if (previewCount) previewCount.textContent = `${res.sentCount} change(s) sent`;
-          const previewMode = document.getElementById('history-preview-mode');
-          if (previewMode) previewMode.textContent = 'Dispatched Payload (Live)';
-        }
-      } else if (res.skipped) {
-        flash(`History sync skipped: ${res.reason}`, 'info');
-      } else {
-        error.textContent = res.error || 'History sync failed.';
-      }
-    } catch (err) {
-      error.textContent = err.message || 'Error triggering history sync.';
-    } finally {
-      button.disabled = false;
-    }
-  });
-
-  // Auto-run initial preview
-  void refreshHistoryPreview(true);
 
   // Check server health button
   document.getElementById('btn-check-server-health')?.addEventListener('click', async (event) => {
@@ -1445,22 +1505,6 @@ async function renderServer(content) {
     }
   });
 
-  // Publish telemetry now button
-  document.getElementById('trigger-cloud-sync')?.addEventListener('click', async (event) => {
-    const button = event.currentTarget;
-    error.textContent = '';
-    button.disabled = true;
-    try {
-      const res = await request(() => remoteCare.triggerCloudSync(state.session.token));
-      flash(`Server sync triggered: ${res?.publishedCount ?? res?.deliveredCount ?? 0} event(s) published.`, 'info');
-      await updateCloudStatus();
-    } catch (err) {
-      error.textContent = err.message || 'Server sync failed.';
-    } finally {
-      button.disabled = false;
-    }
-  });
-
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     error.textContent = '';
@@ -1472,6 +1516,9 @@ async function renderServer(content) {
     const serviceUuid = form.elements.serviceUuid?.value?.trim() || '';
     const deviceUuid = form.elements.deviceUuid?.value?.trim() || '';
     const selectedTargetIds = getSelectedTargetIds();
+    const selectedTargetTypes = getSelectedTargetTypes();
+    const heartbeatMinutes = form.elements.cloudHeartbeatMinutes ? form.elements.cloudHeartbeatMinutes.valueAsNumber : 5;
+    const historyMinutes = form.elements.historySyncIntervalMinutes ? form.elements.historySyncIntervalMinutes.valueAsNumber : 5;
 
     const next = {
       ...state.settings,
@@ -1480,24 +1527,22 @@ async function renderServer(content) {
       serverHealthUrl: healthUrl,
       historySyncEnabled: Boolean(form.elements.historySyncEnabled?.checked),
       historySyncUrl: historyUrl,
-      historySyncIntervalMinutes: form.elements.historySyncIntervalMinutes ? form.elements.historySyncIntervalMinutes.valueAsNumber : 5,
+      historySyncIntervalMinutes: historyMinutes,
       historySyncTargetIds: selectedTargetIds,
+      historySyncTargetTypes: selectedTargetTypes,
       serverAuthToken: authToken,
       cloudAuthToken: authToken,
       terminalHostname,
       serviceUuid,
       deviceUuid,
-      // For backwards compatibility: if cloudHttpsUrl is not customized, derive it
       cloudHttpsUrl: baseUrl ? `${baseUrl.replace(/\/+$/, '')}/api/sync` : state.settings.cloudHttpsUrl,
       telemetrySelection: form.elements.telemetrySelection?.value || 'all',
-      cloudHeartbeatMinutes: form.elements.cloudHeartbeatMinutes ? form.elements.cloudHeartbeatMinutes.valueAsNumber : 5,
-      serverSyncIntervalSeconds: form.elements.serverSyncIntervalSeconds ? form.elements.serverSyncIntervalSeconds.valueAsNumber : 15
+      cloudHeartbeatMinutes: heartbeatMinutes,
+      serverSyncIntervalSeconds: state.settings.serverSyncIntervalSeconds ?? 15
     };
     try {
       state.settings = await request(() => remoteCare.saveAppSettings(state.session.token, next));
-      flash('Server configuration saved successfully.');
-      await updateCloudStatus();
-      void refreshHistoryPreview(true);
+      flash('Server configuration saved. Periodic telemetry and history sync is active.', 'recovered');
     } catch (exception) {
       error.textContent = exception.message || 'Unable to save server configuration.';
     }
@@ -1648,23 +1693,7 @@ function openFactoryResetDialog() {
   dialog.showModal();
 }
 
-const REMOTE_DATA_MONITOR_TYPES = [
-  { id: 'http', label: 'HTTP / HTTPS Endpoints', desc: 'Web services and REST APIs' },
-  { id: 'icmp', label: 'ICMP Ping', desc: 'Direct ICMP echo response' },
-  { id: 'gateway', label: 'Default Gateway', desc: 'Local router / gateway availability' },
-  { id: 'rtsp', label: 'RTSP Stream', desc: 'IP cameras and streaming video ports' },
-  { id: 'disk', label: 'Disk Storage', desc: 'Filesystem and partition storage thresholds' },
-  { id: 'ping', label: 'Ping (ICMP)', desc: 'Standard ping host reachability' },
-  { id: 'tcp', label: 'TCP Port', desc: 'Raw TCP socket connectivity' },
-  { id: 'internet', label: 'Internet Connection', desc: 'External internet connectivity verification' },
-  { id: 'interface', label: 'Network Interface', desc: 'Wi-Fi / Ethernet adapter connectivity' },
-  { id: 'system_service', label: 'Local System Service', desc: 'systemd, Windows service, or launchd' },
-  { id: 'process', label: 'Local Process', desc: 'Running system process verification' },
-  { id: 'docker', label: 'Docker Container / Daemon', desc: 'Docker container state or daemon health' },
-  { id: 'memory', label: 'System RAM Usage', desc: 'Device memory utilization limits' },
-  { id: 'cpu', label: 'CPU Utilization', desc: 'Processor load and core saturation' },
-  { id: 'command', label: 'Custom Shell Script', desc: 'CLI scripts and exit code evaluations' }
-];
+let lastRemoteDataSyncSignature = '';
 
 async function renderRemoteData(content) {
   if (!isAdmin() && !isOperator()) {
@@ -1692,10 +1721,23 @@ async function renderRemoteData(content) {
   const historyEndpoint = history.endpoint || (serverBaseUrl ? `${serverBaseUrl.replace(/\/+$/, '')}/api/history` : 'http://<YOUR_SERVER_IP>:3999/api/history');
   const syncEndpoint = cloud.endpoint || (serverBaseUrl ? `${serverBaseUrl.replace(/\/+$/, '')}/api/sync` : 'http://<YOUR_SERVER_IP>:3999/api/sync');
 
+  const isHeartbeatActive = Boolean(cloud.enabled || settings.cloudSyncEnabled || serverBaseUrl);
+  const isHistorySyncActive = Boolean(history.enabled || settings.historySyncEnabled || serverBaseUrl);
+  const hbMinutes = settings.cloudHeartbeatMinutes ?? 5;
+  const histMinutes = settings.historySyncIntervalMinutes ?? 5;
+  const lastCombinedSyncAt = (() => {
+    const t1 = history.lastSyncAt || null;
+    const t2 = cloud.lastSyncAt || cloud.lastPublishedAt || null;
+    if (t1 && t2) return t1 > t2 ? t1 : t2;
+    return t1 || t2;
+  })();
+
+  lastRemoteDataSyncSignature = `${lastCombinedSyncAt || ''}|${history.lastSyncAt || ''}|${cloud.lastSyncAt || ''}|${isPosting}|${lastError || ''}`;
+
   let bannerClass = 'idle';
   let bannerIcon = 'ℹ';
-  let bannerTitle = 'Idle / Waiting for Interval';
-  let bannerDesc = `Telemetry heartbeats sent every ${settings.cloudHeartbeatMinutes ?? 5}m. Result changes sync every ${settings.historySyncIntervalMinutes ?? 5}m on status changes.`;
+  let bannerTitle = 'Idle / Waiting for Periodic Schedule';
+  let bannerDesc = `Automatic periodic schedule: Telemetry every ${hbMinutes}m · History every ${histMinutes}m.`;
 
   if (isPosting) {
     bannerClass = 'posting';
@@ -1706,17 +1748,17 @@ async function renderRemoteData(content) {
     bannerClass = 'error';
     bannerIcon = '🔒';
     bannerTitle = 'Authentication Error (HTTP 401 Unauthorized)';
-    bannerDesc = `Server rejected the API key or secret token: ${escapeHtml(lastError)}. Please verify the Server API Key (x-api-key) in Server settings.`;
+    bannerDesc = `Server rejected the API key or secret token: ${escapeHtml(lastError)}. Please verify the Server API Key (x-api-key) in the Server tab.`;
   } else if (lastError) {
     bannerClass = 'error';
     bannerIcon = '⚠️';
     bannerTitle = 'Server Connection Error / Not Responding';
-    bannerDesc = escapeHtml(lastError);
-  } else if (history.lastSyncAt || cloud.lastSyncAt || cloud.lastPublishedAt) {
+    bannerDesc = `${escapeHtml(lastError)} · Will automatically retry on periodic schedule (Telemetry: ${hbMinutes}m, History: ${histMinutes}m).`;
+  } else if (lastCombinedSyncAt) {
     bannerClass = 'success';
     bannerIcon = '✓';
-    bannerTitle = 'Synchronized &amp; Connected';
-    bannerDesc = `Last successful communication: ${prettyTime(history.lastSyncAt || cloud.lastSyncAt || cloud.lastPublishedAt)}`;
+    bannerTitle = 'Synchronized &amp; Sending Periodically';
+    bannerDesc = `Last data sent: ${prettyTime(lastCombinedSyncAt)} · Auto-sending Telemetry every ${hbMinutes}m and History every ${histMinutes}m.`;
   }
 
   // Determine Monitors which are already selected and monitored (enabled)
@@ -1771,30 +1813,25 @@ async function renderRemoteData(content) {
 
   const isNoneSelected = parsedTypes.includes('none');
   const isAllSelected = !isNoneSelected && (parsedTypes.length === 0 || parsedTypes.includes('all'));
-  const selectedTypes = new Set();
+  const activeFilteredTypes = [];
   if (!isNoneSelected) {
     for (const t of availableMonitorTypes) {
-      if (isAllSelected) {
-        selectedTypes.add(t.id);
-      } else if (
+      if (
+        isAllSelected ||
         parsedTypes.includes(t.id) ||
         ((t.id === 'ping' || t.id === 'icmp') && (parsedTypes.includes('ping') || parsedTypes.includes('icmp')))
       ) {
-        selectedTypes.add(t.id);
+        activeFilteredTypes.push(t);
       }
     }
-    if (!isAllSelected && selectedTypes.size === 0 && availableMonitorTypes.length > 0) {
-      availableMonitorTypes.forEach((t) => selectedTypes.add(t.id));
+    if (!isAllSelected && activeFilteredTypes.length === 0 && availableMonitorTypes.length > 0) {
+      activeFilteredTypes.push(...availableMonitorTypes);
     }
   }
 
-  const computeTypesSettingValue = (formEl) => {
-    if (!formEl || availableMonitorTypes.length === 0) return settings.historySyncTargetTypes || 'all';
-    const checkedBoxes = Array.from(formEl.querySelectorAll('input[name="types"]:checked')).map((cb) => cb.value);
-    if (checkedBoxes.length === 0) return 'none';
-    if (checkedBoxes.length === availableMonitorTypes.length) return 'all';
-    return checkedBoxes.join(',');
-  };
+  // Filter selectedMonitoredTargets by activeFilteredTypes so summary reflects exact targets being dispatched
+  const activeTypeIds = new Set(activeFilteredTypes.map((t) => t.id));
+  const dispatchedTargets = selectedMonitoredTargets.filter((t) => activeTypeIds.has(String(t.type || '').trim().toLowerCase()));
 
   const latestSingleHistoryPayload = (() => {
     const raw = history.lastPayload;
@@ -1812,14 +1849,11 @@ async function renderRemoteData(content) {
     return raw;
   })();
 
-  const isHeartbeatActive = Boolean(cloud.enabled || settings.cloudSyncEnabled || serverBaseUrl);
-  const isHistorySyncActive = Boolean(history.enabled || settings.historySyncEnabled || serverBaseUrl);
-
   content.innerHTML = `
     <header class="page-header">
       <div>
         <h2>Remote Server Activity &amp; Telemetry</h2>
-        <p>Real-time status of payloads transmitted to the remote diagnostics server, error feedback, and monitor type dispatch filters.</p>
+        <p>Live periodic transmission status, active server configuration summary, and latest dispatched JSON payloads.</p>
       </div>
       ${liveClockMarkup()}
     </header>
@@ -1849,8 +1883,8 @@ async function renderRemoteData(content) {
 
     <article class="card" style="margin-bottom:18px;">
       <div class="panel-title">
-        <h3>Active Server Configuration &amp; Credentials</h3>
-        <span>${isAdmin() ? '<button class="button ghost small" id="edit-server-config-btn" type="button" style="padding:2px 8px;font-size:11px;">Edit in Server Tab →</button>' : 'Target Server'}</span>
+        <h3>Active Server Configuration &amp; Periodic Schedule</h3>
+        <span>${isAdmin() ? '<button class="button secondary small" id="edit-server-config-btn" type="button" style="padding:3px 10px;font-size:11px;">⚙ Configure in Server Tab →</button>' : 'Target Server'}</span>
       </div>
       <div class="panel-body">
         <div class="info-grid">
@@ -1867,71 +1901,39 @@ async function renderRemoteData(content) {
             <strong>${escapeHtml(settings.terminalHostname || serverConfig.terminalHostname || 'Default OS hostname')}</strong>
           </div>
           <div class="info-item">
-            <span>Heartbeat (/api/sync)</span>
-            <strong>${isHeartbeatActive ? `Enabled (every ${settings.cloudHeartbeatMinutes ?? 5}m)` : '<span style="color:var(--text-muted)">Paused / Disabled</span>'}</strong>
+            <span>Telemetry Sync (/api/sync)</span>
+            <strong>${isHeartbeatActive ? `Active · Every ${hbMinutes} min` : '<span style="color:var(--text-muted)">Paused / Disabled</span>'}</strong>
           </div>
           <div class="info-item">
             <span>History Sync (/api/history)</span>
-            <strong>${isHistorySyncActive ? `Enabled (every ${settings.historySyncIntervalMinutes ?? 5}m)` : '<span style="color:var(--text-muted)">Paused / Disabled</span>'}</strong>
+            <strong>${isHistorySyncActive ? `Active · Every ${histMinutes} min` : '<span style="color:var(--text-muted)">Paused / Disabled</span>'}</strong>
           </div>
           <div class="info-item">
             <span>Commissioned UUIDs</span>
             <strong>${escapeHtml(settings.serviceUuid || 'Default')} / ${escapeHtml(settings.deviceUuid || 'Default')}</strong>
           </div>
-          <div class="info-item" style="grid-column: 1 / -1;">
-            <span>Selected &amp; Monitored Targets (${selectedMonitoredTargets.length})</span>
-            <strong>${selectedMonitoredTargets.length ? escapeHtml(selectedMonitoredTargets.map((t) => `${t.name} (${prettyType(t.type)})`).join(', ')) : 'No active monitors selected'}</strong>
+          <div class="info-item">
+            <span>Selected Monitored Types (${activeFilteredTypes.length})</span>
+            <strong>${activeFilteredTypes.length ? escapeHtml(activeFilteredTypes.map((t) => t.label).join(', ')) : 'None selected'}</strong>
+          </div>
+          <div class="info-item">
+            <span>Selected &amp; Monitored Targets (${dispatchedTargets.length})</span>
+            <strong>${dispatchedTargets.length ? escapeHtml(dispatchedTargets.map((t) => `${t.name} (${prettyType(t.type)})`).join(', ')) : 'No active monitors selected'}</strong>
           </div>
         </div>
       </div>
     </article>
 
-    <form id="remote-types-form">
-      <article class="card">
-        <div class="panel-title">
-          <h3>Select Monitored Types to Send</h3>
-          <span>POST /api/history filter (${availableMonitorTypes.length} active type${availableMonitorTypes.length === 1 ? '' : 's'})</span>
-        </div>
-        <div class="panel-body settings-list">
-          <p class="helper" style="margin:0 0 12px">Showing monitor types from the monitors that are currently selected and enabled for monitoring. Unselected types will remain local-only.</p>
-          ${availableMonitorTypes.length ? `
-            <div style="display:flex;gap:8px;margin-bottom:12px">
-              <button class="button ghost small" type="button" id="types-select-all">Select All</button>
-              <button class="button ghost small" type="button" id="types-deselect-all">Deselect All</button>
-            </div>
-            <div class="types-grid">
-              ${availableMonitorTypes.map((t) => `
-                <label class="type-check-label">
-                  <input type="checkbox" name="types" value="${escapeHtml(t.id)}" ${selectedTypes.has(t.id) ? 'checked' : ''} />
-                  <div class="type-title-group">
-                    <strong>${escapeHtml(t.label)}</strong>
-                    <small>${escapeHtml(t.desc)} · <em>Monitors: ${escapeHtml(t.monitorNames.join(', '))}</em></small>
-                  </div>
-                </label>
-              `).join('')}
-            </div>
-            <div class="actions" style="margin-top:16px;padding:0">
-              <button class="button" type="submit" ${!isAdmin() ? 'disabled' : ''}>Save Monitored Types Filter</button>
-              <span class="helper settings-help">Filters state transition history events and monitor types sent to <code>POST /api/history</code>.</span>
-            </div>
-          ` : `
-            <div class="empty">No active monitors are currently selected and monitored. Enable or select monitors in the Monitors / Server tab first.</div>
-          `}
-          <div class="error" id="types-error"></div>
-        </div>
-      </article>
-    </form>
-
     <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(420px, 1fr));gap:20px;">
       <article class="card">
         <div class="panel-title">
           <h3>Monitor Status Changes (POST /api/history)</h3>
-          <span>${history.isSyncing ? '<span class="status-pill warning"><span class="spinner-pulse"></span> Sending</span>' : (history.lastError ? '<span class="status-pill down">Error</span>' : '<span class="status-pill good">Ready</span>')}</span>
+          <span>${history.isSyncing ? '<span class="status-pill warning"><span class="spinner-pulse"></span> Sending</span>' : (history.lastError ? '<span class="status-pill down">Error</span>' : (isHistorySyncActive ? `<span class="status-pill good">Auto · Every ${histMinutes}m</span>` : '<span class="status-pill">Paused</span>'))}</span>
         </div>
         <div class="panel-body">
           <div class="info-grid" style="margin-bottom:14px">
             <div class="info-item"><span>Endpoint</span><strong>${escapeHtml(historyEndpoint)}</strong></div>
-            <div class="info-item"><span>Last Dispatched</span><strong>${history.lastSyncAt ? prettyTime(history.lastSyncAt) : 'Never'}</strong></div>
+            <div class="info-item"><span>Last Dispatched</span><strong>${history.lastSyncAt ? prettyTime(history.lastSyncAt) : 'Waiting for first sync…'}</strong></div>
           </div>
           <div style="margin-bottom:12px">
             <strong style="display:block;margin-bottom:4px;font-size:0.85rem;color:var(--text-muted)">Latest Dispatched Request Body (Last 1 History Value)</strong>
@@ -1947,12 +1949,12 @@ async function renderRemoteData(content) {
       <article class="card">
         <div class="panel-title">
           <h3>Heartbeat &amp; Telemetry (POST /api/sync)</h3>
-          <span>${cloud.isPublishing ? '<span class="status-pill warning"><span class="spinner-pulse"></span> Sending</span>' : (cloud.lastError ? '<span class="status-pill down">Error</span>' : '<span class="status-pill good">Ready</span>')}</span>
+          <span>${cloud.isPublishing ? '<span class="status-pill warning"><span class="spinner-pulse"></span> Sending</span>' : (cloud.lastError ? '<span class="status-pill down">Error</span>' : (isHeartbeatActive ? `<span class="status-pill good">Auto · Every ${hbMinutes}m</span>` : '<span class="status-pill">Paused</span>'))}</span>
         </div>
         <div class="panel-body">
           <div class="info-grid" style="margin-bottom:14px">
             <div class="info-item"><span>Endpoint</span><strong>${escapeHtml(syncEndpoint)}</strong></div>
-            <div class="info-item"><span>Last Dispatched</span><strong>${(cloud.lastPublishedAt || cloud.lastSyncAt) ? prettyTime(cloud.lastPublishedAt || cloud.lastSyncAt) : 'Never'}</strong></div>
+            <div class="info-item"><span>Last Dispatched</span><strong>${(cloud.lastPublishedAt || cloud.lastSyncAt) ? prettyTime(cloud.lastPublishedAt || cloud.lastSyncAt) : 'Waiting for first sync…'}</strong></div>
           </div>
           <div style="margin-bottom:12px">
             <strong style="display:block;margin-bottom:4px;font-size:0.85rem;color:var(--text-muted)">Latest Dispatched Request Body</strong>
@@ -1976,25 +1978,11 @@ async function renderRemoteData(content) {
     await renderPage();
   });
 
-  const typesForm = document.getElementById('remote-types-form');
-
   document.getElementById('trigger-sync-now-btn')?.addEventListener('click', async (e) => {
     const btn = e.currentTarget;
     btn.disabled = true;
     btn.textContent = 'Sending…';
     try {
-      if (isAdmin() && typesForm && availableMonitorTypes.length > 0) {
-        const currentTypesValue = computeTypesSettingValue(typesForm);
-        const latestSettings = await request(() => remoteCare.getAppSettings(state.session.token));
-        if (latestSettings.historySyncTargetTypes !== currentTypesValue) {
-          state.settings = await request(() => remoteCare.saveAppSettings(state.session.token, {
-            ...latestSettings,
-            historySyncTargetTypes: currentTypesValue
-          }));
-        } else {
-          state.settings = latestSettings;
-        }
-      }
       const res = await request(() => remoteCare.triggerRemoteSync(state.session.token));
       const syncErr = res?.historySync?.error || res?.cloudSync?.error;
       if (syncErr) {
@@ -2016,35 +2004,6 @@ async function renderRemoteData(content) {
 
   document.getElementById('refresh-sync-view-btn')?.addEventListener('click', () => {
     renderRemoteData(content);
-  });
-
-  document.getElementById('types-select-all')?.addEventListener('click', () => {
-    content.querySelectorAll('#remote-types-form input[type="checkbox"]').forEach((cb) => { cb.checked = true; });
-  });
-
-  document.getElementById('types-deselect-all')?.addEventListener('click', () => {
-    content.querySelectorAll('#remote-types-form input[type="checkbox"]').forEach((cb) => { cb.checked = false; });
-  });
-
-  typesForm?.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const errBox = document.getElementById('types-error');
-    errBox.textContent = '';
-    try {
-      const latestSettings = await request(() => remoteCare.getAppSettings(state.session.token));
-      const typesValue = computeTypesSettingValue(typesForm);
-      const next = {
-        ...latestSettings,
-        historySyncTargetTypes: typesValue
-      };
-      state.settings = await request(() => remoteCare.saveAppSettings(state.session.token, next));
-      flash('Monitored types filter saved successfully.');
-      if (state.page === 'remote-data') {
-        await renderRemoteData(content);
-      }
-    } catch (err) {
-      errBox.textContent = err.message || 'Failed to save types filter.';
-    }
   });
 }
 
@@ -2611,10 +2570,9 @@ if (typeof remoteCare.onRemoteSyncUpdate === 'function') {
     if (!state.session) return;
     if (state.page === 'remote-data') {
       const content = document.getElementById('page-content');
-      if (content) renderRemoteData(content);
-    } else {
-      scheduleRefresh();
+      if (content) void renderRemoteData(content);
     }
+    scheduleRefresh();
   });
 }
 

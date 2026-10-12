@@ -121,6 +121,7 @@ let startedAtLogin = false;
 let cloudPublisher;
 let heartbeatService;
 let historySyncService;
+let remoteSyncWatchdogTimer;
 let currentTrayMenu = null;
 let lastTraySignature = '';
 const sessions = new SessionStore();
@@ -302,6 +303,7 @@ function completeShutdown() {
   if (shutdownComplete) return;
   shutdownComplete = true;
   if (trayClockTimer) clearInterval(trayClockTimer);
+  if (remoteSyncWatchdogTimer) clearInterval(remoteSyncWatchdogTimer);
   historySyncService?.stop();
   heartbeatService?.stop();
   cloudPublisher?.stop();
@@ -412,11 +414,16 @@ function getRemoteSyncSummary() {
     lastTelemetrySyncAt,
     lastHistorySyncAt,
     lastError,
+    telemetryIntervalMinutes: Number(settings.cloudHeartbeatMinutes) || 5,
     historyIntervalMinutes: Number(settings.historySyncIntervalMinutes) || 5
   };
 }
 
 function initializeCloudServices() {
+  if (remoteSyncWatchdogTimer) {
+    clearInterval(remoteSyncWatchdogTimer);
+    remoteSyncWatchdogTimer = null;
+  }
   if (cloudPublisher) {
     cloudPublisher.stop();
     cloudPublisher.removeAllListeners();
@@ -429,11 +436,19 @@ function initializeCloudServices() {
     historySyncService.removeAllListeners();
   }
 
-  cloudPublisher = new CloudPublisher({ database, getSettings: () => database.getAppSettings() });
-  cloudPublisher.on('batch_delivered', (data) => broadcast('remote-sync-update', { source: 'cloudPublisher', event: 'batch_delivered', data }));
+  cloudPublisher = new CloudPublisher({
+    database,
+    getSettings: () => database.getAppSettings(),
+    ensureHeartbeat: () => heartbeatService?.sendHeartbeat({ triggerPublish: false })
+  });
+  cloudPublisher.on('batch_delivered', (data) => {
+    broadcast('remote-sync-update', { source: 'cloudPublisher', event: 'batch_delivered', data });
+    broadcast('monitor-update', { type: 'remote_sync_completed', source: 'cloudPublisher' });
+  });
   cloudPublisher.on('error', (err) => {
     console.warn('[CloudPublisher] Network sync error:', err?.message || err);
     broadcast('remote-sync-update', { source: 'cloudPublisher', event: 'error', error: err?.message || String(err) });
+    broadcast('monitor-update', { type: 'remote_sync_error', source: 'cloudPublisher' });
   });
   cloudPublisher.start();
 
@@ -441,23 +456,38 @@ function initializeCloudServices() {
   heartbeatService.start();
 
   historySyncService = new HistorySyncService({ database, getSettings: () => database.getAppSettings() });
-  historySyncService.on('synced', (data) => broadcast('remote-sync-update', { source: 'historySync', event: 'synced', data }));
+  historySyncService.on('synced', (data) => {
+    broadcast('remote-sync-update', { source: 'historySync', event: 'synced', data });
+    broadcast('monitor-update', { type: 'remote_sync_completed', source: 'historySync' });
+  });
   historySyncService.on('error', (err) => {
     console.warn('[HistorySyncService] Network history sync error:', err?.message || err);
     broadcast('remote-sync-update', { source: 'historySync', event: 'error', error: err?.message || String(err) });
+    broadcast('monitor-update', { type: 'remote_sync_error', source: 'historySync' });
   });
   historySyncService.start();
+
+  // Watchdog to ensure periodic telemetry & history syncs fire on schedule
+  remoteSyncWatchdogTimer = setInterval(() => {
+    heartbeatService?.checkDue();
+    historySyncService?.checkDue();
+  }, 10_000);
+  if (!process.versions?.electron) {
+    remoteSyncWatchdogTimer.unref?.();
+  }
 
   // Ensure initial monitor check results recorded shortly after startup are synced promptly
   const initialSyncTimer = setTimeout(() => {
     if (cloudPublisher?.isEnabled()) {
-      cloudPublisher.publishPending().catch(() => {});
+      heartbeatService?.sendHeartbeat({ triggerPublish: true });
     }
     if (historySyncService?.isEnabled()) {
-      historySyncService.syncNow().catch(() => {});
+      historySyncService.syncNow({ force: true }).catch(() => {});
     }
   }, 3000);
-  initialSyncTimer.unref?.();
+  if (!process.versions?.electron) {
+    initialSyncTimer.unref?.();
+  }
 }
 
 function registerIpc() {
@@ -497,6 +527,8 @@ function registerIpc() {
 
   ipcMain.handle('dashboard', (_event, { token }) => {
     requireSession(token);
+    heartbeatService?.checkDue();
+    historySyncService?.checkDue();
     return {
       ...monitor.dashboard(),
       remoteSync: getRemoteSyncSummary()
@@ -688,6 +720,8 @@ function registerIpc() {
 
   ipcMain.handle('remote-sync-status', (_event, { token }) => {
     requireSession(token);
+    heartbeatService?.checkDue();
+    historySyncService?.checkDue();
     const settings = database.getAppSettings();
     const cloudStatus = cloudPublisher?.getStatus() || null;
     const historyStatus = historySyncService?.getStatus() || null;
@@ -705,6 +739,8 @@ function registerIpc() {
         deviceUuid: settings.deviceUuid,
         cloudSyncEnabled: Boolean(cloudStatus?.enabled ?? settings.cloudSyncEnabled),
         historySyncEnabled: Boolean(historyStatus?.enabled ?? settings.historySyncEnabled),
+        cloudHeartbeatMinutes: settings.cloudHeartbeatMinutes || 5,
+        telemetrySelection: settings.telemetrySelection || 'all',
         historySyncIntervalMinutes: settings.historySyncIntervalMinutes,
         historySyncTargetIds: settings.historySyncTargetIds,
         historySyncTargetTypes: settings.historySyncTargetTypes || 'all'
@@ -727,6 +763,7 @@ function registerIpc() {
       results.historySync = await historySyncService.syncNow({ force: true }).catch((err) => ({ error: err.message }));
     }
     broadcast('remote-sync-update', { type: 'manual_trigger', results });
+    broadcast('monitor-update', { type: 'remote_sync_completed', source: 'manual' });
     return results;
   });
 
@@ -738,6 +775,7 @@ function registerIpc() {
     }
     database.audit(session.userId, 'authorized_factory_reset', 'application', null, {});
     try {
+      if (remoteSyncWatchdogTimer) clearInterval(remoteSyncWatchdogTimer);
       monitor?.stop();
       cloudPublisher?.stop();
       heartbeatService?.stop();
@@ -856,11 +894,11 @@ function registerIpc() {
       cloudPublisher.restart();
     }
     if (heartbeatService) {
-      heartbeatService.restart();
+      heartbeatService.restart({ sendImmediate: true });
     }
     if (historySyncService) {
       historySyncService.lastError = null;
-      historySyncService.restart();
+      historySyncService.restart({ syncImmediate: true });
     }
     broadcast('monitor-update', { type: 'app_settings_updated', settings: saved });
     broadcast('remote-sync-update', { type: 'settings_updated', settings: saved });
@@ -922,9 +960,8 @@ app.whenReady().then(() => {
   monitor.on('update', (event) => {
     updateTray();
     broadcast('monitor-update', event);
-    if (historySyncService?.isEnabled() && !historySyncService.lastSyncAt) {
-      historySyncService.syncNow().catch(() => {});
-    }
+    heartbeatService?.checkDue();
+    historySyncService?.checkDue();
   });
   registerIpc();
   tray = new Tray(createTrayIcon());
@@ -935,7 +972,9 @@ app.whenReady().then(() => {
   }
   updateTray();
   trayClockTimer = setInterval(updateTray, 60_000);
-  trayClockTimer.unref?.();
+  if (!process.versions?.electron) {
+    trayClockTimer.unref?.();
+  }
   if (database.hasSuperAdmin()) {
     database.createDefaultTargets();
     monitor.start();

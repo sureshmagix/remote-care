@@ -251,10 +251,20 @@ test('history sync service builds preview and sends batch updating cursor', asyn
     assert.equal(cursor.lastId, sentBatch.history[0].id);
     assert.ok(cursor.lastSyncAt);
 
-    // Subsequent sync without new changes will produce 0 new entries
+    // Subsequent periodic sync without new state transitions dispatches latest snapshot per selected target
     const nextSync = await service.syncNow();
     assert.equal(nextSync.ok, true);
-    assert.equal(nextSync.sentCount, 0);
+    assert.equal(nextSync.sentCount, 1);
+    assert.equal(sentBatch.history.length, 1);
+    assert.equal(sentBatch.history[0].targetName, 'Gateway');
+
+    // Verify checkDue triggers sync when interval has elapsed
+    sentBatch = null;
+    service.lastSyncAt = new Date(Date.now() - (6 * 60 * 1000)).toISOString();
+    service.lastAttemptAt = Date.now() - (6 * 60 * 1000);
+    await service.checkDue();
+    assert.ok(sentBatch);
+    assert.equal(sentBatch.history.length, 1);
   } finally {
     database.close();
     fs.rmSync(directory, { recursive: true, force: true });

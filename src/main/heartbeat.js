@@ -6,17 +6,24 @@ class HeartbeatService {
     this.publisher = publisher;
     this.getSettings = getSettings || (() => database.getAppSettings());
     this.timer = null;
+    this.lastHeartbeatAt = 0;
+  }
+
+  getIntervalMinutes() {
+    const settings = this.getSettings();
+    return Math.max(1, Math.min(1440, Number.parseInt(settings?.cloudHeartbeatMinutes ?? 5, 10)));
   }
 
   start({ sendImmediate = true } = {}) {
     if (this.timer) return;
     if (sendImmediate) {
-      this.sendHeartbeat();
+      this.sendHeartbeat({ triggerPublish: true });
     }
-    const settings = this.getSettings();
-    const intervalMinutes = Math.max(1, Number.parseInt(settings?.cloudHeartbeatMinutes ?? 5, 10));
-    this.timer = setInterval(() => this.sendHeartbeat(), intervalMinutes * 60 * 1000);
-    this.timer.unref?.();
+    const intervalMinutes = this.getIntervalMinutes();
+    this.timer = setInterval(() => this.sendHeartbeat({ triggerPublish: true }), intervalMinutes * 60 * 1000);
+    if (!process.versions?.electron) {
+      this.timer.unref?.();
+    }
   }
 
   stop() {
@@ -29,6 +36,17 @@ class HeartbeatService {
   restart({ sendImmediate = true } = {}) {
     this.stop();
     this.start({ sendImmediate });
+  }
+
+  checkDue() {
+    if (!this.publisher?.isEnabled?.()) return;
+    if (this.publisher.isPublishing) return;
+    const intervalMs = this.getIntervalMinutes() * 60 * 1000;
+    const lastSyncMs = this.publisher.lastSyncAt ? new Date(this.publisher.lastSyncAt).getTime() : 0;
+    const baseline = Math.max(this.lastHeartbeatAt || 0, lastSyncMs || 0);
+    if (!baseline || (Date.now() - baseline >= intervalMs)) {
+      this.sendHeartbeat({ triggerPublish: true });
+    }
   }
 
   getSelectedMonitoredTargets(dashboard, settings) {
@@ -165,11 +183,15 @@ class HeartbeatService {
 
   sendHeartbeat({ triggerPublish = true } = {}) {
     try {
+      this.lastHeartbeatAt = Date.now();
       const telemetry = this.collectTelemetry();
       this.database.clearPendingHeartbeats?.();
       this.database.enqueueEvent('device.heartbeat', telemetry);
-      if (triggerPublish) {
-        this.publisher?.trigger()?.catch?.(() => {});
+      if (triggerPublish && this.publisher) {
+        const enabled = typeof this.publisher.isEnabled === 'function' ? this.publisher.isEnabled() : true;
+        if (enabled) {
+          this.publisher.trigger({ force: true })?.catch?.(() => {});
+        }
       }
       return telemetry;
     } catch (err) {

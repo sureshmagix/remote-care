@@ -4,10 +4,11 @@ const https = require('node:https');
 const { URL } = require('node:url');
 
 class CloudPublisher extends EventEmitter {
-  constructor({ database, getSettings }) {
+  constructor({ database, getSettings, ensureHeartbeat }) {
     super();
     this.database = database;
     this.getSettings = getSettings || (() => database.getAppSettings());
+    this.ensureHeartbeat = ensureHeartbeat || null;
     this.timer = null;
     this.isPublishing = false;
     this.lastSyncAt = null;
@@ -24,7 +25,9 @@ class CloudPublisher extends EventEmitter {
     this.timer = setInterval(() => {
       void this.publishPending().catch(() => {});
     }, resolvedIntervalMs);
-    this.timer.unref?.();
+    if (!process.versions?.electron) {
+      this.timer.unref?.();
+    }
     this.emit('started');
   }
 
@@ -85,7 +88,13 @@ class CloudPublisher extends EventEmitter {
 
     this.isPublishing = true;
     try {
-      const pending = this.database.getPendingOutboundEvents(batchSize);
+      let pending = this.database.getPendingOutboundEvents(batchSize);
+      if ((!pending || pending.length === 0) && (force || !this.lastSyncAt) && typeof this.ensureHeartbeat === 'function') {
+        try {
+          this.ensureHeartbeat();
+          pending = this.database.getPendingOutboundEvents(batchSize);
+        } catch (_) {}
+      }
       if (!pending || pending.length === 0) {
         return { publishedCount: 0 };
       }
@@ -218,10 +227,13 @@ class CloudPublisher extends EventEmitter {
       }
     }
     const pendingCount = this.database.getPendingOutboundCount?.() ?? 0;
+    const settings = this.getSettings();
+    const intervalMinutes = Math.max(1, Math.min(1440, Number.parseInt(settings?.cloudHeartbeatMinutes ?? 5, 10)));
     return {
       enabled: this.isEnabled(),
       protocol,
       endpoint: endpoint || null,
+      intervalMinutes,
       isPublishing: this.isPublishing,
       lastSyncAt: this.lastSyncAt,
       lastError: this.lastError,
