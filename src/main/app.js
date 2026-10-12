@@ -891,10 +891,12 @@ function registerIpc() {
     const saved = database.updateAppSettings(settings, session.userId);
     if (cloudPublisher) {
       cloudPublisher.lastError = null;
-      cloudPublisher.restart();
     }
     if (heartbeatService) {
       heartbeatService.restart({ sendImmediate: true });
+    }
+    if (cloudPublisher) {
+      cloudPublisher.restart();
     }
     if (historySyncService) {
       historySyncService.lastError = null;

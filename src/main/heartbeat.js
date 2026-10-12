@@ -54,7 +54,8 @@ class HeartbeatService {
     const rawIds = settings?.historySyncTargetIds;
     let filtered = rawTargets;
     if (rawIds && rawIds !== 'all' && String(rawIds).trim()) {
-      if (String(rawIds).trim().toLowerCase() === 'none') {
+      const cleanIds = String(rawIds).trim().toLowerCase();
+      if (cleanIds === 'none' || cleanIds === '__none__') {
         filtered = [];
       } else {
         const ids = new Set(String(rawIds).split(',').map((s) => Number.parseInt(s.trim(), 10)).filter((n) => Number.isInteger(n) && n > 0));
@@ -69,11 +70,11 @@ class HeartbeatService {
       const types = Array.isArray(rawTypes)
         ? rawTypes.map((s) => String(s).trim().toLowerCase()).filter(Boolean)
         : String(rawTypes).split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
-      if (types.includes('none')) {
+      if (types.includes('none') || types.includes('__none__')) {
         filtered = [];
       } else if (!types.includes('all') && types.length > 0) {
         filtered = filtered.filter((t) => {
-          const tType = String(t.type || '').toLowerCase();
+          const tType = String(t.type || '').trim().toLowerCase();
           return types.some((rt) => (rt === 'icmp' || rt === 'ping') ? (tType === 'icmp' || tType === 'ping') : rt === tType);
         });
       }
@@ -94,6 +95,7 @@ class HeartbeatService {
     const device_uuid = settings?.deviceUuid?.trim() || settings?.device_uuid?.trim() || 'ASSIGNED_DEVICE_UUID';
 
     const monitoredTargets = this.getSelectedMonitoredTargets(dashboard, settings);
+    const selectedTargetIdSet = new Set(monitoredTargets.map((t) => Number(t.id)));
     const monitors = monitoredTargets.map((t) => ({
       id: t.targetUuid || String(t.id),
       targetId: t.targetUuid || String(t.id),
@@ -111,6 +113,7 @@ class HeartbeatService {
     const healthyMonitors = monitoredTargets.filter((t) => t.status === 'healthy').length;
     const warningMonitors = monitoredTargets.filter((t) => t.status === 'warning').length;
     const downMonitors = monitoredTargets.filter((t) => t.status === 'down').length;
+    const selectedIncidentsCount = (dashboard?.activeIncidents || []).filter((inc) => selectedTargetIdSet.has(Number(inc.targetId))).length;
 
     const fullTelemetry = {
       hostname,
@@ -134,7 +137,7 @@ class HeartbeatService {
       },
       monitorNames: monitoredTargets.map((t) => t.name),
       monitors,
-      activeIncidentsCount: dashboard?.activeIncidents?.length || 0,
+      activeIncidentsCount: selectedIncidentsCount,
       service_uuid,
       device_uuid,
       timestamp: new Date().toISOString()

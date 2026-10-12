@@ -997,3 +997,108 @@ test('periodic sync runs automatically once serverBaseUrl is configured without 
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('only selected monitor types are sent to the remote server in /api/sync and /api/history', async () => {
+  const { database, directory } = temporaryDatabase();
+  try {
+    const admin = database.createInitialAdmin({ username: 'admin', displayName: 'Admin', password: 'password-123' });
+    const gwTarget = database.saveTarget({
+      name: 'Default gateway',
+      type: 'gateway',
+      intervalSeconds: 10,
+      timeoutMs: 1000,
+      failureThreshold: 1,
+      recoveryThreshold: 1,
+      severity: 'critical',
+      downMessage: 'Gateway down',
+      recoveryMessage: 'Gateway up',
+      enabled: true
+    }, admin.id);
+    const internetTarget = database.saveTarget({
+      name: 'Internet connection',
+      type: 'internet',
+      url: 'https://example.com',
+      intervalSeconds: 10,
+      timeoutMs: 1000,
+      failureThreshold: 1,
+      recoveryThreshold: 1,
+      severity: 'critical',
+      downMessage: 'Internet down',
+      recoveryMessage: 'Internet up',
+      enabled: true
+    }, admin.id);
+    const ifaceTarget = database.saveTarget({
+      name: 'Network interface',
+      type: 'interface',
+      intervalSeconds: 10,
+      timeoutMs: 1000,
+      failureThreshold: 1,
+      recoveryThreshold: 1,
+      severity: 'warning',
+      downMessage: 'Interface down',
+      recoveryMessage: 'Interface up',
+      enabled: true
+    }, admin.id);
+
+    // Select ONLY 'gateway' type to send
+    database.updateAppSettings({
+      cloudSyncEnabled: true,
+      historySyncEnabled: true,
+      serverBaseUrl: 'http://192.168.1.200:3999',
+      historySyncTargetTypes: 'gateway',
+      historySyncTargetIds: 'all'
+    }, admin.id);
+
+    // Record checks for all 3 targets (including a down check on unselected internetTarget)
+    database.recordCheck(gwTarget.id, { ok: true, status: 'healthy', latencyMs: 3, message: 'Gateway OK' });
+    database.recordCheck(internetTarget.id, { ok: false, status: 'down', latencyMs: 100, message: 'Internet unreachable' });
+    database.recordCheck(ifaceTarget.id, { ok: true, status: 'healthy', latencyMs: 1, message: 'Interface up' });
+
+    const publisher = new CloudPublisher({ database, getSettings: () => database.getAppSettings() });
+    const heartbeat = new HeartbeatService({ database, publisher, getSettings: () => database.getAppSettings() });
+    const historySync = new HistorySyncService({ database, getSettings: () => database.getAppSettings() });
+
+    let sentSyncBatch = null;
+    publisher.sendBatch = async (_url, _token, batch) => {
+      sentSyncBatch = batch;
+      return { ok: true, statusCode: 200, responseData: { received: true } };
+    };
+
+    let sentHistoryPayload = null;
+    historySync.sendPayload = async (_url, _token, payload) => {
+      sentHistoryPayload = payload;
+      return { ok: true, statusCode: 200, responseData: { received: true } };
+    };
+
+    heartbeat.sendHeartbeat({ triggerPublish: false });
+    await publisher.publishPending(25, { force: true });
+    await historySync.syncNow({ force: true });
+
+    // 1. Verify /api/sync only includes the 'gateway' monitor and does NOT include 'internet' or 'interface' or unselected incidents
+    assert.ok(sentSyncBatch);
+    assert.equal(sentSyncBatch.events.length, 1);
+    assert.equal(sentSyncBatch.events[0].eventType, 'device.heartbeat');
+    const hbPayload = sentSyncBatch.events[0].payload;
+    assert.deepEqual(hbPayload.monitorNames, ['Default gateway']);
+    assert.equal(hbPayload.monitors.length, 1);
+    assert.equal(hbPayload.monitors[0].type, 'gateway');
+    assert.equal(hbPayload.monitors[0].name, 'Default gateway');
+    assert.equal(hbPayload.monitorsSummary.total, 1);
+    assert.equal(hbPayload.monitorsSummary.healthy, 1);
+    assert.equal(hbPayload.monitorsSummary.down, 0);
+    assert.equal(hbPayload.activeIncidentsCount, 0);
+
+    // 2. Verify /api/history only includes history for 'gateway'
+    assert.ok(sentHistoryPayload);
+    assert.deepEqual(sentHistoryPayload.targetTypes, ['gateway']);
+    assert.deepEqual(sentHistoryPayload.targetNames, ['Default gateway']);
+    assert.deepEqual(sentHistoryPayload.targetIds, [gwTarget.id]);
+    assert.equal(sentHistoryPayload.history.length, 1);
+    assert.equal(sentHistoryPayload.history[0].targetType, 'gateway');
+    assert.equal(sentHistoryPayload.history[0].targetName, 'Default gateway');
+  } finally {
+    database.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+

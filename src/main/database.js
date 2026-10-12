@@ -982,11 +982,40 @@ class LocalDatabase {
     const finalTarget = this.getTarget(targetId);
     if (incidentEvent) {
       incidentEvent.target = finalTarget;
-      this.enqueueEvent(incidentEvent.kind === 'down' ? 'incident.opened' : 'incident.resolved', {
-        targetId, targetName: finalTarget.name, locationName: finalTarget.locationName, type: finalTarget.type, severity: finalTarget.severity, message: incidentEvent.message, occurredAt: timestamp
-      });
+      if (this.isTargetSelectedForSync(finalTarget)) {
+        this.enqueueEvent(incidentEvent.kind === 'down' ? 'incident.opened' : 'incident.resolved', {
+          targetId, targetName: finalTarget.name, locationName: finalTarget.locationName, type: finalTarget.type, severity: finalTarget.severity, message: incidentEvent.message, occurredAt: timestamp
+        });
+      }
     }
     return { target: finalTarget, result, status, previousStatus: target.status, transition, incidentEvent, wasHealthy, recorded };
+  }
+
+  isTargetSelectedForSync(target, settings = null) {
+    if (!target || target.enabled === false) return false;
+    const cfg = settings || this.getAppSettings();
+    const rawIds = cfg?.historySyncTargetIds;
+    if (rawIds && rawIds !== 'all' && String(rawIds).trim()) {
+      const cleanIds = String(rawIds).trim().toLowerCase();
+      if (cleanIds === 'none') return false;
+      const ids = new Set(cleanIds.split(',').map((s) => Number.parseInt(s.trim(), 10)).filter((n) => Number.isInteger(n) && n > 0));
+      if (ids.size > 0 && !ids.has(Number(target.id))) {
+        return false;
+      }
+    }
+    const rawTypes = cfg?.historySyncTargetTypes;
+    if (rawTypes && rawTypes !== 'all' && String(rawTypes).trim()) {
+      const types = Array.isArray(rawTypes)
+        ? rawTypes.map((s) => String(s).trim().toLowerCase()).filter(Boolean)
+        : String(rawTypes).split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+      if (types.includes('none') || types.includes('__none__')) return false;
+      if (!types.includes('all') && types.length > 0) {
+        const tType = String(target.type || '').trim().toLowerCase();
+        const matched = types.some((rt) => (rt === 'icmp' || rt === 'ping') ? (tType === 'icmp' || tType === 'ping') : rt === tType);
+        if (!matched) return false;
+      }
+    }
+    return true;
   }
 
   recordNotification({ incidentId = null, targetId = null, locationName = DEFAULT_LOCATION_NAME, kind, title, body, details = {} }) {
@@ -1070,16 +1099,25 @@ class LocalDatabase {
       params.push(...targetIds.map(Number));
     }
 
-    if (Array.isArray(targetTypes) && targetTypes.length > 0) {
+    if (Array.isArray(targetTypes)) {
+      if (targetTypes.length === 0) {
+        return [];
+      }
       const expanded = new Set();
       for (const item of targetTypes) {
         const clean = String(item).trim().toLowerCase();
         if (!clean) continue;
+        if (clean === 'none' || clean === '__none__') {
+          return [];
+        }
         expanded.add(clean);
         if (clean === 'icmp' || clean === 'ping') {
           expanded.add('icmp');
           expanded.add('ping');
         }
+      }
+      if (expanded.size === 0) {
+        return [];
       }
       const expandedList = [...expanded];
       const placeholders = expandedList.map(() => '?').join(',');

@@ -37,7 +37,7 @@ function log(level, message, meta = '') {
 
 async function main() {
   const dbPath = resolveDefaultDbPath();
-  log('info', `Starting Remote Care Monitor Daemon v2.0.4...`);
+  log('info', `Starting Remote Care Monitor Daemon v2.0.5...`);
   log('info', `Database path: ${dbPath}`);
 
   const database = new LocalDatabase(dbPath);
@@ -45,7 +45,7 @@ async function main() {
   database.startRuntimeSession(sessionId, {
     mode: 'headless_daemon',
     platform: process.platform,
-    version: '2.0.4'
+    version: '2.0.5'
   });
 
   const cloudPublisher = new CloudPublisher({

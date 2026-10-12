@@ -565,15 +565,19 @@ function createTestServer({ port = PORT, authToken = AUTH_TOKEN } = {}) {
             // or cross warning thresholds (usedPercent >= 85%), skipping identical repeated heartbeats.
             const isWarning = (memUsedPercent !== null && memUsedPercent >= 85) ||
                               (storageUsedPercent !== null && storageUsedPercent >= 85);
+            const monitorsSignature = Array.isArray(hb.monitors)
+              ? JSON.stringify(hb.monitors.map((m) => `${m.id || m.name}:${m.type}:${m.status}`))
+              : (Array.isArray(hb.monitorNames) ? JSON.stringify(hb.monitorNames) : null);
             const prev = lastHeartbeatMetricsMap.get(hostname);
             const levelsChanged = !prev ||
               prev.memUsedPercent !== memUsedPercent ||
               prev.storageUsedPercent !== storageUsedPercent ||
+              prev.monitorsSignature !== monitorsSignature ||
               (prev.memUsedMb !== null && memUsedMb !== null && Math.abs(prev.memUsedMb - memUsedMb) >= 1);
 
             if (isWarning || levelsChanged) {
               insertedCount++;
-              lastHeartbeatMetricsMap.set(hostname, { memUsedPercent, memUsedMb, storageUsedPercent });
+              lastHeartbeatMetricsMap.set(hostname, { memUsedPercent, memUsedMb, storageUsedPercent, monitorsSignature });
               receivedHeartbeats.unshift({ ...hb, receivedAt: new Date().toISOString() });
               if (receivedHeartbeats.length > MAX_LOGS) receivedHeartbeats.pop();
               console.log(`   [Heartbeat Saved] Host: ${hb.hostname} | Memory: ${memUsedPercent}% | Warning: ${isWarning}`);

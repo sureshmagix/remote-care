@@ -116,50 +116,63 @@ class HistorySyncService extends EventEmitter {
     const settings = this.getSettings();
     const clientHostname = settings?.terminalHostname?.trim() || settings?.clientHostname?.trim() || os.hostname();
 
+    const allActiveTargets = (this.database.listTargets?.() || []).filter((t) => t.enabled !== false);
     const matchingTargets = this.getActiveMonitoredTargets(resolvedTargets).filter((t) => {
       if (!resolvedTypes) return true;
-      if (resolvedTypes.includes('__none__')) return false;
-      const tType = String(t.type || '').toLowerCase();
+      if (resolvedTypes.includes('__none__') || resolvedTypes.includes('none')) return false;
+      const tType = String(t.type || '').trim().toLowerCase();
       return resolvedTypes.some((rt) => (rt === 'icmp' || rt === 'ping') ? (tType === 'icmp' || tType === 'ping') : rt === tType);
     });
 
+    const matchingTargetIds = matchingTargets.map((t) => Number(t.id));
+
     let entries = [];
-    if (previewRecent) {
-      entries = this.database.getHistoryChanges({
-        targetIds: resolvedTargets,
-        targetTypes: resolvedTypes,
-        onlyEnabled: true,
-        limit,
-        reverse: true
-      });
-    } else {
-      entries = this.database.getHistoryChanges({
-        targetIds: resolvedTargets,
-        targetTypes: resolvedTypes,
-        onlyEnabled: true,
-        sinceId: cursor.lastId,
-        limit: 100
-      });
-      if (entries.length === 0) {
+    if (matchingTargetIds.length > 0) {
+      if (previewRecent) {
         entries = this.database.getHistoryChanges({
-          targetIds: resolvedTargets,
+          targetIds: matchingTargetIds,
           targetTypes: resolvedTypes,
           onlyEnabled: true,
-          latestPerTarget: true,
+          limit,
+          reverse: true
+        });
+      } else {
+        entries = this.database.getHistoryChanges({
+          targetIds: matchingTargetIds,
+          targetTypes: resolvedTypes,
+          onlyEnabled: true,
+          sinceId: cursor.lastId,
           limit: 100
         });
+        if (entries.length === 0) {
+          entries = this.database.getHistoryChanges({
+            targetIds: matchingTargetIds,
+            targetTypes: resolvedTypes,
+            onlyEnabled: true,
+            latestPerTarget: true,
+            limit: 100
+          });
+        }
       }
     }
 
     const displayTypes = resolvedTypes === null
       ? (matchingTargets.length > 0 ? [...new Set(matchingTargets.map((t) => (t.type === 'ping' ? 'icmp' : t.type)))] : 'all')
-      : [...new Set(resolvedTypes.filter((t) => t !== '__none__').map((t) => (t === 'ping' ? 'icmp' : t)))];
+      : [...new Set(resolvedTypes.filter((t) => t !== '__none__' && t !== 'none').map((t) => (t === 'ping' ? 'icmp' : t)))];
+
+    const isAllMatching = resolvedTargets === null && (
+      resolvedTypes === null ||
+      (!resolvedTypes.includes('__none__') && !resolvedTypes.includes('none') && matchingTargets.length === allActiveTargets.length)
+    );
+    const payloadTargetIds = isAllMatching
+      ? 'all'
+      : (resolvedTargets !== null ? resolvedTargets : matchingTargetIds);
 
     return {
       version: '2.0',
       dispatchedAt: new Date().toISOString(),
       clientHostname,
-      targetIds: resolvedTargets === null ? 'all' : resolvedTargets,
+      targetIds: payloadTargetIds,
       targetTypes: displayTypes,
       targetNames: matchingTargets.map((t) => t.name),
       monitors: matchingTargets.map((t) => ({
@@ -265,9 +278,15 @@ class HistorySyncService extends EventEmitter {
         this.database.setHistorySyncCursor(this.database.getHistorySyncCursor().lastId, payload.dispatchedAt);
       }
 
+      const allowedIds = new Set(payload.monitors.map((m) => String(m.id)));
+      const allowedNames = new Set(payload.targetNames.map((n) => String(n).toLowerCase()));
+      const prevFilteredHistory = (this.lastPayload?.history || []).filter((h) =>
+        allowedIds.has(String(h.targetId)) || allowedNames.has(String(h.targetName || h.name || '').toLowerCase())
+      );
+
       const lastSingleHistory = payload.history.length > 0
         ? payload.history.slice(-1)
-        : (this.lastPayload?.history?.length > 0 ? this.lastPayload.history.slice(-1) : []);
+        : prevFilteredHistory.slice(-1);
 
       this.lastSyncAt = payload.dispatchedAt;
       this.lastSentCount = payload.history.length;
@@ -333,6 +352,17 @@ class HistorySyncService extends EventEmitter {
 
   restart({ syncImmediate = true } = {}) {
     this.stop();
+    if (this.lastPayload) {
+      try {
+        const preview = this.buildPayload({ previewRecent: true, limit: 1 });
+        const lastSingle = preview.history.slice(-1);
+        this.lastPayload = {
+          ...preview,
+          entriesCount: lastSingle.length,
+          history: lastSingle
+        };
+      } catch (_) {}
+    }
     this.start({ syncImmediate });
   }
 

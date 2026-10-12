@@ -29,12 +29,13 @@ button { cursor: pointer; }
 h2 { margin: 0 0 7px; font-size: 23px; letter-spacing: -.025em; }
 .helper { color: var(--muted); line-height: 1.55; margin: 0 0 24px; font-size: 14px; }
 
-.field { display: grid; gap: 7px; margin: 0 0 15px; }
+.field { display: grid; gap: 7px; margin: 0 0 15px; min-width: 0; }
 .field label { color: #c7d9e4; font-size: 13px; font-weight: 650; }
-input, select, textarea { border: 1px solid var(--line); border-radius: 9px; padding: 10px 11px; color: var(--text); background: #081a28; outline: none; }
+input, select, textarea { border: 1px solid var(--line); border-radius: 9px; padding: 10px 11px; color: var(--text); background: #081a28; outline: none; max-width: 100%; min-width: 0; }
 input:focus, select:focus, textarea:focus { border-color: var(--brand); box-shadow: 0 0 0 3px rgb(54 194 216 / 15%); }
 textarea { min-height: 72px; resize: vertical; }
 .two-col { display: grid; gap: 14px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.two-col > .field { min-width: 0; }
 .actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 20px; }
 
 .button { border: 1px solid transparent; border-radius: 9px; padding: 9px 13px; color: #04212a; background: var(--brand); font-size: 13px; font-weight: 750; }
@@ -673,30 +674,108 @@ body.desktop-notification { min-width: 0; min-height: 0; background: #07131f; }
   100% { transform: scale(0.8); opacity: 0.5; }
 }
 
-.types-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
-  gap: 10px;
-  margin-top: 10px;
-}
-.type-checkbox-item {
+.monitor-type-label-row {
   display: flex;
+  justify-content: space-between;
   align-items: center;
   gap: 10px;
-  padding: 8px 12px;
-  background: #0f172a;
+}
+.monitor-type-counter {
+  font-size: 11.5px;
+  font-weight: 650;
+  padding: 2px 9px;
+  border-radius: 99px;
   border: 1px solid var(--line);
-  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--muted);
+}
+.monitor-type-counter.has-selection {
+  border-color: rgba(45, 212, 161, 0.45);
+  background: rgba(45, 212, 161, 0.12);
+  color: #8ef1cf;
+}
+.monitor-type-counter.none-selected {
+  border-color: rgba(245, 184, 74, 0.45);
+  background: rgba(245, 184, 74, 0.12);
+  color: #ffd683;
+}
+.types-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(245px, 1fr));
+  gap: 10px;
+  margin-top: 8px;
+}
+.type-check-label,
+.type-checkbox-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  padding: 11px 13px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
   cursor: pointer;
-  transition: border-color 0.15s, background-color 0.15s;
+  transition: border-color 0.15s ease, background-color 0.15s ease, box-shadow 0.15s ease;
   font-size: 13px;
 }
+.type-check-label:hover,
 .type-checkbox-item:hover {
-  background: #1e293b;
-  border-color: var(--accent, #38bdf8);
+  background: #14324a;
+  border-color: var(--brand);
 }
+.type-check-label.is-selected {
+  background: #0f2c40;
+  border-color: rgba(54, 194, 216, 0.6);
+  box-shadow: inset 0 0 0 1px rgba(54, 194, 216, 0.18);
+}
+.type-check-label input[type="checkbox"],
 .type-checkbox-item input[type="checkbox"] {
+  width: 17px;
+  height: 17px;
+  margin-top: 2px;
+  flex-shrink: 0;
+  accent-color: var(--brand);
   cursor: pointer;
+}
+.type-title-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+.type-title-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.type-title-top strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+}
+.type-desc {
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+.type-targets-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 4px;
+}
+.type-target-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border-radius: 5px;
+  background: rgba(54, 194, 216, 0.12);
+  border: 1px solid rgba(54, 194, 216, 0.25);
+  color: #bae6fd;
+  font-size: 11px;
+  font-weight: 600;
 }
 .type-badge {
   font-size: 10px;

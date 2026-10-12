@@ -1,6 +1,6 @@
 {
   "name": "remote-care-monitor",
-  "version": "2.0.4",
+  "version": "2.0.5",
   "description": "Cross-platform network, target, system resource, and headless server monitor.",
   "homepage": "https://archidtech.in",
   "desktopName": "remote-care-monitor",

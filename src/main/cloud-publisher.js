@@ -41,7 +41,102 @@ class CloudPublisher extends EventEmitter {
 
   restart() {
     this.stop();
+    if (this.lastPayload && Array.isArray(this.lastPayload.events)) {
+      const latestSettings = this.getSettings();
+      this.lastPayload = {
+        ...this.lastPayload,
+        events: this.lastPayload.events
+          .map((ev) => ({
+            ...ev,
+            payload: this.filterEventPayload(ev.eventType, { ...(ev.payload || {}) }, latestSettings)
+          }))
+          .filter((ev) => ev.payload !== null)
+      };
+    }
     this.start();
+  }
+
+  isMonitorSelected(item, settings) {
+    if (!item) return false;
+    const rawIds = settings?.historySyncTargetIds;
+    if (rawIds && rawIds !== 'all' && String(rawIds).trim()) {
+      const cleanIds = String(rawIds).trim().toLowerCase();
+      if (cleanIds === 'none' || cleanIds === '__none__') return false;
+      const allowedNumericIds = new Set(cleanIds.split(',').map((s) => Number.parseInt(s.trim(), 10)).filter((n) => Number.isInteger(n) && n > 0));
+      if (allowedNumericIds.size > 0) {
+        const allTargets = this.database?.listTargets?.() || [];
+        const allowedKeys = new Set();
+        const allowedNames = new Set();
+        for (const t of allTargets) {
+          if (allowedNumericIds.has(Number(t.id))) {
+            allowedKeys.add(String(t.id));
+            if (t.targetUuid) allowedKeys.add(String(t.targetUuid));
+            if (t.name) allowedNames.add(String(t.name).toLowerCase());
+          }
+        }
+        const itemId = String(item.targetId ?? item.id ?? '');
+        const itemName = String(item.targetName ?? item.name ?? '').toLowerCase();
+        const idMatches = (itemId && (allowedKeys.has(itemId) || allowedNumericIds.has(Number(itemId)))) || (itemName && allowedNames.has(itemName));
+        if (!idMatches) return false;
+      }
+    }
+
+    const rawTypes = settings?.historySyncTargetTypes;
+    if (rawTypes && rawTypes !== 'all' && String(rawTypes).trim()) {
+      const types = Array.isArray(rawTypes)
+        ? rawTypes.map((s) => String(s).trim().toLowerCase()).filter(Boolean)
+        : String(rawTypes).split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+      if (types.includes('none') || types.includes('__none__')) return false;
+      if (!types.includes('all') && types.length > 0) {
+        const mType = String(item.type || item.targetType || '').trim().toLowerCase();
+        if (mType) {
+          const matched = types.some((rt) => (rt === 'icmp' || rt === 'ping') ? (mType === 'icmp' || mType === 'ping') : rt === mType);
+          if (!matched) return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  filterEventPayload(eventType, eventPayload, latestSettings) {
+    if (!eventPayload || typeof eventPayload !== 'object') return eventPayload;
+    if (eventType === 'incident.opened' || eventType === 'incident.resolved') {
+      if (!this.isMonitorSelected({
+        id: eventPayload.targetId,
+        targetId: eventPayload.targetId,
+        name: eventPayload.targetName || eventPayload.name,
+        type: eventPayload.type
+      }, latestSettings)) {
+        return null;
+      }
+      return eventPayload;
+    }
+
+    if (eventType === 'device.heartbeat') {
+      if (Array.isArray(eventPayload.monitors)) {
+        const filteredMonitors = eventPayload.monitors.filter((m) => this.isMonitorSelected(m, latestSettings));
+        eventPayload.monitors = filteredMonitors;
+        eventPayload.monitorNames = filteredMonitors.map((m) => m.name || m.targetName);
+        if (eventPayload.monitorsSummary) {
+          eventPayload.monitorsSummary = {
+            total: filteredMonitors.length,
+            healthy: filteredMonitors.filter((m) => m.status === 'healthy').length,
+            warning: filteredMonitors.filter((m) => m.status === 'warning').length,
+            down: filteredMonitors.filter((m) => m.status === 'down').length
+          };
+        }
+        if (typeof eventPayload.status === 'string') {
+          eventPayload.status = filteredMonitors.some((m) => m.status === 'down') ? 'down' : 'healthy';
+        }
+      } else if (Array.isArray(eventPayload.monitorNames)) {
+        const allTargets = (this.database?.listTargets?.() || []).filter((t) => t.enabled !== false);
+        const allowedNames = new Set(
+          allTargets.filter((t) => this.isMonitorSelected(t, latestSettings)).map((t) => t.name)
+        );
+        eventPayload.monitorNames = eventPayload.monitorNames.filter((name) => allowedNames.has(name));
+      }
+    }
+    return eventPayload;
   }
 
   trigger({ force = false } = {}) {
@@ -104,26 +199,37 @@ class CloudPublisher extends EventEmitter {
       const latestServiceUuid = latestSettings?.serviceUuid?.trim() || latestSettings?.service_uuid?.trim();
       const latestDeviceUuid = latestSettings?.deviceUuid?.trim() || latestSettings?.device_uuid?.trim();
 
+      const filteredEvents = [];
+      for (const row of pending) {
+        let eventPayload = typeof row.payload_json === 'string' ? JSON.parse(row.payload_json) : { ...(row.payload_json || {}) };
+        if (eventPayload && typeof eventPayload === 'object') {
+          if (latestHostname) eventPayload.hostname = latestHostname;
+          if (latestServiceUuid) eventPayload.service_uuid = latestServiceUuid;
+          if (latestDeviceUuid) eventPayload.device_uuid = latestDeviceUuid;
+          if (eventPayload.targetName && !eventPayload.name) {
+            eventPayload.name = eventPayload.targetName;
+          }
+          eventPayload = this.filterEventPayload(row.event_type, eventPayload, latestSettings);
+        }
+        if (eventPayload === null) continue;
+        filteredEvents.push({
+          id: row.id,
+          eventType: row.event_type,
+          payload: eventPayload,
+          createdAt: row.created_at
+        });
+      }
+
+      const deliveredIds = pending.map((p) => p.id);
+      if (filteredEvents.length === 0) {
+        this.database.markEventsDelivered(deliveredIds);
+        return { publishedCount: 0 };
+      }
+
       const payload = {
         version: '2.0',
         dispatchedAt: new Date().toISOString(),
-        events: pending.map((row) => {
-          const eventPayload = typeof row.payload_json === 'string' ? JSON.parse(row.payload_json) : { ...(row.payload_json || {}) };
-          if (eventPayload && typeof eventPayload === 'object') {
-            if (latestHostname) eventPayload.hostname = latestHostname;
-            if (latestServiceUuid) eventPayload.service_uuid = latestServiceUuid;
-            if (latestDeviceUuid) eventPayload.device_uuid = latestDeviceUuid;
-            if (eventPayload.targetName && !eventPayload.name) {
-              eventPayload.name = eventPayload.targetName;
-            }
-          }
-          return {
-            id: row.id,
-            eventType: row.event_type,
-            payload: eventPayload,
-            createdAt: row.created_at
-          };
-        })
+        events: filteredEvents
       };
 
       const authToken = this.getAuthToken();
@@ -133,14 +239,13 @@ class CloudPublisher extends EventEmitter {
       };
       const result = await this.sendBatch(endpoint, authToken, payload);
       this.lastResponse = result?.responseData || result;
-      const deliveredIds = pending.map((p) => p.id);
       this.database.markEventsDelivered(deliveredIds);
-      this.deliveredCount += deliveredIds.length;
+      this.deliveredCount += filteredEvents.length;
       this.lastSyncAt = new Date().toISOString();
       this.lastError = null;
 
-      this.emit('batch_delivered', { count: deliveredIds.length, timestamp: this.lastSyncAt, result });
-      return { publishedCount: deliveredIds.length, result };
+      this.emit('batch_delivered', { count: filteredEvents.length, timestamp: this.lastSyncAt, result });
+      return { publishedCount: filteredEvents.length, result };
     } catch (error) {
       this.lastError = error.message;
       this.lastResponse = null;

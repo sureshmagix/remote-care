@@ -342,11 +342,14 @@ function brandLogoMarkup() {
   </svg>`;
 }
 
+const APP_VERSION = '2.0.5';
+
 function renderAuth(setup = null) {
+  const ver = state.appInfo?.version || APP_VERSION;
   root.innerHTML = `
     <main class="auth-shell">
       <section class="auth-card">
-        <div class="brand"><div class="brand-mark">${brandLogoMarkup()}</div><div><h1>Remote Care Monitor</h1><p>Local network and service monitoring</p></div></div>
+        <div class="brand"><div class="brand-mark">${brandLogoMarkup()}</div><div><h1>Remote Care Monitor</h1><p>Local network &amp; service monitoring · v${escapeHtml(ver)}</p></div></div>
         <div id="auth-content"></div>
       </section>
     </main>`;
@@ -391,7 +394,12 @@ function renderAuth(setup = null) {
 }
 
 async function openDashboard() {
-  state.settings = await request(() => remoteCare.getAppSettings(state.session.token));
+  const [settings, appInfo] = await Promise.all([
+    request(() => remoteCare.getAppSettings(state.session.token)),
+    request(() => remoteCare.getAppInfo(state.session.token)).catch(() => null)
+  ]);
+  state.settings = settings;
+  if (appInfo) state.appInfo = appInfo;
   renderShell();
   await refreshDashboard(true);
   startDashboardPolling();
@@ -404,10 +412,11 @@ async function openDashboard() {
 
 function renderShell() {
   const role = isAdmin() ? 'Super Admin' : (isOperator() ? 'Operator' : 'Viewer');
+  const ver = state.appInfo?.version || APP_VERSION;
   root.innerHTML = `
     <main class="app-shell">
       <aside class="sidebar">
-        <div class="brand"><div class="brand-mark">${brandLogoMarkup()}</div><div><h1>Remote Care</h1><p>Local Monitor</p></div></div>
+        <div class="brand"><div class="brand-mark">${brandLogoMarkup()}</div><div><h1>Remote Care</h1><p>Local Monitor · v${escapeHtml(ver)}</p></div></div>
         <nav class="nav" aria-label="Dashboard navigation">
           <button data-page="overview">● Overview</button>
           <button data-page="monitors">◉ Monitors</button>
@@ -1105,11 +1114,10 @@ async function renderSettings(content) {
 
 const REMOTE_DATA_MONITOR_TYPES = [
   { id: 'http', label: 'HTTP / HTTPS Endpoints', desc: 'Web services and REST APIs' },
-  { id: 'icmp', label: 'ICMP Ping', desc: 'Direct ICMP echo response' },
+  { id: 'icmp', label: 'ICMP Ping', desc: 'Direct ICMP echo and host reachability' },
   { id: 'gateway', label: 'Default Gateway', desc: 'Local router / gateway availability' },
   { id: 'rtsp', label: 'RTSP Stream', desc: 'IP cameras and streaming video ports' },
   { id: 'disk', label: 'Disk Storage', desc: 'Filesystem and partition storage thresholds' },
-  { id: 'ping', label: 'Ping (ICMP)', desc: 'Standard ping host reachability' },
   { id: 'tcp', label: 'TCP Port', desc: 'Raw TCP socket connectivity' },
   { id: 'internet', label: 'Internet Connection', desc: 'External internet connectivity verification' },
   { id: 'interface', label: 'Network Interface', desc: 'Wi-Fi / Ethernet adapter connectivity' },
@@ -1120,6 +1128,11 @@ const REMOTE_DATA_MONITOR_TYPES = [
   { id: 'cpu', label: 'CPU Utilization', desc: 'Processor load and core saturation' },
   { id: 'command', label: 'Custom Shell Script', desc: 'CLI scripts and exit code evaluations' }
 ];
+
+function normalizeMonitorType(type) {
+  const t = String(type || '').trim().toLowerCase();
+  return t === 'ping' ? 'icmp' : t;
+}
 
 async function renderServer(content) {
   if (!isAdmin()) {
@@ -1149,23 +1162,67 @@ async function renderServer(content) {
     ? savedTargetIdsRaw.split(',').map((s) => Number(s.trim())).filter((n) => Number.isInteger(n) && n > 0)
     : null;
 
-  const isTargetChecked = (targetId) => {
-    if (isNoTargetsSaved) return false;
-    if (savedTargetIds === null || savedTargetIds.length === 0) return true; // default all checked
-    return savedTargetIds.includes(Number(targetId));
-  };
-
   // Parse saved historySyncTargetTypes
   const rawTypes = settings.historySyncTargetTypes;
   const parsedTypes = Array.isArray(rawTypes)
-    ? rawTypes.map((s) => String(s).trim().toLowerCase()).filter(Boolean)
+    ? rawTypes.map((s) => normalizeMonitorType(s)).filter(Boolean)
     : (typeof rawTypes === 'string' && rawTypes.trim()
-      ? rawTypes.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
+      ? rawTypes.split(',').map((s) => normalizeMonitorType(s)).filter(Boolean)
       : ['all']);
-  const isNoneTypeSaved = parsedTypes.includes('none');
+  const isNoneTypeSaved = parsedTypes.includes('none') || isNoTargetsSaved;
   const isAllTypeSaved = !isNoneTypeSaved && (parsedTypes.length === 0 || parsedTypes.includes('all'));
 
   const typeMetaById = new Map(REMOTE_DATA_MONITOR_TYPES.map((t) => [t.id, t]));
+
+  // Build deduplicated list of active monitor types and their associated targets
+  const computeAvailableMonitorTypes = () => {
+    const byType = new Map();
+    const seenTargetIds = new Set();
+    for (const target of activeTargets) {
+      if (seenTargetIds.has(target.id)) continue;
+      seenTargetIds.add(target.id);
+      const tType = normalizeMonitorType(target.type);
+      if (!tType) continue;
+      if (!byType.has(tType)) {
+        byType.set(tType, { targets: [], monitorNames: [] });
+      }
+      const group = byType.get(tType);
+      group.targets.push(target);
+      if (target.name && !group.monitorNames.includes(target.name)) {
+        group.monitorNames.push(target.name);
+      }
+    }
+    const list = [];
+    for (const [typeId, group] of byType.entries()) {
+      const meta = typeMetaById.get(typeId) || {
+        id: typeId,
+        label: prettyType(typeId),
+        desc: 'Active monitored check type'
+      };
+      list.push({
+        ...meta,
+        targets: group.targets,
+        monitorNames: group.monitorNames
+      });
+    }
+    return list;
+  };
+
+  const availableTypes = computeAvailableMonitorTypes();
+
+  // Initialize checked state per unique monitor type
+  const currentTypeSelection = new Set();
+  if (!isNoneTypeSaved) {
+    for (const t of availableTypes) {
+      const matchesType = isAllTypeSaved || parsedTypes.includes(t.id);
+      const matchesSavedIds = savedTargetIds === null || savedTargetIds.length === 0
+        ? true
+        : t.targets.some((target) => savedTargetIds.includes(Number(target.id)));
+      if (matchesType && matchesSavedIds) {
+        currentTypeSelection.add(t.id);
+      }
+    }
+  }
 
   content.innerHTML = `
     <header class="page-header">
@@ -1255,7 +1312,7 @@ async function renderServer(content) {
       </article>
 
       <article class="card">
-        <div class="panel-title"><h3>History Sync &amp; Monitor Filters Configuration</h3><span>Periodic POST /api/history</span></div>
+        <div class="panel-title"><h3>History Sync &amp; Monitor Type Filters</h3><span>Periodic POST /api/history &amp; /api/sync</span></div>
         <div class="panel-body settings-list">
           <label class="setting-row">
             <span><strong>Enable History of Changes Sync</strong><small>Automatically send monitor status changes and latest monitor snapshots to the server periodically.</small></span>
@@ -1275,40 +1332,19 @@ async function renderServer(content) {
           </div>
 
           <div class="field">
-            <label>Select Monitored Targets to Send</label>
-            <div class="monitor-select-box">
-              <div class="monitor-select-header">
-                <span>Select which active monitors are included in Remote Data transmission:</span>
-                <div class="btn-group">
-                  <button type="button" class="button secondary small" id="btn-select-all-monitors" style="padding:2px 8px;font-size:11px;">Select All</button>
-                  <button type="button" class="button secondary small" id="btn-deselect-all-monitors" style="padding:2px 8px;font-size:11px;">Deselect All</button>
-                </div>
-              </div>
-              <div class="monitor-select-grid" id="history-monitors-list">
-                ${activeTargets.length ? activeTargets.map((t) => `
-                  <label class="monitor-select-item">
-                    <input type="checkbox" data-history-target-id="${t.id}" data-target-type="${escapeHtml(String(t.type || '').toLowerCase())}" data-target-name="${escapeHtml(t.name)}" ${isTargetChecked(t.id) ? 'checked' : ''} />
-                    <div class="monitor-select-info">
-                      <span class="monitor-select-name">${escapeHtml(t.name)}</span>
-                      <span class="monitor-select-sub">${escapeHtml(prettyType(t.type))} · ${escapeHtml(t.locationName || 'Local')}</span>
-                    </div>
-                  </label>
-                `).join('') : '<span style="color:var(--muted);font-size:12px;">No active monitors enabled. Enable monitors in the Monitors tab first.</span>'}
-              </div>
+            <div class="monitor-type-label-row">
+              <label>Select Monitored Types to Send</label>
+              <span class="monitor-type-counter" id="selected-types-counter"></span>
             </div>
-          </div>
-
-          <div class="field">
-            <label>Select Monitored Types to Send</label>
             <div class="monitor-select-box">
               <div class="monitor-select-header">
-                <span>Filter monitor types from the selected &amp; monitored targets above:</span>
+                <span>Only selected monitor types (and their corresponding targets) will be transmitted to the remote server:</span>
                 <div class="btn-group">
-                  <button type="button" class="button secondary small" id="btn-select-all-types" style="padding:2px 8px;font-size:11px;">Select All Types</button>
-                  <button type="button" class="button secondary small" id="btn-deselect-all-types" style="padding:2px 8px;font-size:11px;">Deselect All Types</button>
+                  <button type="button" class="button secondary small" id="btn-select-all-types" style="padding:3px 10px;font-size:11px;">Select All</button>
+                  <button type="button" class="button secondary small" id="btn-deselect-all-types" style="padding:3px 10px;font-size:11px;">Deselect All</button>
                 </div>
               </div>
-              <div class="types-grid" id="server-types-list" style="margin-top:8px;"></div>
+              <div class="types-grid" id="server-types-list"></div>
             </div>
           </div>
         </div>
@@ -1316,7 +1352,7 @@ async function renderServer(content) {
 
       <div class="actions">
         <button class="button" type="submit">Save Server Configuration</button>
-        <span class="helper settings-help">Saves configuration and immediately activates automatic periodic transmission to the remote server.</span>
+        <span class="helper settings-help">Saves configuration and immediately updates periodic transmission filters for the remote server.</span>
       </div>
       <div class="error" id="server-error"></div>
     </form>`;
@@ -1324,137 +1360,120 @@ async function renderServer(content) {
   const form = document.getElementById('server-form');
   const error = document.getElementById('server-error');
   const typesListEl = document.getElementById('server-types-list');
+  const counterEl = document.getElementById('selected-types-counter');
 
-  document.getElementById('btn-open-remote-data-tab')?.addEventListener('click', async () => {
-    state.page = 'remote-data';
-    await renderPage();
-  });
+  const getSelectedTargetTypes = () => {
+    if (!availableTypes.length) return 'none';
+    const checkedBoxes = Array.from(form.querySelectorAll('input[name="types"]:checked')).map((cb) => normalizeMonitorType(cb.value));
+    if (checkedBoxes.length === 0) return 'none';
+    if (checkedBoxes.length === availableTypes.length) return 'all';
+    return checkedBoxes.join(',');
+  };
 
-  // Track which types are currently checked in the UI
-  const currentTypeSelection = new Set();
-  let initializedTypes = false;
-
-  const computeAvailableMonitorTypes = () => {
-    const checkedTargetBoxes = Array.from(form.querySelectorAll('[data-history-target-id]:checked'));
-    const byType = new Map();
-    for (const cb of checkedTargetBoxes) {
-      const tType = String(cb.dataset.targetType || '').trim().toLowerCase();
-      const tName = cb.dataset.targetName || '';
-      if (!tType) continue;
-      if (!byType.has(tType)) byType.set(tType, []);
-      byType.get(tType).push(tName);
+  const getSelectedTargetIds = () => {
+    if (!availableTypes.length) return 'none';
+    const checkedTypeSet = new Set(
+      Array.from(form.querySelectorAll('input[name="types"]:checked')).map((cb) => normalizeMonitorType(cb.value))
+    );
+    if (checkedTypeSet.size === 0) return 'none';
+    if (checkedTypeSet.size === availableTypes.length) return 'all';
+    const ids = [];
+    for (const t of availableTypes) {
+      if (checkedTypeSet.has(t.id)) {
+        for (const target of t.targets) {
+          ids.push(Number(target.id));
+        }
+      }
     }
-    const list = [];
-    for (const [typeId, monitorNames] of byType.entries()) {
-      const meta = typeMetaById.get(typeId) || {
-        id: typeId,
-        label: prettyType(typeId),
-        desc: 'Active monitored check type'
-      };
-      list.push({ ...meta, monitorNames });
+    return ids.length > 0 ? ids.join(',') : 'none';
+  };
+
+  const updateSelectionCounter = () => {
+    if (!counterEl) return;
+    const total = availableTypes.length;
+    const selectedCount = currentTypeSelection.size;
+    counterEl.textContent = total === 0
+      ? 'No active monitor types'
+      : `${selectedCount} of ${total} type${total === 1 ? '' : 's'} selected`;
+    counterEl.className = `monitor-type-counter ${selectedCount > 0 ? 'has-selection' : 'none-selected'}`;
+  };
+
+  const persistFilterSelection = async () => {
+    const selectedTargetTypes = getSelectedTargetTypes();
+    const selectedTargetIds = getSelectedTargetIds();
+    const next = {
+      ...state.settings,
+      historySyncTargetTypes: selectedTargetTypes,
+      historySyncTargetIds: selectedTargetIds
+    };
+    try {
+      state.settings = await request(() => remoteCare.saveAppSettings(state.session.token, next));
+    } catch {
+      // Ignore background save errors; explicit form submit will surface any error
     }
-    return list;
   };
 
   const renderAvailableTypes = () => {
     if (!typesListEl) return;
-    const availableTypes = computeAvailableMonitorTypes();
-    if (!initializedTypes) {
-      initializedTypes = true;
-      if (!isNoneTypeSaved) {
-        for (const t of availableTypes) {
-          if (isAllTypeSaved) {
-            currentTypeSelection.add(t.id);
-          } else if (
-            parsedTypes.includes(t.id) ||
-            ((t.id === 'ping' || t.id === 'icmp') && (parsedTypes.includes('ping') || parsedTypes.includes('icmp')))
-          ) {
-            currentTypeSelection.add(t.id);
-          }
-        }
-        if (!isAllTypeSaved && currentTypeSelection.size === 0 && availableTypes.length > 0) {
-          availableTypes.forEach((t) => currentTypeSelection.add(t.id));
-        }
-      }
-    } else {
-      // Auto-select newly added monitor types when user checks a monitor
-      for (const t of availableTypes) {
-        if (!typesListEl.querySelector(`input[name="types"][value="${CSS.escape(t.id)}"]`)) {
-          currentTypeSelection.add(t.id);
-        }
-      }
-    }
+    updateSelectionCounter();
 
     if (availableTypes.length === 0) {
-      typesListEl.innerHTML = '<span style="color:var(--muted);font-size:12px;">Select at least one active monitor above to filter its monitor types.</span>';
+      typesListEl.innerHTML = '<span style="color:var(--muted);font-size:12px;">No active monitors enabled. Enable monitors in the Monitors tab first.</span>';
       return;
     }
 
-    typesListEl.innerHTML = availableTypes.map((t) => `
-      <label class="type-check-label">
-        <input type="checkbox" name="types" value="${escapeHtml(t.id)}" ${currentTypeSelection.has(t.id) ? 'checked' : ''} />
-        <div class="type-title-group">
-          <strong>${escapeHtml(t.label)}</strong>
-          <small>${escapeHtml(t.desc)} · <em>Monitors: ${escapeHtml(t.monitorNames.join(', '))}</em></small>
-        </div>
-      </label>
-    `).join('');
+    typesListEl.innerHTML = availableTypes.map((t) => {
+      const checked = currentTypeSelection.has(t.id);
+      const targetBadges = t.targets.map((target) => {
+        const loc = target.locationName ? ` · ${target.locationName}` : '';
+        return `<span class="type-target-pill">${escapeHtml(target.name)}${escapeHtml(loc)}</span>`;
+      }).join('');
+      return `
+        <label class="type-check-label ${checked ? 'is-selected' : ''}">
+          <input type="checkbox" name="types" value="${escapeHtml(t.id)}" ${checked ? 'checked' : ''} />
+          <div class="type-title-group">
+            <div class="type-title-top">
+              <strong>${escapeHtml(t.label)}</strong>
+              <span class="type-badge">${escapeHtml(t.id.toUpperCase())}</span>
+            </div>
+            <small class="type-desc">${escapeHtml(t.desc)}</small>
+            <div class="type-targets-list">${targetBadges}</div>
+          </div>
+        </label>
+      `;
+    }).join('');
 
     typesListEl.querySelectorAll('input[name="types"]').forEach((cb) => {
       cb.addEventListener('change', () => {
-        if (cb.checked) currentTypeSelection.add(cb.value);
-        else currentTypeSelection.delete(cb.value);
+        const val = normalizeMonitorType(cb.value);
+        if (cb.checked) currentTypeSelection.add(val);
+        else currentTypeSelection.delete(val);
+        const cardLabel = cb.closest('.type-check-label');
+        if (cardLabel) cardLabel.classList.toggle('is-selected', cb.checked);
+        updateSelectionCounter();
+        persistFilterSelection();
       });
     });
   };
 
   renderAvailableTypes();
 
-  form.querySelectorAll('[data-history-target-id]').forEach((cb) => {
-    cb.addEventListener('change', () => renderAvailableTypes());
-  });
-
-  // Helper to extract currently checked monitor IDs from UI
-  const getSelectedTargetIds = () => {
-    const checkboxes = form.querySelectorAll('[data-history-target-id]');
-    if (!checkboxes.length) return 'all';
-    const checked = Array.from(checkboxes).filter((cb) => cb.checked).map((cb) => Number(cb.dataset.historyTargetId));
-    if (checked.length === 0) return 'none';
-    if (checked.length === checkboxes.length) return 'all';
-    return checked.join(',');
-  };
-
-  const getSelectedTargetTypes = () => {
-    const availableTypes = computeAvailableMonitorTypes();
-    if (!availableTypes.length) return 'none';
-    const checkedBoxes = Array.from(form.querySelectorAll('input[name="types"]:checked')).map((cb) => cb.value);
-    if (checkedBoxes.length === 0) return 'none';
-    if (checkedBoxes.length === availableTypes.length) return 'all';
-    return checkedBoxes.join(',');
-  };
-
-  // Select all / Deselect all monitors handlers
-  document.getElementById('btn-select-all-monitors')?.addEventListener('click', () => {
-    form.querySelectorAll('[data-history-target-id]').forEach((cb) => { cb.checked = true; });
-    renderAvailableTypes();
-  });
-  document.getElementById('btn-deselect-all-monitors')?.addEventListener('click', () => {
-    form.querySelectorAll('[data-history-target-id]').forEach((cb) => { cb.checked = false; });
-    renderAvailableTypes();
+  document.getElementById('btn-open-remote-data-tab')?.addEventListener('click', async () => {
+    await persistFilterSelection();
+    state.page = 'remote-data';
+    await renderPage();
   });
 
   // Select all / Deselect all types handlers
   document.getElementById('btn-select-all-types')?.addEventListener('click', () => {
-    form.querySelectorAll('input[name="types"]').forEach((cb) => {
-      cb.checked = true;
-      currentTypeSelection.add(cb.value);
-    });
+    availableTypes.forEach((t) => currentTypeSelection.add(t.id));
+    renderAvailableTypes();
+    persistFilterSelection();
   });
   document.getElementById('btn-deselect-all-types')?.addEventListener('click', () => {
-    form.querySelectorAll('input[name="types"]').forEach((cb) => {
-      cb.checked = false;
-      currentTypeSelection.delete(cb.value);
-    });
+    currentTypeSelection.clear();
+    renderAvailableTypes();
+    persistFilterSelection();
   });
 
   // Auto-update health and history URL placeholders when base URL changes
@@ -1764,11 +1783,12 @@ async function renderRemoteData(content) {
   // Determine Monitors which are already selected and monitored (enabled)
   const allTargets = state.dashboard?.targets || [];
   const savedTargetIdsRaw = String(settings.historySyncTargetIds || '').trim();
-  const savedTargetIds = savedTargetIdsRaw && savedTargetIdsRaw !== 'all' && savedTargetIdsRaw.toLowerCase() !== 'none'
+  const isNoTargetsSaved = savedTargetIdsRaw.toLowerCase() === 'none';
+  const savedTargetIds = savedTargetIdsRaw && savedTargetIdsRaw !== 'all' && !isNoTargetsSaved
     ? savedTargetIdsRaw.split(',').map((s) => Number(s.trim())).filter((n) => Number.isInteger(n) && n > 0)
     : null;
 
-  const selectedMonitoredTargets = savedTargetIdsRaw.toLowerCase() === 'none'
+  const selectedMonitoredTargets = isNoTargetsSaved
     ? []
     : allTargets.filter((t) => {
       if (t.enabled === false) return false;
@@ -1778,15 +1798,18 @@ async function renderRemoteData(content) {
       return true;
     });
 
-  // Group selected & monitored targets by their monitor type
+  // Group selected & monitored targets by their normalized monitor type
   const monitorsByType = new Map();
   for (const target of selectedMonitoredTargets) {
-    const tType = String(target.type || '').trim().toLowerCase();
+    const tType = normalizeMonitorType(target.type);
     if (!tType) continue;
     if (!monitorsByType.has(tType)) {
       monitorsByType.set(tType, []);
     }
-    monitorsByType.get(tType).push(target.name);
+    const list = monitorsByType.get(tType);
+    if (target.name && !list.includes(target.name)) {
+      list.push(target.name);
+    }
   }
 
   const typeMetaById = new Map(REMOTE_DATA_MONITOR_TYPES.map((t) => [t.id, t]));
@@ -1806,32 +1829,25 @@ async function renderRemoteData(content) {
   // Parse saved historySyncTargetTypes (string or array) and match against availableMonitorTypes
   const rawTypes = settings.historySyncTargetTypes;
   const parsedTypes = Array.isArray(rawTypes)
-    ? rawTypes.map((s) => String(s).trim().toLowerCase()).filter(Boolean)
+    ? rawTypes.map((s) => normalizeMonitorType(s)).filter(Boolean)
     : (typeof rawTypes === 'string' && rawTypes.trim()
-      ? rawTypes.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
+      ? rawTypes.split(',').map((s) => normalizeMonitorType(s)).filter(Boolean)
       : ['all']);
 
-  const isNoneSelected = parsedTypes.includes('none');
+  const isNoneSelected = parsedTypes.includes('none') || isNoTargetsSaved;
   const isAllSelected = !isNoneSelected && (parsedTypes.length === 0 || parsedTypes.includes('all'));
   const activeFilteredTypes = [];
   if (!isNoneSelected) {
     for (const t of availableMonitorTypes) {
-      if (
-        isAllSelected ||
-        parsedTypes.includes(t.id) ||
-        ((t.id === 'ping' || t.id === 'icmp') && (parsedTypes.includes('ping') || parsedTypes.includes('icmp')))
-      ) {
+      if (isAllSelected || parsedTypes.includes(t.id)) {
         activeFilteredTypes.push(t);
       }
-    }
-    if (!isAllSelected && activeFilteredTypes.length === 0 && availableMonitorTypes.length > 0) {
-      activeFilteredTypes.push(...availableMonitorTypes);
     }
   }
 
   // Filter selectedMonitoredTargets by activeFilteredTypes so summary reflects exact targets being dispatched
   const activeTypeIds = new Set(activeFilteredTypes.map((t) => t.id));
-  const dispatchedTargets = selectedMonitoredTargets.filter((t) => activeTypeIds.has(String(t.type || '').trim().toLowerCase()));
+  const dispatchedTargets = selectedMonitoredTargets.filter((t) => activeTypeIds.has(normalizeMonitorType(t.type)));
 
   const latestSingleHistoryPayload = (() => {
     const raw = history.lastPayload;
@@ -2008,14 +2024,15 @@ async function renderRemoteData(content) {
 }
 
 async function renderAbout(content) {
-  if (!state.appInfo) state.appInfo = await request(() => remoteCare.getAppInfo(state.session.token));
+  state.appInfo = await request(() => remoteCare.getAppInfo(state.session.token));
   const runtime = state.appInfo.runtime || {};
   const autostart = state.appInfo.autostart || {};
   const previousShutdown = runtime.lastUnexpectedShutdownAt
     ? `Unexpected shutdown recorded ${prettyTime(runtime.lastUnexpectedShutdownAt)}`
     : 'No unexpected shutdown has been recorded';
   const autostartMessage = autostart.message || 'Not available';
-  content.innerHTML = `<header class="page-header"><div><h2>About this device</h2><p>Phase 1 works completely locally. Cloud publishing is deliberately disabled.</p></div>${liveClockMarkup()}</header><article class="card"><div class="panel-body"><div class="info-grid"><div class="info-item"><span>Application version</span><strong>${escapeHtml(state.appInfo.version)}</strong></div><div class="info-item"><span>Platform</span><strong>${escapeHtml(state.appInfo.platform)} / ${escapeHtml(state.appInfo.arch)}</strong></div><div class="info-item"><span>Automatic startup</span><strong>${escapeHtml(autostartMessage)}</strong></div><div class="info-item"><span>Data location</span><strong>${escapeHtml(state.appInfo.dataPath)}</strong></div><div class="info-item"><span>Cloud sync</span><strong>${escapeHtml(state.appInfo.cloudSync)}</strong></div><div class="info-item"><span>Runtime integrity</span><strong>${escapeHtml(previousShutdown)}</strong></div><div class="info-item"><span>Current session started</span><strong>${escapeHtml(prettyTime(runtime.startedAt))}</strong></div></div><p class="helper" style="margin:20px 0 0">The durable local event queue is ready for a Phase 2 HTTPS or MQTT sender. It currently sends no data outside this computer.</p></div></article>`;
+  const ver = state.appInfo.version || APP_VERSION;
+  content.innerHTML = `<header class="page-header"><div><h2>About this device</h2><p>Remote Care Monitor v${escapeHtml(ver)} — Local &amp; Remote Telemetry Monitoring.</p></div>${liveClockMarkup()}</header><article class="card"><div class="panel-body"><div class="info-grid"><div class="info-item"><span>Application version</span><strong>v${escapeHtml(ver)}</strong></div><div class="info-item"><span>Platform</span><strong>${escapeHtml(state.appInfo.platform)} / ${escapeHtml(state.appInfo.arch)}</strong></div><div class="info-item"><span>Automatic startup</span><strong>${escapeHtml(autostartMessage)}</strong></div><div class="info-item"><span>Data location</span><strong>${escapeHtml(state.appInfo.dataPath)}</strong></div><div class="info-item"><span>Cloud sync</span><strong>${escapeHtml(state.appInfo.cloudSync)}</strong></div><div class="info-item"><span>Runtime integrity</span><strong>${escapeHtml(previousShutdown)}</strong></div><div class="info-item"><span>Current session started</span><strong>${escapeHtml(prettyTime(runtime.startedAt))}</strong></div></div></div></article>`;
 }
 
 function monitorFields(type) {
