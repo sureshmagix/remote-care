@@ -917,11 +917,12 @@ test('saveAppSettings accepts historySyncTargetTypes as array or string, include
     assert.equal(sentHistoryPayload.history[0].details.service_uuid, 'UPDATED_SERVICE_UUID_777');
     assert.equal(sentHistoryPayload.history[0].details.device_uuid, 'UPDATED_DEVICE_UUID_888');
 
-    // Verify lastPayload in HistorySyncService stores only the last 1 history value
+    // Verify lastPayload in HistorySyncService stores all dispatched history values
     const historyStatus = historySync.getStatus();
-    assert.equal(historyStatus.lastPayload.history.length, 1);
-    assert.equal(historyStatus.lastPayload.entriesCount, 1);
-    assert.equal(historyStatus.lastPayload.history[0].name, 'Main Branch Gateway');
+    assert.equal(historyStatus.lastPayload.history.length, 2);
+    assert.equal(historyStatus.lastPayload.entriesCount, 2);
+    assert.equal(historyStatus.lastPayload.history[0].name, 'Primary Web Portal');
+    assert.equal(historyStatus.lastPayload.history[1].name, 'Main Branch Gateway');
   } finally {
     database.close();
     fs.rmSync(directory, { recursive: true, force: true });
@@ -981,17 +982,18 @@ test('periodic sync runs automatically once serverBaseUrl is configured without 
     const histRes = await historySync.syncNow({ force: false });
 
     assert.equal(pubRes.publishedCount, 2);
-    assert.equal(publisher.getStatus().lastPayload.events.length, 1);
+    assert.equal(publisher.getStatus().lastPayload.events.length, 2);
     assert.equal(periodicSyncCount, 1);
     assert.equal(histRes.ok, true);
     assert.equal(periodicHistoryCount, 1);
     assert.equal(dispatchedHistoryBatch.history.length, 2);
 
-    // And lastPayload in status keeps only the last 1 history entry
+    // And lastPayload in status keeps all dispatched history entries
     const status = historySync.getStatus();
     assert.equal(status.enabled, true);
-    assert.equal(status.lastPayload.history.length, 1);
-    assert.equal(status.lastPayload.history[0].status, 'down');
+    assert.equal(status.lastPayload.history.length, 2);
+    assert.equal(status.lastPayload.history[0].status, 'healthy');
+    assert.equal(status.lastPayload.history[1].status, 'down');
   } finally {
     database.close();
     fs.rmSync(directory, { recursive: true, force: true });
@@ -1101,4 +1103,136 @@ test('only selected monitor types are sent to the remote server in /api/sync and
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('when internet or network goes down and comes back up, all recorded down/warning/recovery history and events are sent to the server without missing anything', async () => {
+  const { database, directory } = temporaryDatabase();
+  try {
+    const admin = database.createInitialAdmin({ username: 'admin', displayName: 'Admin', password: 'password-123' });
+    database.createDefaultTargets();
+    const targets = database.listTargets();
+    const ifaceTarget = targets.find((t) => t.type === 'interface');
+    const gwTarget = targets.find((t) => t.type === 'gateway');
+    const netTarget = targets.find((t) => t.type === 'internet');
+
+    database.updateAppSettings({
+      cloudSyncEnabled: true,
+      historySyncEnabled: true,
+      serverBaseUrl: 'http://192.168.1.200:3999',
+      historySyncIntervalMinutes: 5,
+      historySyncTargetTypes: 'all',
+      historySyncTargetIds: 'all'
+    }, admin.id);
+
+    const publisher = new CloudPublisher({ database, getSettings: () => database.getAppSettings() });
+    const heartbeat = new HeartbeatService({ database, publisher, getSettings: () => database.getAppSettings() });
+    const historySync = new HistorySyncService({ database, getSettings: () => database.getAppSettings() });
+
+    let networkAvailable = true;
+    const receivedSyncEvents = [];
+    const receivedHistoryEntries = [];
+
+    publisher.sendBatch = async (_url, _token, payload) => {
+      if (!networkAvailable) {
+        throw new Error('Cloud connection failed: ENETUNREACH');
+      }
+      receivedSyncEvents.push(...payload.events);
+      return { ok: true, statusCode: 200, responseData: { ok: true } };
+    };
+
+    historySync.sendPayload = async (_url, _token, payload) => {
+      if (!networkAvailable) {
+        throw new Error('History sync connection failed: ENETUNREACH');
+      }
+      receivedHistoryEntries.push(...payload.history);
+      return { ok: true, statusCode: 200, responseData: { ok: true } };
+    };
+
+    // 1. Initial healthy state while network is UP
+    database.recordCheck(ifaceTarget.id, { ok: true, latencyMs: 0, message: 'Wi-Fi (en0) connected.' });
+    database.recordCheck(gwTarget.id, { ok: true, latencyMs: 2, message: 'Default gateway 192.168.1.1 is reachable.' });
+    database.recordCheck(netTarget.id, { ok: true, latencyMs: 15, message: 'Internet connection is available (www.cloudflare.com).' });
+
+    heartbeat.sendHeartbeat({ triggerPublish: false });
+    await publisher.publishPending();
+    await historySync.syncNow();
+
+    assert.equal(receivedHistoryEntries.length, 3);
+    assert.equal(receivedSyncEvents.length, 1);
+    receivedHistoryEntries.length = 0;
+    receivedSyncEvents.length = 0;
+
+    // 2. Network / Internet goes DOWN
+    networkAvailable = false;
+
+    // Interface goes down immediately (failureThreshold: 1)
+    database.recordCheck(ifaceTarget.id, { ok: false, latencyMs: null, message: 'Wi-Fi connection is disconnected.' });
+    // Gateway and Internet hit warning on 1st failure, then down on 2nd failure (failureThreshold: 2)
+    database.recordCheck(gwTarget.id, { ok: false, latencyMs: null, message: 'No default gateway is configured. The local network may be disconnected.' });
+    database.recordCheck(gwTarget.id, { ok: false, latencyMs: null, message: 'No default gateway is configured. The local network may be disconnected.' });
+    database.recordCheck(netTarget.id, { ok: false, latencyMs: null, message: 'DNS lookup failed for cloudflare.com: ETIMEOUT' });
+    database.recordCheck(netTarget.id, { ok: false, latencyMs: null, message: 'DNS lookup failed for cloudflare.com: ETIMEOUT' });
+
+    // Record heartbeat while network is down
+    heartbeat.sendHeartbeat({ triggerPublish: false });
+
+    // Simulate > 10 failed sync attempts while the network is down (e.g. prolonged outage)
+    for (let i = 0; i < 12; i++) {
+      const pubAttempt = await publisher.publishPending();
+      assert.ok(pubAttempt.error);
+      const histAttempt = await historySync.syncNow();
+      assert.equal(histAttempt.ok, false);
+    }
+
+    // Nothing reached the server while offline
+    assert.equal(receivedHistoryEntries.length, 0);
+    assert.equal(receivedSyncEvents.length, 0);
+
+    // 3. Network / Internet comes BACK UP
+    networkAvailable = true;
+    database.recordCheck(ifaceTarget.id, { ok: true, latencyMs: 0, message: 'Wi-Fi (en0) connected.' });
+    database.recordCheck(gwTarget.id, { ok: true, latencyMs: 3, message: 'Default gateway 192.168.1.1 is reachable.' });
+    database.recordCheck(netTarget.id, { ok: true, latencyMs: 18, message: 'Internet connection is available (www.cloudflare.com).' });
+    heartbeat.sendHeartbeat({ triggerPublish: false });
+
+    const recoveryPub = await publisher.publishPending();
+    const recoveryHist = await historySync.syncNow();
+
+    assert.equal(recoveryHist.ok, true);
+    assert.ok(recoveryPub.publishedCount > 0);
+
+    // Verify ALL 8 history transitions recorded during the outage + recovery were sent in order without missing any
+    // (iface down, gw warning, gw down, net warning, net down, iface healthy, gw healthy, net healthy)
+    assert.equal(receivedHistoryEntries.length, 8);
+    assert.deepEqual(
+      receivedHistoryEntries.map((e) => `${e.targetName}:${e.status}`),
+      [
+        'Network interface:down',
+        'Default gateway:warning',
+        'Default gateway:down',
+        'Internet connection:warning',
+        'Internet connection:down',
+        'Network interface:healthy',
+        'Default gateway:healthy',
+        'Internet connection:healthy'
+      ]
+    );
+
+    // Verify lastPayload in HistorySyncService also preserves the full dispatched history
+    assert.equal(historySync.getStatus().lastPayload.history.length, 8);
+
+    // Verify all incident.opened (down), outage heartbeat (down), incident.resolved (recovered), and recovery heartbeat (healthy) events were delivered
+    const eventTypes = receivedSyncEvents.map((e) => e.eventType);
+    assert.equal(eventTypes.filter((t) => t === 'incident.opened').length, 3);
+    assert.equal(eventTypes.filter((t) => t === 'incident.resolved').length, 3);
+    const heartbeats = receivedSyncEvents.filter((e) => e.eventType === 'device.heartbeat');
+    assert.equal(heartbeats.length, 2);
+    assert.equal(heartbeats[0].payload.monitorsSummary.down, 3);
+    assert.equal(heartbeats[1].payload.monitorsSummary.down, 0);
+    assert.equal(heartbeats[1].payload.monitorsSummary.healthy, 3);
+  } finally {
+    database.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 

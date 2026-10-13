@@ -11,6 +11,7 @@ class HistorySyncService extends EventEmitter {
     this.getSettings = getSettings || (() => database.getAppSettings());
     this.timer = null;
     this.isSyncing = false;
+    this.pendingSync = false;
     this.lastSyncAt = null;
     this.lastAttemptAt = 0;
     this.lastError = null;
@@ -109,7 +110,29 @@ class HistorySyncService extends EventEmitter {
     return Boolean(settings?.historySyncEnabled || endpoint);
   }
 
-  buildPayload({ previewRecent = false, limit = 50, targetIds = undefined, targetTypes = undefined } = {}) {
+  hasUnsyncedChanges() {
+    const resolvedTargets = this.getTargetIds();
+    const resolvedTypes = this.getTargetTypes(resolvedTargets);
+    const cursor = this.database.getHistorySyncCursor();
+    const matchingTargets = this.getActiveMonitoredTargets(resolvedTargets).filter((t) => {
+      if (!resolvedTypes) return true;
+      if (resolvedTypes.includes('__none__') || resolvedTypes.includes('none')) return false;
+      const tType = String(t.type || '').trim().toLowerCase();
+      return resolvedTypes.some((rt) => (rt === 'icmp' || rt === 'ping') ? (tType === 'icmp' || tType === 'ping') : rt === tType);
+    });
+    const matchingTargetIds = matchingTargets.map((t) => Number(t.id));
+    if (matchingTargetIds.length === 0) return false;
+    const unsynced = this.database.getHistoryChanges({
+      targetIds: matchingTargetIds,
+      targetTypes: resolvedTypes,
+      onlyEnabled: true,
+      sinceId: cursor.lastId,
+      limit: 1
+    });
+    return unsynced.length > 0;
+  }
+
+  buildPayload({ previewRecent = false, limit = 50, targetIds = undefined, targetTypes = undefined, onlyUnsynced = false } = {}) {
     const resolvedTargets = targetIds !== undefined ? targetIds : this.getTargetIds();
     const resolvedTypes = targetTypes !== undefined ? targetTypes : this.getTargetTypes(resolvedTargets);
     const cursor = this.database.getHistorySyncCursor();
@@ -142,9 +165,9 @@ class HistorySyncService extends EventEmitter {
           targetTypes: resolvedTypes,
           onlyEnabled: true,
           sinceId: cursor.lastId,
-          limit: 100
+          limit: 500
         });
-        if (entries.length === 0) {
+        if (entries.length === 0 && !onlyUnsynced) {
           entries = this.database.getHistoryChanges({
             targetIds: matchingTargetIds,
             targetTypes: resolvedTypes,
@@ -250,11 +273,12 @@ class HistorySyncService extends EventEmitter {
 
   async syncNow({ force = false } = {}) {
     if (this.isSyncing) {
-      if (!force) return { skipped: true, reason: 'History sync is currently running.' };
+      this.pendingSync = true;
+      if (!force) return { skipped: true, queued: true, reason: 'History sync is currently running.' };
       for (let i = 0; i < 50 && this.isSyncing; i++) {
         await new Promise((r) => setTimeout(r, 100));
       }
-      if (this.isSyncing) return { skipped: true, reason: 'History sync is currently running.' };
+      if (this.isSyncing) return { skipped: true, queued: true, reason: 'History sync is currently running.' };
     }
     const endpoint = this.getEndpointUrl();
     if (!force && (!this.isEnabled() || !endpoint)) {
@@ -265,41 +289,70 @@ class HistorySyncService extends EventEmitter {
     }
 
     this.isSyncing = true;
+    this.pendingSync = false;
     this.lastAttemptAt = Date.now();
     try {
-      const payload = this.buildPayload({ previewRecent: false });
-      const authToken = this.getAuthToken();
-      const res = await this.sendPayload(endpoint, authToken, payload);
+      let totalSentCount = 0;
+      let lastRes = null;
+      let finalPayload = null;
+      const allDispatchedHistory = [];
+      let anyNewChanges = false;
+      let iterations = 0;
 
-      if (payload.history.length > 0) {
-        const maxId = Math.max(this.database.getHistorySyncCursor().lastId, ...payload.history.map((e) => e.id));
-        this.database.setHistorySyncCursor(maxId, payload.dispatchedAt);
-      } else {
-        this.database.setHistorySyncCursor(this.database.getHistorySyncCursor().lastId, payload.dispatchedAt);
+      while (iterations < 20) {
+        iterations += 1;
+        this.pendingSync = false;
+        const onlyUnsynced = iterations > 1;
+        const hasNewInDb = this.hasUnsyncedChanges();
+        if (hasNewInDb) anyNewChanges = true;
+        const payload = this.buildPayload({ previewRecent: false, onlyUnsynced });
+        if (onlyUnsynced && payload.history.length === 0) {
+          break;
+        }
+
+        const authToken = this.getAuthToken();
+        const res = await this.sendPayload(endpoint, authToken, payload);
+        lastRes = res;
+
+        if (payload.history.length > 0) {
+          const maxId = Math.max(this.database.getHistorySyncCursor().lastId, ...payload.history.map((e) => e.id));
+          this.database.setHistorySyncCursor(maxId, payload.dispatchedAt);
+        } else {
+          this.database.setHistorySyncCursor(this.database.getHistorySyncCursor().lastId, payload.dispatchedAt);
+        }
+
+        allDispatchedHistory.push(...payload.history);
+        totalSentCount += payload.history.length;
+
+        const allowedIds = new Set(payload.monitors.map((m) => String(m.id)));
+        const allowedNames = new Set(payload.targetNames.map((n) => String(n).toLowerCase()));
+        const prevFilteredHistory = (this.lastPayload?.history || []).filter((h) =>
+          allowedIds.has(String(h.targetId)) || allowedNames.has(String(h.targetName || h.name || '').toLowerCase())
+        );
+
+        const fullHistory = (!anyNewChanges && prevFilteredHistory.length > 0)
+          ? prevFilteredHistory
+          : (allDispatchedHistory.length > 0 ? [...allDispatchedHistory] : prevFilteredHistory);
+
+        this.lastSyncAt = payload.dispatchedAt;
+        this.lastSentCount = totalSentCount;
+        this.lastPayload = {
+          ...payload,
+          entriesCount: fullHistory.length,
+          history: fullHistory
+        };
+        finalPayload = this.lastPayload;
+        this.lastResponse = res?.responseData || res;
+        this.lastError = null;
+
+        this.emit('synced', { timestamp: this.lastSyncAt, count: payload.history.length, payload: this.lastPayload, result: res });
+
+        if (!this.pendingSync && !this.hasUnsyncedChanges()) {
+          break;
+        }
       }
 
-      const allowedIds = new Set(payload.monitors.map((m) => String(m.id)));
-      const allowedNames = new Set(payload.targetNames.map((n) => String(n).toLowerCase()));
-      const prevFilteredHistory = (this.lastPayload?.history || []).filter((h) =>
-        allowedIds.has(String(h.targetId)) || allowedNames.has(String(h.targetName || h.name || '').toLowerCase())
-      );
-
-      const lastSingleHistory = payload.history.length > 0
-        ? payload.history.slice(-1)
-        : prevFilteredHistory.slice(-1);
-
-      this.lastSyncAt = payload.dispatchedAt;
-      this.lastSentCount = payload.history.length;
-      this.lastPayload = {
-        ...payload,
-        entriesCount: lastSingleHistory.length,
-        history: lastSingleHistory
-      };
-      this.lastResponse = res?.responseData || res;
-      this.lastError = null;
-
-      this.emit('synced', { timestamp: this.lastSyncAt, count: payload.history.length, payload: this.lastPayload, result: res });
-      return { ok: true, sentCount: payload.history.length, timestamp: this.lastSyncAt, payload, result: res };
+      return { ok: true, sentCount: totalSentCount, timestamp: this.lastSyncAt, payload: finalPayload, result: lastRes };
     } catch (err) {
       this.lastError = err.message;
       this.lastResponse = null;
@@ -316,10 +369,18 @@ class HistorySyncService extends EventEmitter {
 
   checkDue() {
     if (!this.isEnabled() || this.isSyncing) return Promise.resolve(null);
+    const nowMs = Date.now();
+    if (this.hasUnsyncedChanges() || this.lastError) {
+      const retryDelayMs = 5_000;
+      if (!this.lastAttemptAt || (nowMs - this.lastAttemptAt >= retryDelayMs)) {
+        return this.syncNow().catch(() => null);
+      }
+      return Promise.resolve(null);
+    }
     const intervalMs = this.getIntervalMinutes() * 60 * 1000;
     const lastSyncMs = this.lastSyncAt ? new Date(this.lastSyncAt).getTime() : 0;
     const baseline = Math.max(this.lastAttemptAt || 0, lastSyncMs || 0);
-    if (!baseline || (Date.now() - baseline >= intervalMs)) {
+    if (!baseline || (nowMs - baseline >= intervalMs)) {
       return this.syncNow().catch(() => null);
     }
     return Promise.resolve(null);
@@ -354,12 +415,17 @@ class HistorySyncService extends EventEmitter {
     this.stop();
     if (this.lastPayload) {
       try {
-        const preview = this.buildPayload({ previewRecent: true, limit: 1 });
-        const lastSingle = preview.history.slice(-1);
+        const preview = this.buildPayload({ previewRecent: true, limit: 50 });
+        const allowedIds = new Set(preview.monitors.map((m) => String(m.id)));
+        const allowedNames = new Set(preview.targetNames.map((n) => String(n).toLowerCase()));
+        const existingFiltered = (this.lastPayload.history || []).filter((h) =>
+          allowedIds.has(String(h.targetId)) || allowedNames.has(String(h.targetName || h.name || '').toLowerCase())
+        );
+        const keptHistory = existingFiltered.length > 0 ? existingFiltered : preview.history;
         this.lastPayload = {
           ...preview,
-          entriesCount: lastSingle.length,
-          history: lastSingle
+          entriesCount: keptHistory.length,
+          history: keptHistory
         };
       } catch (_) {}
     }

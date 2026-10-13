@@ -80,13 +80,14 @@ async function main() {
       }
     }
 
+    heartbeatService.sendHeartbeat({ triggerPublish: false });
     cloudPublisher.trigger();
+    historySyncService.syncNow().catch(() => {});
   };
 
   const monitor = new MonitorEngine({
     database,
-    notify: notifyHandler,
-    onEvent: notifyHandler
+    notify: notifyHandler
   });
 
   monitor.on('update', (data) => {
@@ -95,7 +96,15 @@ async function main() {
       if (outcome) {
         const symbol = outcome.status === 'healthy' ? '✔' : outcome.status === 'warning' ? '▲' : '✖';
         log('debug', `${symbol} ${outcome.target.name}: ${outcome.status} (${outcome.result.latencyMs ?? 0}ms)`);
+        if (outcome.recorded && historySyncService.isEnabled()) {
+          historySyncService.syncNow().catch(() => {});
+        }
+        if (outcome.result?.ok && cloudPublisher.isEnabled() && (cloudPublisher.lastError || (database.getPendingOutboundCount() > 0))) {
+          cloudPublisher.trigger();
+        }
       }
+      heartbeatService.checkDue();
+      historySyncService.checkDue();
     }
   });
 

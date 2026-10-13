@@ -188,7 +188,7 @@ class HeartbeatService {
     try {
       this.lastHeartbeatAt = Date.now();
       const telemetry = this.collectTelemetry();
-      this.database.clearPendingHeartbeats?.();
+      this.database.clearPendingHeartbeats?.(telemetry);
       this.database.enqueueEvent('device.heartbeat', telemetry);
       if (triggerPublish && this.publisher) {
         const enabled = typeof this.publisher.isEnabled === 'function' ? this.publisher.isEnabled() : true;

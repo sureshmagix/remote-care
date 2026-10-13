@@ -273,8 +273,10 @@ function notify(event) {
     }
   }
 
-  // Phase 2: Trigger immediate cloud sync
+  // Phase 2: Trigger immediate cloud & history sync
+  heartbeatService?.sendHeartbeat({ triggerPublish: false });
   cloudPublisher?.trigger()?.catch?.(() => {});
+  historySyncService?.syncNow()?.catch?.(() => {});
 }
 
 function showBackgroundToast() {
@@ -444,6 +446,9 @@ function initializeCloudServices() {
   cloudPublisher.on('batch_delivered', (data) => {
     broadcast('remote-sync-update', { source: 'cloudPublisher', event: 'batch_delivered', data });
     broadcast('monitor-update', { type: 'remote_sync_completed', source: 'cloudPublisher' });
+    if (historySyncService?.isEnabled() && (historySyncService.lastError || historySyncService.hasUnsyncedChanges?.())) {
+      historySyncService.syncNow().catch(() => {});
+    }
   });
   cloudPublisher.on('error', (err) => {
     console.warn('[CloudPublisher] Network sync error:', err?.message || err);
@@ -459,6 +464,9 @@ function initializeCloudServices() {
   historySyncService.on('synced', (data) => {
     broadcast('remote-sync-update', { source: 'historySync', event: 'synced', data });
     broadcast('monitor-update', { type: 'remote_sync_completed', source: 'historySync' });
+    if (cloudPublisher?.isEnabled() && (database?.getPendingOutboundCount() > 0)) {
+      cloudPublisher.trigger()?.catch?.(() => {});
+    }
   });
   historySyncService.on('error', (err) => {
     console.warn('[HistorySyncService] Network history sync error:', err?.message || err);
@@ -962,6 +970,12 @@ app.whenReady().then(() => {
   monitor.on('update', (event) => {
     updateTray();
     broadcast('monitor-update', event);
+    if (event?.outcome?.recorded && historySyncService?.isEnabled()) {
+      historySyncService.syncNow().catch(() => {});
+    }
+    if (event?.outcome?.result?.ok && cloudPublisher?.isEnabled() && (cloudPublisher.lastError || (database?.getPendingOutboundCount() > 0))) {
+      cloudPublisher.trigger()?.catch?.(() => {});
+    }
     heartbeatService?.checkDue();
     historySyncService?.checkDue();
   });

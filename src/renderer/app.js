@@ -1855,11 +1855,10 @@ async function renderRemoteData(content) {
       return { message: 'No history events dispatched yet.' };
     }
     if (Array.isArray(raw.history)) {
-      const lastOne = raw.history.slice(-1);
       return {
         ...raw,
-        entriesCount: lastOne.length,
-        history: lastOne
+        entriesCount: raw.history.length,
+        history: raw.history
       };
     }
     return raw;
@@ -1952,7 +1951,7 @@ async function renderRemoteData(content) {
             <div class="info-item"><span>Last Dispatched</span><strong>${history.lastSyncAt ? prettyTime(history.lastSyncAt) : 'Waiting for first sync…'}</strong></div>
           </div>
           <div style="margin-bottom:12px">
-            <strong style="display:block;margin-bottom:4px;font-size:0.85rem;color:var(--text-muted)">Latest Dispatched Request Body (Last 1 History Value)</strong>
+            <strong style="display:block;margin-bottom:4px;font-size:0.85rem;color:var(--text-muted)">Latest Dispatched Request Body</strong>
             <pre class="server-response-box"><code>${escapeHtml(JSON.stringify(latestSingleHistoryPayload, null, 2))}</code></pre>
           </div>
           <div>

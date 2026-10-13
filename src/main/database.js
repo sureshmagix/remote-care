@@ -1129,7 +1129,7 @@ class LocalDatabase {
       query += ` WHERE ${clauses.join(' AND ')}`;
     }
 
-    const safeLimit = Number.isInteger(Number(limit)) && Number(limit) > 0 ? Math.min(Number(limit), 500) : 100;
+    const safeLimit = Number.isInteger(Number(limit)) && Number(limit) > 0 ? Math.min(Number(limit), 1000) : 100;
 
     const settings = this.getAppSettings();
     const globalServiceUuid = settings?.serviceUuid?.trim() || 'ASSIGNED_SERVICE_UUID';
@@ -1297,13 +1297,33 @@ class LocalDatabase {
       .run(eventType, JSON.stringify(payload), now());
   }
 
-  clearPendingHeartbeats() {
-    this.db.prepare("DELETE FROM outbound_events WHERE event_type = 'device.heartbeat' AND delivered_at IS NULL").run();
+  clearPendingHeartbeats(newTelemetry = null) {
+    if (!newTelemetry) {
+      this.db.prepare("DELETE FROM outbound_events WHERE event_type = 'device.heartbeat' AND delivered_at IS NULL").run();
+      return;
+    }
+    const stateSignature = (payload) => {
+      if (!payload || typeof payload !== 'object') return '';
+      if (Array.isArray(payload.monitors)) {
+        return JSON.stringify(payload.monitors.map((m) => [m.id || m.targetId || m.name || m.targetName, m.status]));
+      }
+      if (payload.monitorsSummary) return JSON.stringify(payload.monitorsSummary);
+      return String(payload.status || '');
+    };
+    const nextSig = stateSignature(newTelemetry);
+    const pending = this.db.prepare("SELECT id, payload_json FROM outbound_events WHERE event_type = 'device.heartbeat' AND delivered_at IS NULL ORDER BY id ASC").all();
+    const deleteStmt = this.db.prepare('DELETE FROM outbound_events WHERE id = ?');
+    for (const row of pending) {
+      const parsed = parseJson(row.payload_json, null);
+      if (stateSignature(parsed) === nextSig) {
+        deleteStmt.run(row.id);
+      }
+    }
   }
 
-  getPendingOutboundEvents(limit = 25) {
+  getPendingOutboundEvents(limit = 100) {
     return this.db.prepare(`SELECT * FROM outbound_events
-      WHERE delivered_at IS NULL AND attempts < 10
+      WHERE delivered_at IS NULL
       ORDER BY id ASC LIMIT ?`).all(limit);
   }
 

@@ -68,7 +68,21 @@ class MonitorEngine extends EventEmitter {
     try {
       const result = await this.executeCheck(target);
       const outcome = this.database.recordCheck(target.id, result);
+      if (!result.ok && outcome?.status === 'warning') {
+        this.nextRunAt.set(target.id, Date.now() + Math.min(target.intervalSeconds * 1000, 1500));
+      } else if (outcome?.status === 'down' && ['interface', 'gateway', 'internet'].includes(target.type)) {
+        this.nextRunAt.set(target.id, Date.now() + Math.min(target.intervalSeconds * 1000, 3000));
+      }
       if (outcome?.transition) {
+        if (['interface', 'gateway', 'internet'].includes(target.type)) {
+          const allTargets = this.database.listTargets?.() || [];
+          const nowMs = Date.now();
+          for (const other of allTargets) {
+            if (other.enabled && other.id !== target.id && ['interface', 'gateway', 'internet', 'ping', 'icmp', 'http', 'tcp', 'rtsp'].includes(other.type)) {
+              this.nextRunAt.set(other.id, nowMs);
+            }
+          }
+        }
         const event = outcome.incidentEvent || {
           kind: outcome.status === 'healthy' ? (outcome.previousStatus === 'unknown' ? 'healthy' : 'recovered') : outcome.status,
           target: outcome.target,

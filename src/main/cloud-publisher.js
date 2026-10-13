@@ -11,6 +11,7 @@ class CloudPublisher extends EventEmitter {
     this.ensureHeartbeat = ensureHeartbeat || null;
     this.timer = null;
     this.isPublishing = false;
+    this.pendingPublish = false;
     this.lastSyncAt = null;
     this.lastError = null;
     this.deliveredCount = 0;
@@ -166,12 +167,13 @@ class CloudPublisher extends EventEmitter {
 
   async publishPending(batchSize = 25, { force = false } = {}) {
     if (this.isPublishing) {
-      if (!force) return { skipped: true, reason: 'Cloud publish already in progress.' };
+      this.pendingPublish = true;
+      if (!force) return { skipped: true, queued: true, reason: 'Cloud publish already in progress.' };
       // Wait for current in-flight publish to finish when forced manually
       for (let i = 0; i < 50 && this.isPublishing; i++) {
         await new Promise((r) => setTimeout(r, 100));
       }
-      if (this.isPublishing) return { skipped: true, reason: 'Cloud publish already in progress.' };
+      if (this.isPublishing) return { skipped: true, queued: true, reason: 'Cloud publish already in progress.' };
     }
     const endpoint = this.getEndpointUrl();
     if (!endpoint) {
@@ -182,70 +184,91 @@ class CloudPublisher extends EventEmitter {
     }
 
     this.isPublishing = true;
+    this.pendingPublish = false;
     try {
-      let pending = this.database.getPendingOutboundEvents(batchSize);
-      if ((!pending || pending.length === 0) && (force || !this.lastSyncAt) && typeof this.ensureHeartbeat === 'function') {
-        try {
-          this.ensureHeartbeat();
-          pending = this.database.getPendingOutboundEvents(batchSize);
-        } catch (_) {}
-      }
-      if (!pending || pending.length === 0) {
-        return { publishedCount: 0 };
-      }
+      let totalPublished = 0;
+      let lastResult = null;
+      const allDispatchedEvents = [];
+      let iterations = 0;
 
-      const latestSettings = this.getSettings();
-      const latestHostname = latestSettings?.terminalHostname?.trim() || latestSettings?.clientHostname?.trim();
-      const latestServiceUuid = latestSettings?.serviceUuid?.trim() || latestSettings?.service_uuid?.trim();
-      const latestDeviceUuid = latestSettings?.deviceUuid?.trim() || latestSettings?.device_uuid?.trim();
-
-      const filteredEvents = [];
-      for (const row of pending) {
-        let eventPayload = typeof row.payload_json === 'string' ? JSON.parse(row.payload_json) : { ...(row.payload_json || {}) };
-        if (eventPayload && typeof eventPayload === 'object') {
-          if (latestHostname) eventPayload.hostname = latestHostname;
-          if (latestServiceUuid) eventPayload.service_uuid = latestServiceUuid;
-          if (latestDeviceUuid) eventPayload.device_uuid = latestDeviceUuid;
-          if (eventPayload.targetName && !eventPayload.name) {
-            eventPayload.name = eventPayload.targetName;
-          }
-          eventPayload = this.filterEventPayload(row.event_type, eventPayload, latestSettings);
+      while (iterations < 20) {
+        iterations += 1;
+        this.pendingPublish = false;
+        let pending = this.database.getPendingOutboundEvents(batchSize);
+        if ((!pending || pending.length === 0) && iterations === 1 && (force || !this.lastSyncAt) && typeof this.ensureHeartbeat === 'function') {
+          try {
+            this.ensureHeartbeat();
+            pending = this.database.getPendingOutboundEvents(batchSize);
+          } catch (_) {}
         }
-        if (eventPayload === null) continue;
-        filteredEvents.push({
-          id: row.id,
-          eventType: row.event_type,
-          payload: eventPayload,
-          createdAt: row.created_at
-        });
+        if (!pending || pending.length === 0) {
+          break;
+        }
+
+        const latestSettings = this.getSettings();
+        const latestHostname = latestSettings?.terminalHostname?.trim() || latestSettings?.clientHostname?.trim();
+        const latestServiceUuid = latestSettings?.serviceUuid?.trim() || latestSettings?.service_uuid?.trim();
+        const latestDeviceUuid = latestSettings?.deviceUuid?.trim() || latestSettings?.device_uuid?.trim();
+
+        const filteredEvents = [];
+        for (const row of pending) {
+          let eventPayload = typeof row.payload_json === 'string' ? JSON.parse(row.payload_json) : { ...(row.payload_json || {}) };
+          if (eventPayload && typeof eventPayload === 'object') {
+            if (latestHostname) eventPayload.hostname = latestHostname;
+            if (latestServiceUuid) eventPayload.service_uuid = latestServiceUuid;
+            if (latestDeviceUuid) eventPayload.device_uuid = latestDeviceUuid;
+            if (eventPayload.targetName && !eventPayload.name) {
+              eventPayload.name = eventPayload.targetName;
+            }
+            eventPayload = this.filterEventPayload(row.event_type, eventPayload, latestSettings);
+          }
+          if (eventPayload === null) continue;
+          filteredEvents.push({
+            id: row.id,
+            eventType: row.event_type,
+            payload: eventPayload,
+            createdAt: row.created_at
+          });
+        }
+
+        const deliveredIds = pending.map((p) => p.id);
+        if (filteredEvents.length === 0) {
+          this.database.markEventsDelivered(deliveredIds);
+          if (!this.pendingPublish && pending.length < batchSize) break;
+          continue;
+        }
+
+        const payload = {
+          version: '2.0',
+          dispatchedAt: new Date().toISOString(),
+          events: filteredEvents
+        };
+
+        const authToken = this.getAuthToken();
+        allDispatchedEvents.push(...filteredEvents);
+        this.lastPayload = {
+          ...payload,
+          events: [...allDispatchedEvents]
+        };
+        const result = await this.sendBatch(endpoint, authToken, payload);
+        lastResult = result;
+        this.lastResponse = result?.responseData || result;
+        this.database.markEventsDelivered(deliveredIds);
+        this.deliveredCount += filteredEvents.length;
+        totalPublished += filteredEvents.length;
+        this.lastSyncAt = new Date().toISOString();
+        this.lastError = null;
+
+        this.emit('batch_delivered', { count: filteredEvents.length, timestamp: this.lastSyncAt, result });
+        if (!this.pendingPublish && pending.length < batchSize) {
+          break;
+        }
       }
 
-      const deliveredIds = pending.map((p) => p.id);
-      if (filteredEvents.length === 0) {
-        this.database.markEventsDelivered(deliveredIds);
+      if (totalPublished === 0) {
         return { publishedCount: 0 };
       }
-
-      const payload = {
-        version: '2.0',
-        dispatchedAt: new Date().toISOString(),
-        events: filteredEvents
-      };
-
-      const authToken = this.getAuthToken();
-      this.lastPayload = {
-        ...payload,
-        events: payload.events.slice(-1)
-      };
-      const result = await this.sendBatch(endpoint, authToken, payload);
-      this.lastResponse = result?.responseData || result;
-      this.database.markEventsDelivered(deliveredIds);
-      this.deliveredCount += filteredEvents.length;
-      this.lastSyncAt = new Date().toISOString();
-      this.lastError = null;
-
-      this.emit('batch_delivered', { count: filteredEvents.length, timestamp: this.lastSyncAt, result });
-      return { publishedCount: filteredEvents.length, result };
+      return { publishedCount: totalPublished, result: lastResult };
     } catch (error) {
       this.lastError = error.message;
       this.lastResponse = null;

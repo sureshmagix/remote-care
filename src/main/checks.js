@@ -43,9 +43,10 @@ function runCommand(command, args, timeoutMs = 5_000) {
 
 function adapterKind(name, description = '') {
   const text = `${name} ${description}`.toLowerCase();
+  if (/(loopback|\blo\b)/.test(text)) return 'loopback';
+  if (/(virtual|vethernet|hyper-v|wsl|vmware|vbox|docker|veth|virbr|ibridge|bluetooth|bridge\d*)/.test(text)) return 'other';
   if (/(wi-?fi|wireless|wlan|airport|802\.11)/.test(text)) return 'wireless';
   if (/(ethernet|wired|\blan\b|\beth\d+|\ben\d+|\ben[ops]\d+)/.test(text)) return 'wired';
-  if (/(loopback|\blo\b)/.test(text)) return 'loopback';
   return 'other';
 }
 
@@ -107,22 +108,29 @@ async function getMacAdapters() {
   // Combine physical hardware ports plus any physical non-virtual interfaces
   const allNames = new Set([
     ...ports.map((item) => item.name),
-    ...Object.keys(os.networkInterfaces()).filter((name) => !/^(lo\d*|utun\d*|llw\d*|awdl\d*|gif\d*|stf\d*|p2p\d*|ipsec\d*|ap\d*|vboxnet\d*|vmnet\d*)/i.test(name))
+    ...Object.keys(os.networkInterfaces()).filter((name) => !/^(lo\d*|utun\d*|llw\d*|awdl\d*|gif\d*|stf\d*|p2p\d*|ipsec\d*|ap\d*|anpi\d*|bridge\d*|vboxnet\d*|vmnet\d*)/i.test(name))
   ]);
 
   const adapters = [];
   for (const name of allNames) {
     const text = blocks.get(name) || '';
     const mapped = known.get(name);
-    const hasIp = /inet\s+(?!127\.)\d+\.\d+\.\d+\.\d+/.test(text);
-    const active = /status:\s+active/i.test(text) || hasIp;
+    const mac = (text.match(/ether\s+([0-9a-f:]{17})/i)?.[1] || '').toLowerCase();
+    // Ignore Apple internal iBridge virtual USB NIC (ac:de:48:00:11:22)
+    if (mac === 'ac:de:48:00:11:22') continue;
+    const hasIp = /inet\s+(?!127\.|169\.254\.)\d+\.\d+\.\d+\.\d+/.test(text);
+    // Skip unmapped macOS interfaces that have no routable IPv4 address
+    if (ports.length > 0 && !mapped && !hasIp) continue;
+    const hasActiveStatus = /status:\s+active/i.test(text);
+    const hasStatusLine = /status:\s+/i.test(text);
+    const active = hasStatusLine ? (hasActiveStatus && hasIp) : hasIp;
     adapters.push({
       name,
       description: mapped?.description || name,
       kind: mapped?.kind || adapterKind(name, mapped?.description),
       state: active ? 'up' : 'down',
       connected: active,
-      mac: text.match(/ether\s+([0-9a-f:]{17})/i)?.[1] || '',
+      mac,
       linkSpeed: ''
     });
   }
@@ -132,11 +140,12 @@ async function getMacAdapters() {
 async function getLinuxAdapters() {
   let names = [];
   try {
-    names = fs.readdirSync('/sys/class/net').filter((name) => name !== 'lo');
+    names = fs.readdirSync('/sys/class/net').filter((name) => !/^(lo|docker\d*|veth[a-z0-9]*|br-[a-z0-9]*|virbr\d*|tun\d*|tap\d*)$/i.test(name));
   } catch {
-    names = Object.keys(os.networkInterfaces()).filter((name) => name !== 'lo');
+    names = Object.keys(os.networkInterfaces()).filter((name) => !/^(lo|docker\d*|veth[a-z0-9]*|br-[a-z0-9]*|virbr\d*|tun\d*|tap\d*)$/i.test(name));
   }
   const adapters = [];
+  const osIfaces = os.networkInterfaces();
   for (const name of names) {
     const base = path.join('/sys/class/net', name);
     let state = 'unknown';
@@ -145,7 +154,8 @@ async function getLinuxAdapters() {
     try { carrier = fs.readFileSync(path.join(base, 'carrier'), 'utf8').trim(); } catch {}
     const wireless = fs.existsSync(path.join(base, 'wireless'));
     const kind = wireless ? 'wireless' : adapterKind(name);
-    const connected = state === 'up' && (carrier === '' || carrier === '1');
+    const hasIp = (osIfaces[name] || []).some((addr) => !addr.internal && addr.family === 'IPv4' && !addr.address.startsWith('169.254.'));
+    const connected = state === 'up' && (carrier === '' || carrier === '1') && (hasIp || state === 'up');
     let mac = '';
     try { mac = fs.readFileSync(path.join(base, 'address'), 'utf8').trim(); } catch {}
     adapters.push({ name, description: name, kind, state, connected, mac, linkSpeed: '' });
@@ -317,11 +327,24 @@ async function checkGateway(target) {
 
 async function checkInternet(target) {
   const dnsHost = String(target.metadata?.dnsHost || new URL(target.url).hostname);
+  const dnsTimeoutMs = Math.min(Math.max(Number(target.timeoutMs) || 5000, 1000), 3500);
+  let dnsTimer = null;
   try {
-    const answers = await dns.resolve4(dnsHost);
+    const answers = await Promise.race([
+      dns.resolve4(dnsHost),
+      new Promise((_, reject) => {
+        dnsTimer = setTimeout(() => {
+          const err = new Error(`DNS lookup timed out after ${dnsTimeoutMs}ms`);
+          err.code = 'ETIMEOUT';
+          reject(err);
+        }, dnsTimeoutMs);
+      })
+    ]);
     if (!answers.length) return { ok: false, latencyMs: null, message: `DNS did not return an address for ${dnsHost}.`, details: { dnsHost } };
   } catch (error) {
     return { ok: false, latencyMs: null, message: `DNS lookup failed for ${dnsHost}: ${error.code || error.message}`, details: { dnsHost, code: error.code } };
+  } finally {
+    if (dnsTimer) clearTimeout(dnsTimer);
   }
   const http = await checkHttp(target.url, target.timeoutMs);
   return { ...http, message: http.ok ? `Internet connection is available (${new URL(target.url).host}).` : `Internet HTTPS check failed: ${http.message}` };
