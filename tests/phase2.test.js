@@ -1235,4 +1235,150 @@ test('when internet or network goes down and comes back up, all recorded down/wa
   }
 });
 
+test('once Commissioned Service UUID and Commissioned Device UUID are changed and saved, check its getting saved and updated everywhere and sent to the server', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-care-commissioned-uuid-test-'));
+  const database = new LocalDatabase(path.join(directory, 'app.db'));
+  try {
+    const admin = database.createInitialAdmin({ username: 'admin', password: 'ValidPassword123' });
+
+    // 1. Initial configuration with initial UUIDs
+    database.updateAppSettings({
+      serverBaseUrl: 'http://127.0.0.1:3999',
+      serverAuthToken: 'Token_Initial_111',
+      terminalHostname: 'pos-terminal-initial',
+      serviceUuid: 'INITIAL_SERVICE_UUID',
+      deviceUuid: 'INITIAL_DEVICE_UUID'
+    }, admin.id);
+
+    const initialSettings = database.getAppSettings();
+    assert.equal(initialSettings.serviceUuid, 'INITIAL_SERVICE_UUID');
+    assert.equal(initialSettings.deviceUuid, 'INITIAL_DEVICE_UUID');
+
+    // Create monitor target (inheriting commissioned service/device UUIDs)
+    const monitorTarget = database.saveTarget({
+      name: 'Central POS API',
+      type: 'http',
+      url: 'https://pos.internal/health',
+      locationName: 'Main Store',
+      intervalSeconds: 10,
+      timeoutMs: 2000,
+      failureThreshold: 2,
+      recoveryThreshold: 1,
+      severity: 'critical',
+      downMessage: 'POS API down',
+      recoveryMessage: 'POS API recovered',
+      enabled: true
+    }, admin.id);
+
+    database.recordCheck(monitorTarget.id, {
+      ok: true,
+      status: 'healthy',
+      latencyMs: 15,
+      message: 'HTTP 200 OK'
+    });
+
+    const publisher = new CloudPublisher({ database, getSettings: () => database.getAppSettings() });
+    const heartbeat = new HeartbeatService({ database, publisher, getSettings: () => database.getAppSettings() });
+    const historySync = new HistorySyncService({ database, getSettings: () => database.getAppSettings() });
+
+    // Capture payloads sent to server
+    let sentSyncPayload = null;
+    let sentHistoryPayload = null;
+    publisher.sendBatch = async (_url, _token, payload) => {
+      sentSyncPayload = payload;
+      return { ok: true, statusCode: 200, responseData: { success: true } };
+    };
+    historySync.sendPayload = async (_url, _token, payload) => {
+      sentHistoryPayload = payload;
+      return { ok: true, statusCode: 200, responseData: { success: true } };
+    };
+
+    // Initial heartbeat & history sync
+    heartbeat.sendHeartbeat({ triggerPublish: false });
+    await publisher.publishPending(25, { force: true });
+    await historySync.syncNow({ force: true });
+
+    assert.equal(sentSyncPayload.events[0].payload.service_uuid, 'INITIAL_SERVICE_UUID');
+    assert.equal(sentSyncPayload.events[0].payload.device_uuid, 'INITIAL_DEVICE_UUID');
+    assert.equal(sentHistoryPayload.service_uuid, 'INITIAL_SERVICE_UUID');
+    assert.equal(sentHistoryPayload.device_uuid, 'INITIAL_DEVICE_UUID');
+    assert.equal(sentHistoryPayload.history[0].details.service_uuid, 'INITIAL_SERVICE_UUID');
+    assert.equal(sentHistoryPayload.history[0].details.device_uuid, 'INITIAL_DEVICE_UUID');
+
+    // 2. Change Commissioned Service UUID and Commissioned Device UUID and save
+    const updatedSettings = database.updateAppSettings({
+      serviceUuid: 'COMMISSIONED_SERVICE_UUID_888',
+      deviceUuid: 'COMMISSIONED_DEVICE_UUID_999'
+    }, admin.id);
+
+    // Check it's getting saved in database
+    assert.equal(updatedSettings.serviceUuid, 'COMMISSIONED_SERVICE_UUID_888');
+    assert.equal(updatedSettings.deviceUuid, 'COMMISSIONED_DEVICE_UUID_999');
+    const reloadedSettings = database.getAppSettings();
+    assert.equal(reloadedSettings.serviceUuid, 'COMMISSIONED_SERVICE_UUID_888');
+    assert.equal(reloadedSettings.deviceUuid, 'COMMISSIONED_DEVICE_UUID_999');
+
+    // Trigger restart / sync as occurs when settings are saved in app
+    publisher.restart();
+    heartbeat.restart({ sendImmediate: true });
+    historySync.restart({ syncImmediate: true });
+
+    // Send updated telemetry heartbeat and sync to server
+    sentSyncPayload = null;
+    sentHistoryPayload = null;
+    heartbeat.sendHeartbeat({ triggerPublish: false });
+    await publisher.publishPending(25, { force: true });
+    await historySync.syncNow({ force: true });
+
+    // Check updated values are sent to the server in /api/sync
+    assert.ok(sentSyncPayload);
+    assert.equal(sentSyncPayload.events[0].payload.service_uuid, 'COMMISSIONED_SERVICE_UUID_888');
+    assert.equal(sentSyncPayload.events[0].payload.device_uuid, 'COMMISSIONED_DEVICE_UUID_999');
+
+    // Check updated values are sent to the server in /api/history
+    assert.ok(sentHistoryPayload);
+    assert.equal(sentHistoryPayload.service_uuid, 'COMMISSIONED_SERVICE_UUID_888');
+    assert.equal(sentHistoryPayload.device_uuid, 'COMMISSIONED_DEVICE_UUID_999');
+    assert.equal(sentHistoryPayload.history[0].details.service_uuid, 'COMMISSIONED_SERVICE_UUID_888');
+    assert.equal(sentHistoryPayload.history[0].details.device_uuid, 'COMMISSIONED_DEVICE_UUID_999');
+    assert.equal(sentHistoryPayload.monitors[0].service_uuid, 'COMMISSIONED_SERVICE_UUID_888');
+    assert.equal(sentHistoryPayload.monitors[0].device_uuid, 'COMMISSIONED_DEVICE_UUID_999');
+
+    // Check lastPayload in services are updated everywhere
+    assert.equal(publisher.getStatus().lastPayload.events[0].payload.service_uuid, 'COMMISSIONED_SERVICE_UUID_888');
+    assert.equal(publisher.getStatus().lastPayload.events[0].payload.device_uuid, 'COMMISSIONED_DEVICE_UUID_999');
+    assert.equal(historySync.getStatus().lastPayload.service_uuid, 'COMMISSIONED_SERVICE_UUID_888');
+    assert.equal(historySync.getStatus().lastPayload.device_uuid, 'COMMISSIONED_DEVICE_UUID_999');
+    assert.equal(historySync.getStatus().lastPayload.history[0].details.service_uuid, 'COMMISSIONED_SERVICE_UUID_888');
+    assert.equal(historySync.getStatus().lastPayload.history[0].details.device_uuid, 'COMMISSIONED_DEVICE_UUID_999');
+
+    // 3. Test changing again using snake_case input keys (e.g. from API or raw payload)
+    database.updateAppSettings({
+      service_uuid: 'COMMISSIONED_SERVICE_UUID_FINAL',
+      device_uuid: 'COMMISSIONED_DEVICE_UUID_FINAL'
+    }, admin.id);
+
+    const finalSettings = database.getAppSettings();
+    assert.equal(finalSettings.serviceUuid, 'COMMISSIONED_SERVICE_UUID_FINAL');
+    assert.equal(finalSettings.deviceUuid, 'COMMISSIONED_DEVICE_UUID_FINAL');
+
+    sentSyncPayload = null;
+    sentHistoryPayload = null;
+    heartbeat.sendHeartbeat({ triggerPublish: false });
+    await publisher.publishPending(25, { force: true });
+    await historySync.syncNow({ force: true });
+
+    assert.equal(sentSyncPayload.events[0].payload.service_uuid, 'COMMISSIONED_SERVICE_UUID_FINAL');
+    assert.equal(sentSyncPayload.events[0].payload.device_uuid, 'COMMISSIONED_DEVICE_UUID_FINAL');
+    assert.equal(sentHistoryPayload.service_uuid, 'COMMISSIONED_SERVICE_UUID_FINAL');
+    assert.equal(sentHistoryPayload.device_uuid, 'COMMISSIONED_DEVICE_UUID_FINAL');
+    assert.equal(sentHistoryPayload.history[0].details.service_uuid, 'COMMISSIONED_SERVICE_UUID_FINAL');
+    assert.equal(sentHistoryPayload.history[0].details.device_uuid, 'COMMISSIONED_DEVICE_UUID_FINAL');
+  } finally {
+    database.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+
 

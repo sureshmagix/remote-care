@@ -1401,8 +1401,19 @@ async function renderServer(content) {
   const persistFilterSelection = async () => {
     const selectedTargetTypes = getSelectedTargetTypes();
     const selectedTargetIds = getSelectedTargetIds();
+    const serviceUuid = form.elements.serviceUuid?.value?.trim() ?? state.settings.serviceUuid ?? '';
+    const deviceUuid = form.elements.deviceUuid?.value?.trim() ?? state.settings.deviceUuid ?? '';
+    const terminalHostname = form.elements.terminalHostname?.value?.trim() ?? state.settings.terminalHostname ?? '';
+    const baseUrl = form.elements.serverBaseUrl?.value?.trim() ?? state.settings.serverBaseUrl ?? '';
+    const authToken = form.elements.serverAuthToken?.value?.trim() ?? state.settings.serverAuthToken ?? '';
     const next = {
       ...state.settings,
+      serverBaseUrl: baseUrl,
+      serverAuthToken: authToken,
+      cloudAuthToken: authToken,
+      terminalHostname,
+      serviceUuid,
+      deviceUuid,
       historySyncTargetTypes: selectedTargetTypes,
       historySyncTargetIds: selectedTargetIds
     };
@@ -1561,7 +1572,8 @@ async function renderServer(content) {
     };
     try {
       state.settings = await request(() => remoteCare.saveAppSettings(state.session.token, next));
-      flash('Server configuration saved. Periodic telemetry and history sync is active.', 'recovered');
+      await renderPage();
+      flash('Server configuration saved. Commissioned Service UUID and Device UUID updated and sent to server.', 'recovered');
     } catch (exception) {
       error.textContent = exception.message || 'Unable to save server configuration.';
     }

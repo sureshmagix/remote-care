@@ -44,13 +44,22 @@ class CloudPublisher extends EventEmitter {
     this.stop();
     if (this.lastPayload && Array.isArray(this.lastPayload.events)) {
       const latestSettings = this.getSettings();
+      const latestHostname = latestSettings?.terminalHostname?.trim() || latestSettings?.clientHostname?.trim();
+      const latestServiceUuid = latestSettings?.serviceUuid?.trim() || latestSettings?.service_uuid?.trim() || 'ASSIGNED_SERVICE_UUID';
+      const latestDeviceUuid = latestSettings?.deviceUuid?.trim() || latestSettings?.device_uuid?.trim() || 'ASSIGNED_DEVICE_UUID';
       this.lastPayload = {
         ...this.lastPayload,
         events: this.lastPayload.events
-          .map((ev) => ({
-            ...ev,
-            payload: this.filterEventPayload(ev.eventType, { ...(ev.payload || {}) }, latestSettings)
-          }))
+          .map((ev) => {
+            const payload = { ...(ev.payload || {}) };
+            if (latestHostname) payload.hostname = latestHostname;
+            if (latestServiceUuid) payload.service_uuid = latestServiceUuid;
+            if (latestDeviceUuid) payload.device_uuid = latestDeviceUuid;
+            return {
+              ...ev,
+              payload: this.filterEventPayload(ev.eventType, payload, latestSettings)
+            };
+          })
           .filter((ev) => ev.payload !== null)
       };
     }
@@ -207,16 +216,16 @@ class CloudPublisher extends EventEmitter {
 
         const latestSettings = this.getSettings();
         const latestHostname = latestSettings?.terminalHostname?.trim() || latestSettings?.clientHostname?.trim();
-        const latestServiceUuid = latestSettings?.serviceUuid?.trim() || latestSettings?.service_uuid?.trim();
-        const latestDeviceUuid = latestSettings?.deviceUuid?.trim() || latestSettings?.device_uuid?.trim();
+        const latestServiceUuid = latestSettings?.serviceUuid?.trim() || latestSettings?.service_uuid?.trim() || 'ASSIGNED_SERVICE_UUID';
+        const latestDeviceUuid = latestSettings?.deviceUuid?.trim() || latestSettings?.device_uuid?.trim() || 'ASSIGNED_DEVICE_UUID';
 
         const filteredEvents = [];
         for (const row of pending) {
           let eventPayload = typeof row.payload_json === 'string' ? JSON.parse(row.payload_json) : { ...(row.payload_json || {}) };
           if (eventPayload && typeof eventPayload === 'object') {
             if (latestHostname) eventPayload.hostname = latestHostname;
-            if (latestServiceUuid) eventPayload.service_uuid = latestServiceUuid;
-            if (latestDeviceUuid) eventPayload.device_uuid = latestDeviceUuid;
+            eventPayload.service_uuid = latestServiceUuid;
+            eventPayload.device_uuid = latestDeviceUuid;
             if (eventPayload.targetName && !eventPayload.name) {
               eventPayload.name = eventPayload.targetName;
             }

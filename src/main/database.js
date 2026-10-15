@@ -655,36 +655,42 @@ class LocalDatabase {
     if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Settings are required.');
     const settings = this.getAppSettings();
     for (const name of Object.keys(APP_SETTING_KEYS)) {
-      if (!Object.hasOwn(input, name)) continue;
+      const snakeName = APP_SETTING_KEYS[name];
+      const hasKey = Object.hasOwn(input, name) || Object.hasOwn(input, snakeName);
+      if (!hasKey) continue;
+      const val = Object.hasOwn(input, name) ? input[name] : input[snakeName];
       if (name === 'notificationDurationSeconds') {
-        if (!Number.isInteger(input[name]) || input[name] < 1 || input[name] > 300) {
+        if (!Number.isInteger(val) || val < 1 || val > 300) {
           throw new Error('Notification duration must be a whole number from 1 to 300 seconds.');
         }
       } else if (name === 'cloudHeartbeatMinutes') {
-        if (!Number.isInteger(input[name]) || input[name] < 1 || input[name] > 1440) {
+        if (!Number.isInteger(val) || val < 1 || val > 1440) {
           throw new Error('Heartbeat interval must be a whole number from 1 to 1440 minutes.');
         }
       } else if (name === 'soundVolume') {
-        if (!Number.isInteger(input[name]) || input[name] < 0 || input[name] > 100) {
+        if (!Number.isInteger(val) || val < 0 || val > 100) {
           throw new Error('Sound volume must be between 0 and 100.');
         }
       } else if (name === 'serverSyncIntervalSeconds') {
-        if (!Number.isInteger(input[name]) || input[name] < 2 || input[name] > 3600) {
+        if (!Number.isInteger(val) || val < 2 || val > 3600) {
           throw new Error('Server sync interval must be between 2 and 3600 seconds.');
         }
       } else if (name === 'historySyncIntervalMinutes') {
-        if (!Number.isInteger(input[name]) || input[name] < 1 || input[name] > 1440) {
+        if (!Number.isInteger(val) || val < 1 || val > 1440) {
           throw new Error('History sync interval must be between 1 and 1440 minutes.');
         }
       } else if (typeof DEFAULT_APP_SETTINGS[name] === 'boolean') {
-        if (typeof input[name] !== 'boolean') throw new Error('Each setting must be enabled or disabled.');
+        if (typeof val !== 'boolean') throw new Error('Each setting must be enabled or disabled.');
       } else {
-        if ((name === 'historySyncTargetIds' || name === 'historySyncTargetTypes') && Array.isArray(input[name])) {
-          input[name] = input[name].join(',');
+        let strVal = val;
+        if ((name === 'historySyncTargetIds' || name === 'historySyncTargetTypes') && Array.isArray(strVal)) {
+          strVal = strVal.join(',');
         }
-        if (typeof input[name] !== 'string') throw new Error(`${name} must be a string.`);
+        if (typeof strVal !== 'string') throw new Error(`${name} must be a string.`);
+        settings[name] = strVal;
+        continue;
       }
-      settings[name] = input[name];
+      settings[name] = val;
     }
     const timestamp = now();
     const save = this.db.transaction(() => {

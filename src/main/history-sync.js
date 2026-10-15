@@ -138,6 +138,8 @@ class HistorySyncService extends EventEmitter {
     const cursor = this.database.getHistorySyncCursor();
     const settings = this.getSettings();
     const clientHostname = settings?.terminalHostname?.trim() || settings?.clientHostname?.trim() || os.hostname();
+    const serviceUuid = settings?.serviceUuid?.trim() || settings?.service_uuid?.trim() || 'ASSIGNED_SERVICE_UUID';
+    const deviceUuid = settings?.deviceUuid?.trim() || settings?.device_uuid?.trim() || 'ASSIGNED_DEVICE_UUID';
 
     const allActiveTargets = (this.database.listTargets?.() || []).filter((t) => t.enabled !== false);
     const matchingTargets = this.getActiveMonitoredTargets(resolvedTargets).filter((t) => {
@@ -195,6 +197,8 @@ class HistorySyncService extends EventEmitter {
       version: '2.0',
       dispatchedAt: new Date().toISOString(),
       clientHostname,
+      service_uuid: serviceUuid,
+      device_uuid: deviceUuid,
       targetIds: payloadTargetIds,
       targetTypes: displayTypes,
       targetNames: matchingTargets.map((t) => t.name),
@@ -205,7 +209,9 @@ class HistorySyncService extends EventEmitter {
         targetName: t.name,
         type: t.type === 'ping' ? 'icmp' : t.type,
         locationName: t.locationName,
-        status: t.status
+        status: t.status,
+        service_uuid: t.serviceUuid || serviceUuid,
+        device_uuid: t.deviceUuid || deviceUuid
       })),
       entriesCount: entries.length,
       history: entries.map((entry) => ({
@@ -326,13 +332,27 @@ class HistorySyncService extends EventEmitter {
 
         const allowedIds = new Set(payload.monitors.map((m) => String(m.id)));
         const allowedNames = new Set(payload.targetNames.map((n) => String(n).toLowerCase()));
+        const currentServiceUuid = payload.service_uuid || 'ASSIGNED_SERVICE_UUID';
+        const currentDeviceUuid = payload.device_uuid || 'ASSIGNED_DEVICE_UUID';
         const prevFilteredHistory = (this.lastPayload?.history || []).filter((h) =>
           allowedIds.has(String(h.targetId)) || allowedNames.has(String(h.targetName || h.name || '').toLowerCase())
-        );
+        ).map((h) => {
+          const target = this.database.getTarget?.(h.targetId);
+          const itemServiceUuid = target?.serviceUuid || (h.details?.service_uuid && h.details?.service_uuid !== 'ASSIGNED_SERVICE_UUID' && !target ? h.details.service_uuid : currentServiceUuid);
+          const itemDeviceUuid = target?.deviceUuid || (h.details?.device_uuid && h.details?.device_uuid !== 'ASSIGNED_DEVICE_UUID' && !target ? h.details.device_uuid : currentDeviceUuid);
+          return {
+            ...h,
+            details: {
+              ...(h.details || {}),
+              service_uuid: itemServiceUuid,
+              device_uuid: itemDeviceUuid
+            }
+          };
+        });
 
-        const fullHistory = (!anyNewChanges && prevFilteredHistory.length > 0)
-          ? prevFilteredHistory
-          : (allDispatchedHistory.length > 0 ? [...allDispatchedHistory] : prevFilteredHistory);
+        const fullHistory = (allDispatchedHistory.length > 0)
+          ? [...allDispatchedHistory]
+          : prevFilteredHistory;
 
         this.lastSyncAt = payload.dispatchedAt;
         this.lastSentCount = totalSentCount;
@@ -420,7 +440,17 @@ class HistorySyncService extends EventEmitter {
         const allowedNames = new Set(preview.targetNames.map((n) => String(n).toLowerCase()));
         const existingFiltered = (this.lastPayload.history || []).filter((h) =>
           allowedIds.has(String(h.targetId)) || allowedNames.has(String(h.targetName || h.name || '').toLowerCase())
-        );
+        ).map((h) => {
+          const target = this.database.getTarget?.(h.targetId);
+          return {
+            ...h,
+            details: {
+              ...(h.details || {}),
+              service_uuid: target?.serviceUuid || preview.service_uuid,
+              device_uuid: target?.deviceUuid || preview.device_uuid
+            }
+          };
+        });
         const keptHistory = existingFiltered.length > 0 ? existingFiltered : preview.history;
         this.lastPayload = {
           ...preview,
